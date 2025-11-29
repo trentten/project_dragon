@@ -28,6 +28,11 @@ class OrderStatus(Enum):
     CANCELLED = auto()
 
 
+class OrderActivationState(Enum):
+    PARKED = auto()
+    ACTIVE = auto()
+
+
 @dataclass
 class Candle:
     timestamp: datetime
@@ -48,6 +53,10 @@ class Order:
     status: OrderStatus = OrderStatus.OPEN
     filled_size: float = 0.0
     note: str = ""
+    activation_band_pct: Optional[float] = None
+    target_price: Optional[float] = None
+    activation_state: OrderActivationState = OrderActivationState.ACTIVE
+    last_activation_price: Optional[float] = None
 
 
 @dataclass
@@ -76,5 +85,7 @@ class Position:
 class BacktestResult:
     trades: List[Trade]
     equity_curve: List[float]
+    equity_timestamps: List[datetime] = field(default_factory=list)
+    candles: List[Candle] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
     params: Dict[str, float] = field(default_factory=dict)

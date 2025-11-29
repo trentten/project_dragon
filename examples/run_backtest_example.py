@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from project_dragon.domain import Candle
@@ -15,7 +15,7 @@ def generate_dummy_candles(n: int = 200) -> List[Candle]:
     Replace this with real OHLCV data from CSV or an exchange later.
     """
     candles: List[Candle] = []
-    t = datetime.utcnow()
+    t = datetime.now(timezone.utc)
     price = 100.0
 
     for i in range(n):
