@@ -1,0 +1,7 @@
+[theme]
+# Keep the app in dark mode, but use a blue accent for active/primary UI.
+base = "dark"
+
+# Change Streamlit's global accent color (buttons, toggles, sliders, etc)
+# from red to blue.
+primaryColor = "#60A5FA"

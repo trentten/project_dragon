@@ -26,6 +26,8 @@ class OrderStatus(Enum):
     OPEN = auto()
     FILLED = auto()
     CANCELLED = auto()
+    PARTIAL = auto()
+    REJECTED = auto()
 
 
 class OrderActivationState(Enum):
@@ -61,12 +63,29 @@ class Order:
 
 @dataclass
 class Trade:
+    index: Optional[int]
     timestamp: Optional[datetime]
     side: Side
     price: float
     size: float
     pnl: float = 0.0
     note: str = ""
+
+    @property
+    def realized_pnl(self) -> float:
+        return self.pnl
+
+    def to_dict(self) -> Dict[str, Optional[object]]:
+        return {
+            "index": self.index,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "side": self.side.name if isinstance(self.side, Enum) else str(self.side),
+            "price": self.price,
+            "size": self.size,
+            "pnl": self.pnl,
+            "realized_pnl": self.realized_pnl,
+            "note": self.note,
+        }
 
 
 @dataclass
@@ -83,9 +102,14 @@ class Position:
 
 @dataclass
 class BacktestResult:
-    trades: List[Trade]
+    candles: List[Candle]
     equity_curve: List[float]
-    equity_timestamps: List[datetime] = field(default_factory=list)
-    candles: List[Candle] = field(default_factory=list)
+    trades: List[Trade]
     metrics: Dict[str, float] = field(default_factory=dict)
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    equity_timestamps: List[datetime] = field(default_factory=list)
     params: Dict[str, float] = field(default_factory=dict)
+    run_context: Dict[str, float] = field(default_factory=dict)
+    computed_metrics: Dict[str, float] = field(default_factory=dict)
+    extra_series: Dict[str, List[Optional[float]]] = field(default_factory=dict)

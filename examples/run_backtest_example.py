@@ -63,6 +63,21 @@ def main() -> None:
     else:
         print("No trades yet (strategy logic is still stubbed).")
 
+    metrics = result.metrics
+    keys = [
+        "net_profit",
+        "return_pct",
+        "max_drawdown_pct",
+        "sharpe_ratio",
+        "sortino_ratio",
+        "win_rate",
+        "profit_factor",
+    ]
+    print("Metrics snapshot:")
+    for key in keys:
+        value = metrics.get(key, float("nan"))
+        print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
+
 
 if __name__ == "__main__":
     main()

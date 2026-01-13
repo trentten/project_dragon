@@ -1,946 +1,634 @@
-Project Dragon – Trading Bot Manager
+# Project Dragon – Trading Bot Manager
+
+## Full plan (living document)
+
+### What this project is
+Project Dragon is a **local-first trading bot manager** that supports:
+- Backtesting + parameter sweeps
+- Creating “Live bots” from backtest runs (config snapshots)
+- A live worker that executes strategies safely with strong guardrails
+- A Streamlit UI that acts as the control room
+
+Today we’re **WooX Perps-focused**, but the design is intentionally extensible to more exchanges (and later, other asset classes like stocks).
+
+### Guiding principles
+- **Safety-first defaults** (live trading disabled by default; kill switch; risk limits)
+- **Traceability** (every live bot links back to run_id / sweep)
+- **Idempotent + restart-safe** (job locking; clientOrderId-first; ledger idempotency)
+- **Multi-user ready** (header-based identity; encrypted credentials per user)
+- **Minimal UI, maximal clarity** (overview table → focused bot detail)
+
+### Current scope (v1)
+**Backtesting**
+- Single backtest and parameter sweeps (inline per-field sweep controls)
+- Results + sweeps browsing
+
+**Live trading**
+- Bot storage (bots + bot_run_map)
+- Worker-driven execution (bar-close driven)
+- WooX broker with hedge-mode support + maker execution (BBO queue + fallback)
+- PnL + ledger + events + positions snapshots
+
+**Security / multi-user**
+- Header-based identity (proxy header) + per-user encrypted credentials
+- Global gate: live_trading_enabled
+- Kill switch: global + per-bot
+- Guarded flatten-now
+
+### Near-term roadmap (recommended order)
+**Phase 1 — Reliability + correctness**
+1) **Hedge-mode enforcement**: detect non-hedge and fail fast with a clear error/event.
+2) **Account model**: add trading_accounts and link bots → account → credential (supports multiple WooX accounts per user).
+3) **Account-level risk limits**: daily loss / drawdown caps across all bots in an account.
+4) **Reconciliation hardening**: persist order intents / lifecycle so restarts never double-send.
+
+**Phase 2 — UX polish**
+1) Backtest page UX refinement (direction radios, Exits SL/TP conditional fields, per-indicator rows, tooltips).
+2) Live overview health indicators and stronger at-a-glance position summary.
+3) Better “Create bot from run” flow (templates + defaults).
+
+**Phase 3 — Scaling + deployment**
+1) Move from SQLite → Postgres when we have real multi-user / multi-worker needs.
+2) Run Streamlit behind a reverse proxy (auth → header identity).
+3) Container deployment (worker + UI) with secrets management.
+
+### Architecture overview
+**Components**
+- `storage.py`: SQLite schema + CRUD + migrations
+- `streamlit_app.py`: UI (Backtest/Results/Sweeps/Live/Tools)
+- `live_worker.py`: claims jobs, runs bots, writes heartbeats/events/ledger
+- `woox_client.py` / `woox_broker.py`: exchange adapter + reconciliation
+- `data_online.py`: candle fetching + ccxt exchange mapping
+
+**Core flows**
+1) Backtest → stores run config + results
+2) Create bot from run_id → stores config snapshot + links bot_run_map + enqueues live_bot job
+3) Worker claims job → bar loop runs strategy → broker places/cancels orders → events/ledger updated → UI reflects state
+
+### Data model (high level)
+- `users`: identity scope
+- `exchange_credentials`: encrypted API keys per user
+- `bots`: live bots (+ snapshots, PnL summary, desired_status/action)
+- `jobs`: background tasks (backtest/sweep/live_bot)
+- `bot_run_map`: traceability (bot ↔ run_id)
+- `bot_events`: audit log / debugging
+- `bot_ledger`: idempotent fills/fees/funding/pnl adjustments
+- `bot_fills`, `bot_positions_history`: optional richer history tables
+- `candles_cache`: local candle cache
 
-0. Document Purpose
+### Operational safety checklist
+- Keep `live_trading_enabled` OFF until ready
+- Keep kill switch ON while validating
+- Dry-run first
+- Start tiny sizing
+- Prefer maker settings only once reconciliation is stable
 
-Living design doc for Project Dragon (Trent + ChatGPT).
+---
 
-Tracks vision, scope, assumptions, research, and design.
 
-We will update this as we learn more and refine the architecture.
+## Update: WooX BBO Queue Maker Orders (v1 Enhancement)
 
-Change tracking will be done via a simple Change Log section at the end.
+### Status
 
-1. Vision & Goals
+✅ Implemented in code (WooXBroker + WooXClient):
 
-1.1 Vision
+- **V3 trade endpoints** (`/v3/trade/order`, `/v3/trade/orders`).
+- **Signature/body parity** (signed and sent using the exact same serialized bytes).
+- **clientOrderId-first** workflow (place/cancel/query by clientOrderId; still stores exchange orderId when returned).
+- **BBO Queue maker orders** (`type=BID/ASK` + `bidAskLevel=1..5`, no price).
+- **Maker-safe fallback** to `type=POST_ONLY` at top-of-book using an orderbook helper.
+- Offline payload sanity check script added (`examples/woox_payload_check.py`).
 
-Build a modular trading bot manager in Python (“Project Dragon”) that can:
+### Overview
 
-Design and configure strategies/bots.
+Project Dragon’s WooX Perps adapter now supports **Best Bid/Offer (BBO) Queue maker orders** to minimize taker fees. Users can configure **queue levels 1–5** directly from the bot configuration or UI.
 
-Backtest them robustly across multiple parameter ranges.
+### What are BBO Queue Orders?
 
-Compare and review results with proper metrics and charts.
+WooX supports placing orders at specific levels of the order book via the **BBO Queue** mechanism. These orders rest on the maker side (i.e., inside the book) and earn maker fees when filled. Each level represents how deep into the order book the order is placed:
 
-Deploy chosen configurations as live bots.
+| Queue Level | Description            | Maker Likelihood | Fill Speed |
+| ----------- | ---------------------- | ---------------- | ---------- |
+| **1**       | Closest to top of book | Moderate         | Fastest    |
+| **2**       | Slightly deeper        | Higher           | Slower     |
+| **3**       | Mid-depth              | Very high        | Slower     |
+| **4**       | Deep                   | Near-certain     | Very slow  |
+| **5**       | Deepest                | Highest          | Rare fills |
 
-Monitor and manage live bots (PnL, positions, health, logs).
+### Implementation Summary
 
-1.2 Primary Goals (v1 timeframe)
+#### Important API correctness notes (WooX V3)
 
-Robust backtesting core
+- **Trading endpoints** for place/cancel/get order are under `` (and list orders under ``) in the official docs. citeturn24view0turn24view1turn24view2
+- WooX signs requests as: `timestamp + method + request_path + request_body` (request\_path includes the querystring when present). Make sure the **exact** query ordering and **exact** request-body bytes you send are what you sign. citeturn24view4
+- **Post-only** is represented by setting `type = "POST_ONLY"` on the order payload (not a generic `postOnly=true` flag). citeturn24view5
+- Prefer sending `clientOrderId` (e.g., reuse our local\_id) so we can cancel/query orders deterministically without relying only on exchange `orderId`. citeturn24view0turn24view1
 
-Single-asset, single-strategy backtests.
 
-Realistic simulation (fees, slippage model, order types).
 
-Clear performance metrics (Sharpe, Sortino, Win %, Profit Factor, etc.).
+#### `WooXBroker`
 
-Strategy lab
+A new method has been added:
 
-Run parameter sweeps (grid search first).
+```python
+def place_bbo_queue_limit(
+    self,
+    order_side: str | Side,
+    position_side: str | Side,
+    size: float,
+    bid_ask_level: int = 1,
+    note: str = "",
+    reduce_only: bool = False,
+    local_id: Optional[int] = None,
+) -> int:
+```
 
-Store each run with parameters + metrics.
+**Key logic:**
 
-UI to sort, filter, and shortlist best configs.
+- Enforces correct WooX semantics:
+  - `type = "BID"` for BUY orders.
+  - `type = "ASK"` for SELL orders.
+  - Includes `bidAskLevel` (1–5).
+- Does **not** include a manual `price` – WooX will derive the correct book level internally.
+- Preserves hedge-mode correctness with proper `positionSide` and `reduceOnly` flags.
 
-Live bot manager (v1-lite)
+**Error handling:**
 
-Deploy a strategy configuration as a live bot.
+- If WooX rejects `BID`/`ASK` types, the method logs a warning and automatically falls back to a `post-only limit` order at the same intent.
 
-Connect to at least one exchange/broker.
+#### Bot Configuration
 
-Dashboard of running bots, with basic health + PnL.
+Each bot gains two new configuration options:
 
-Port “Dragon DCA ATR” strategy
+```yaml
+prefer_bbo_maker: true
+bbo_queue_level: 1   # 1–5
+```
 
-Re-implement Trent’s Haas-based DCA + ATR trailing-exit bot.
+- `prefer_bbo_maker` toggles whether the bot should use BBO Queue maker orders when possible.
+- `bbo_queue_level` defines how deep into the order book to rest the order.
 
-Use it as the reference strategy for engine and UI.
+#### Streamlit UI
 
-1.3 Non-goals (for now)
+Add new settings under **Order Settings**:
 
-High-frequency / ultra-low-latency trading.
+- Toggle: “Prefer maker via BBO Queue (WooX only)”
+- Dropdown: “BBO Queue Level” (1–5)
 
-Options, perps funding-arb, or complex multi-leg spreads.
+### Live Behaviour
 
-Multi-asset portfolio optimization engine.
+When active:
 
-AI/ML optimizers beyond simple generational search.
+- All **limit entries**, **DCA orders**, and **take-profits** can use the BBO mechanism if `prefer_bbo_maker=True`.
+- Dynamic activation respects maker preference:
+  - When an order moves from PARKED → ACTIVE, `activate_dynamic()` will place via **BBO Queue** (or fall back) while reusing the original local ID.
 
-2. Initial Scope Outline
+### Safety & Fallbacks
 
-2.1 v0 – Proof of Concept
+- If BBO placement fails or the level becomes invalid, the broker falls back to `post_only` limit orders to retain maker intent.
+- If both fail, a standard limit order may be used as a last resort (with warning logged).
 
-Load historical OHLCV data from CSV.
+### Example Config
 
-Run one strategy (Dragon DCA ATR simplified) over one symbol.
+```python
+DragonAlgoConfig(
+    prefer_bbo_maker=True,
+    bbo_queue_level=2,
+    entry_activation_pct=0.8,
+    dca_activation_pct=0.5,
+    tp_activation_pct=1.0,
+)
+```
 
-Produce:
+### Summary
 
-Trade list.
+✅ Supports maker-fee-efficient execution using WooX BBO Queue orders.\
+✅ Configurable queue depth (1–5) per bot.\
+✅ UI toggle for user control.\
+✅ Full fallback logic to post-only limits when BBO unavailable.
 
-Equity curve.
+---
 
-Basic metrics (P/L, Win %, Max DD, Profit Factor).
+## Update: Live Trading (WooX Perps) – Bot Lifecycle + Job Control (v1)
 
-Display results in a simple Streamlit app.
+### Status
 
-2.2 v1 – Usable Tool
+✅ Implemented in code (Streamlit UI + storage + worker):
 
-Add parameter sweeps (brute-force grid).
+- `bots`, `bot_run_map`, `bot_events` tables (SQLite) + CRUD helpers.
+- `jobs` now has `bot_id`, `updated_at`, `worker_id` (for locking) + indexes.
+- Streamlit **Live Bots** tab:
+  - Create bot from a `run_id` (loads config snapshot, allows edits, creates bot + job + links to run).
+  - Controls: Pause / Resume / Stop (writes `desired_status`).
+  - Bot Events expander for quick debugging.
+- `live_worker.py` (bar-driven runner):
+  - Polls/claims `live_bot` jobs (durable locking via `worker_id`).
+  - Honours `desired_status` (`running|paused|stopped`).
+  - Fetches latest **closed** candle via ccxt each bar.
+  - Calls `DragonDcaAtrStrategy.on_bar(...)` per new bar.
+  - Uses `WooXBroker` (hedge mode supported).
+  - Persists runtime state into bot config (`_runtime.last_candle_ts_ms`, `_runtime.bar_index`).
+  - Heartbeats + bot/job status transitions.
+  - Error handling: marks bot + job **error** and records a bot\_event.
 
-Persist backtest runs (e.g. SQLite/Parquet/CSV).
+### Safety / Ops features
 
-Add richer metrics and charts.
+✅ Implemented:
 
-Implement one live exchange adapter.
+- `--dry-run` mode (skips real WooX order placement/cancel; logs bot\_events instead).
+- Risk guardrails via config `_risk`:
+  - `max_open_orders`
+  - `max_position_size_per_side`
+  - `max_notional_per_side`
+  - Guard trip => bot/job **error** + bot\_event
+- Durable job locking:
+  - A worker claims a job (stores `worker_id`) and only the claiming worker runs it.
 
-Basic bot monitoring dashboard.
+### Reconciliation and audit trail (v1)
 
-2.3 Future (v2+ Ideas)
+✅ Implemented:
 
-Walk-forward and out-of-sample testing.
+- WooX order reconciliation prioritises **clientOrderId** (stable mapping back to our local IDs).
+- Tracks **partial / rejected** states (adds `OrderStatus.PARTIAL` and `OrderStatus.REJECTED`).
+- Captures filled size + average fill price and attaches timestamps where available.
+- Emits bot events on:
+  - order status transitions (open → partial → filled / cancelled / rejected)
+  - order lifecycle changes (activation state changes, missing snapshot warnings, forced cancellation)
+- Offline reconciliation demos:
+  - `examples/woox_payload_check.py` validates payload shapes for BID/ASK and POST\_ONLY + fallback behavior.
+  - `examples/woox_reconcile_check.py` replays snapshots to validate event capture.
 
-Generational/AI-based parameter search.
+### Missing-from-snapshot policy (important)
 
-Strategy portfolios (multiple bots per symbol / multiple symbols).
+✅ Implemented in `WooXBroker.sync_orders`:
 
-Alerting (Discord/Telegram).
+- **PARKED** intents are treated as *local-only* and are never auto-cancelled.
+- For orders expected to exist on exchange (have `external_id` or ACTIVE `client_order_id`):
+  - If an order is missing from the exchange snapshot, increment `miss_count` on the same Order object.
+  - Emit `sync_warning` only on **miss\_count 1 and 3** to reduce noise.
+  - After **3 consecutive misses**, optionally verify via `get_order(clientOrderId)`; if still missing, mark cancelled and emit `order_missing_cancelled`.
+- Identifiers are not overwritten with `None` (prevents “losing” IDs during sparse API responses).
+- Price/size only update when present (prevents clobbering good local data with empty fields).
 
-Role-based configuration ("research", "production").
+### Notes about hedge mode (v1)
 
-3. Design Principles
+- WooX hedge mode is enabled at the account level.
+- Our current strategy state machine is still primarily “single-position”.
+- Recommended v1 approach for true LONG+SHORT simultaneously:
+  - Run **two bots** for the same symbol (one long-only, one short-only), or
+  - Backlog: refactor strategy to maintain **two independent legs** (LONG and SHORT) in one bot.
 
-Separation of concerns
+### How to run the worker
 
-Strategy logic vs execution vs risk management vs UI.
+From repo root:
 
-Exchange-agnostic core
+```bash
+PYTHONPATH=src python -m project_dragon.live_worker
+```
 
-Engine talks to an abstract broker interface.
+Dry-run:
 
-Deterministic backtests
+```bash
+PYTHONPATH=src python -m project_dragon.live_worker --dry-run
+```
 
-Same data + config = same result.
+### Next steps
 
-Honest simulations
+- Live smoke test with **very small size**:
+  - Validate pause/resume/stop.
+  - Confirm candle “new bar” detection is correct for each timeframe.
+  - Verify maker path (BBO vs POST\_ONLY fallback) and cancellation behaviour.
+- Backlog: WebSocket ingestion later (private fills/order updates + public candles), but keep v1 bar-driven runner as baseline.
 
-Include fees, slippage, realistic order fills.
+---
 
-Safety first
+**Next steps (implementation backlog):**
 
-Explicit risk limits and guardrails.
+- Price-driven runner (tick-based) for faster reaction (backlog).
+- Hot-reload strategy params safely (backlog).
+- “Flatten now” guarded action (cancel all + reduce-only market close).
+- Reconciliation: robust partial-fill handling + consistent PnL/funding tracking (perps).
 
-Extensibility
+---
 
-Adding new strategies or exchanges should not require rewrites.
+## UI Cleanup Plan (after Safety + PnL steps)
 
-4. Research & Best Practices (Summary)
+### Goals
 
-4.1 Data & Backtesting
+- Make **Live trading** feel like a simple “control room”: a clean bot list, then a focused bot detail view.
+- Keep navigation fast even with many bots/runs/jobs.
+- Ensure every live bot remains **traceable** back to its originating `run_id` (and sweep if applicable).
 
-Use clean, well-sourced historical data.
+### Proposed Layout (Streamlit)
 
-Avoid common backtest biases:
+#### A) Live Bots – Overview (default view)
 
-Look-ahead bias.
+A single, compact table with:
 
-Data snooping / overfitting.
+- **Name**
+- **Exchange**
+- **Symbol**
+- **Timeframe**
+- **Status** (and desired\_status if different)
+- **Realized PnL**
+- **Unrealized PnL**
+- **Last heartbeat**
+- **Last event / last error**
+- Actions: **Open**, **Pause/Resume**, **Stop**, **Flatten** (guarded), **Dry-run toggle indicator**
 
-Survivorship bias.
+Recommended UX:
 
-Always separate:
+- Filters above table: exchange, symbol search, status, only-errors.
+- Sort toggles: newest updated, highest PnL, biggest drawdown.
+- Conditional formatting: green/red PnL; yellow for stale heartbeat; red for error.
 
-In-sample (for design).
+#### B) Bot Detail – “Bot page”
 
-Out-of-sample (for validation).
+Use query params for deep links: `?bot_id=123`. Sections (top-to-bottom):
 
-Forward test / paper trading.
+1. **Header**: Name, symbol, timeframe, status/desire, worker\_id, heartbeat.
+2. **PnL panel**: realized/unrealized, today’s PnL, fees, funding (once added).
+3. **Charts**:
+   - Price chart + orders/fills markers (optional v1)
+   - Equity / realized PnL curve (v1 once ledger exists)
+4. **Controls (guarded)**:
+   - Resume / Pause / Stop
+   - Flatten Now (guarded confirmation)
+   - Kill-switch status indicator
+5. **Config**:
+   - Show “effective config” + runtime overlays (`_runtime`, `_risk`, maker settings)
+   - Allow editing only **runtime-safe fields** (ex: risk limits, activation band, maker preference)
+   - Track a config revision history (optional; backlog)
+6. **Events / Logs**:
+   - Paginated bot\_events table with severity filter
+   - “Copy diagnostics” button (prints bot\_id, run\_id, symbol, timeframe, last 50 events)
+7. **Traceability**:
+   - Linked **Backtest Run** card (run\_id) + open results
+   - Linked **Sweep** card (if applicable)
 
-Model transaction costs and approximate slippage.
+#### C) Backtests/Results integration (small but valuable)
 
-Consider simple walk-forward procedures for serious strategies.
+- In **Backtest Results** detail page: show “**Create bot from this run**” button.
+- In **Results table**: add a small indicator column “**Live bot**” if any bot\_run\_map links exist (optional; backlog if slow).
 
-4.2 Risk Management
+### Data Requirements
 
-Position sizing rules (e.g. max % of equity per bot/trade).
+To display realized/unrealized PnL cleanly:
 
-Global caps:
+- Prefer a local **fills/ledger** table (best long-term) and compute:
+  - realized PnL, fees, funding, trade count, win rate
+- Short-term v1 fallback (if ledger isn’t ready):
+  - unrealized from positions endpoint, realized from account/positions if available; still store locally when possible.
 
-Max concurrent bots.
+### Backlog UI Enhancements
 
-Max exposure per asset and overall.
+- Bot grouping (paired long/short “hedge set”).
+- Bulk actions (pause all, stop all, flatten all).
+- Presets and templates (“create bot from template”).
+- Dedicated “Worker status” page.
 
-Drawdown limits and circuit breakers:
+---
 
-Per-bot max DD.
+## Note: Grid Filtering Performance (v1)
 
-Initial per-bot target max DD: ~20% (configurable).
+- Current UI uses a shared Streamlit filter bar (dropdowns/ranges/search) above grids and applies filtering in-memory (pandas) after a single DB query.
+- If a grid grows beyond ~5–20k rows, switch backend filtering to SQL (`WHERE` + `LIMIT/OFFSET` pagination) to keep UI responsive.
+- Keep the filter UI identical; only swap the data loader from pandas filtering to server-side filtering (same `filters` dict shape).
 
-Account-level kill switch.
 
-Clear definition of:
 
-Stop loss, take profit, trailing exits.
+---
 
-What happens on gaps, extreme volatility, or exchange issues.
+## Update: Multi-user deployment foundations (v1)
 
-4.3 Architecture & Implementation
+### Status
 
-Modular architecture:
+✅ Implemented (Streamlit + DB + worker):
 
-Core engine (backtest + live).
+- **Encrypted exchange credentials** stored in SQLite per-user (Fernet).
+- **Env-only master key**: `DRAGON_MASTER_KEY` must be a valid Fernet key.
+- **Identity scoping**:
+  - Reads user identity from a reverse-proxy header (default `X-Forwarded-User`, configurable via `DRAGON_AUTH_HEADER`).
+  - Fallback to `DRAGON_USER_EMAIL`, then `admin@local`.
+  - Parses formats like `Name <email@domain>` and comma-separated lists.
+- **DB schema additions**:
+  - `users`, `exchange_credentials`
+  - `bots.user_id`, `bots.credentials_id` + indexes + backfill
+- **Worker uses stored credentials**:
+  - Loads and decrypts credentials by `(bot.user_id, bot.credentials_id)`.
+  - On missing/decrypt failure: emits `credential_missing`, sets bot/job to error without leaking secrets.
+- **Credentials UI**:
+  - Tools → **Credentials** page (create/list/delete).
+  - Bot creation requires selecting a credential.
+  - Bot detail allows changing credential.
+- **Stored-credential connectivity test tool**:
+  - Tools → Credentials → “Test WooX connectivity” (calls get\_positions / get\_orders / orderbook; returns only non-sensitive fields).
 
-Strategy layer.
+### Env requirements (runtime)
 
-Broker adapters (exchanges/Haas/etc.).
+- `DRAGON_MASTER_KEY=<Fernet.generate_key()>`
+- Optional:
+  - `DRAGON_AUTH_HEADER=X-Forwarded-User` (or your proxy header)
+  - `DRAGON_USER_EMAIL=you@example.com` (fallback)
 
-Data layer.
+---
 
-UI layer.
+## Update: Live trading safety gates (v1)
 
-Strong configuration management:
+### Global "live trading enabled" gate
 
-Strategy configs versioned.
+✅ Implemented:
 
-Ability to reproduce a live bot from a saved config + code version.
+- New app setting: `live_trading_enabled` (default **False**).
+- Settings UI toggle: “Enable Live Trading (Worker Processing)”.
+- Worker behavior when OFF:
+  - Does not claim new queued `live_bot` jobs.
+  - For already-running jobs: heartbeat shows blocked, emits `live_trading_disabled_block` once per bot, skips strategy/broker work.
+  - Pause/stop still works.
 
-Logging and observability:
+### Kill switch (global + per-bot)
 
-Structured logs for decisions and orders.
+✅ Implemented:
 
-Per-bot metrics and health indicators.
+- Global kill switch setting (separate from live\_trading\_enabled).
+- Per-bot kill switch stored under `config_json._risk.kill_switch`.
+- Worker guard blocks **all** broker place/cancel actions when kill switch active.
+  - Emits `kill_switch_block` events and increments `bots.blocked_actions_count`.
+  - Flatten requests are blocked safely (no error), desired action cleared.
 
-4.4 Monitoring & Operations
+### Guarded “Flatten Now”
 
-Real-time monitoring for live bots:
+✅ Implemented:
 
-PnL, exposure, open orders, error rates.
+- `bots.desired_action` supports `flatten_now`.
+- UI requires typing `FLATTEN` to confirm.
+- Worker executes cancel + reduce-only close flow (dry-run supported).
+- Emits detailed events (`flatten_*`) and clears `desired_action` on completion.
 
-Alerting for:
+---
 
-Repeated API failures.
+## Update: PnL + ledger + positions (v1)
 
-Unusual behaviour (no trades when expected, too many trades, etc.).
+### PnL summary + history
 
-Tools for safe interventions:
+✅ Implemented:
 
-Pause/stop a bot.
+- Bot-level summary fields on `bots`:
+  - realized/unrealized PnL, fees\_total, funding\_total, dca\_fills\_current, mark\_price
+- Worker derives mark price with priority:
+  - ccxt ticker → orderbook mid → candle close (persisted to `bots.mark_price`)
+- Bot overview and bot detail show:
+  - Realized, Unrealized, Fees, Funding, Net After Costs (ROI uses net)
 
-Flatten all positions.
+### Unified ledger
 
-4.5 Security & Safety
+✅ Implemented:
 
-4.6 Order & Execution Model (Planned)
+- `bot_ledger` table with idempotent inserts (`bot_id, kind, ref_id` unique when ref\_id present).
+- Worker writes ledger rows for:
+  - fills + fees (fee estimated if missing)
+  - funding ingestion (best effort)
+  - realized PnL adjustments (best effort when closing position)
+- Bot detail includes **Ledger** tab with totals + recent rows.
 
-Support for multiple order types in both backtest and live modes:
+### Positions snapshot
 
-Market orders.
+✅ Implemented:
 
-Limit orders.
+- Worker persists raw WooX `get_positions(symbol)` snapshots to `bots.positions_snapshot_json` best-effort.
+- Bot detail **Positions** tab renders:
+  - Exchange positions table (by side + TOTAL row)
+  - Open orders grouped summary (Active/Parked/Total)
+  - Strategy runtime legs under expander
 
-Maker-style limit orders (price offset to favour maker fills when possible).
+---
 
-Dynamic limit orders:
+## Update: UI navigation + persistence improvements (v1)
 
-Ability to specify a target price plus an activation band (e.g. "activate when within X% of last price").
+### Sidebar navigation
 
-Until activation, orders can remain parked or unsubmitted.
+✅ Implemented:
 
-Once active, they behave like normal limit/maker orders.
+- Sidebar menu groups:
+  - Backtesting: Backtest / Results / Sweeps
+  - Live: Live Bots
+  - Tools: Jobs / Candle Cache / Settings / Credentials
+- Removed run settings from sidebar (moved to Settings).
+- Deep-link routing fixed for Jobs → Open sweep/run/bot.
 
-Execution simulation will model:
+### Live Bots overview
 
-Fill probabilities for each order type based on candle high/low/close.
+✅ Implemented:
 
-Distinction between maker/taker fees where supported by the venue.
+- Single sortable table using `st.data_editor`.
+- Open is a LinkColumn deep-linking to bot detail.
+- No row selection / no “open selected bot”.
+- Overview columns include PnL, ROI, DCA status, kill switch indicators.
 
-4.5 Security & Safety
+### Bot detail dashboard layout
 
-API key management:
+✅ Implemented:
 
-Read/write keys only where needed.
+- Header + chart + KPI blocks + compact controls bar.
+- Tabs grouped (Orders & Fills as sub-tabs).
+- Danger zone expander contains kill switch, flatten, blocked reset.
+- Health box shows heartbeat freshness, last\_error, recent event severity.
 
-IP whitelisting when possible.
+### Page input persistence
 
-Avoid storing secrets in plain text.
+✅ Implemented:
 
-Separate test/play accounts from real size.
+- Backtest page widget inputs persist in session state until changed.
+- “Show all runs” on Results/Sweeps persists.
 
-Always support paper trading / sandbox mode.
+---
 
-5. Open Questions / Options
+## Update: Backtest page refactor (v1)
 
-We will refine these with Trent’s preferences.
+✅ Implemented:
 
-Primary market(s)
+- Two-column layout with bordered “cards”.
+- Inline per-field Fixed/Sweep controls (no sweep selectors at top).
+- Grouped into clearer sections; better use of page width.
 
-Crypto only? Which exchanges?
+### Proposed follow-up UX improvements (queued)
 
-Any interest in FX/CFD/other later?
+- Trade direction as radio (Long-only / Short-only).
+- Re-order left-column sections: Core/Position → Entry & Indicators → DCA → Exits.
+- Exits split into SL vs TP with conditional fields (hide fixed TP when ATR TP enabled).
+- Each indicator on its own row with settings beside it; add hover help.
 
-Holding period focus
+---
 
-Intra-day vs swing vs multi-day DCA.
+## Update: Futures leverage support (WooX) (optional)
 
-Infrastructure
+✅ Implemented:
 
-Run primarily on QNAP / home server?
+- `WooXClient.set_leverage()`.
+- Worker applies leverage once per bot if enabled via config:
+  - `_futures.apply_leverage_on_start`, `_futures.leverage`
+  - Stores `_runtime.applied_leverage` + timestamp.
+  - Dry-run emits `leverage_set_dry_run`.
+  - Clamps using `_risk.max_leverage`.
+- UI fields added in Bot Config + Create-bot panel.
 
-Cloud VPS later for resilience?
+---
 
-Data source for backtests
+## Hedge mode support status
 
-Exchange-native historical data downloads.
+✅ Current posture:
 
-Third-party data service.
+- Primary recommended approach for simultaneous LONG + SHORT is **two bots**.
+- Broker normalizes legacy `positionSide=BOTH` into LONG/SHORT by sign of holding.
+- Bot creation stores `_trade.primary_position_side` for single-leg strategy compatibility.
 
-Minimum viable monitoring
+✅ Pending safety check:
 
-What must the initial bot dashboard show for you to feel safe running real money?
+- Add a broker/account sanity check: if WooX account is not in hedge mode (or API reports one-way), fail fast with a clear error and event.
 
-5.1 Decisions so far
+---
 
-Primary markets / venues
+## Roadmap: Next best steps
 
-Crypto via Woox.
+### Reliability + correctness
 
-Stocks via Moomoo.
+- Hedge-mode enforcement check (fail fast, clear UI error).
+- Tighten position/PnL calculations using “hybrid” exchange numbers where trusted, with consistent mark-price fallback.
+- Add lightweight websocket layer (later): faster fills/order updates, reduces polling and reconciliation gaps.
 
-Strategy styles
+### UX & workflow
 
-Core: DCA/swing strategies (like Dragon DCA ATR).
+- Backtest page UX polish (radio direction, exits split, indicator rows, tooltips).
+- Sweep settings remain inline per-field; add small sweep summary strip.
+- Results ↔ Live linking: “Create bot from this run” in Results detail.
 
-Future: room for scalping / faster intraday strategies.
+### Multi-user hardening (future)
 
-Risk tolerance (starting point)
+- Put Streamlit behind a reverse proxy (Caddy/Nginx/Traefik) providing auth headers.
+- Move from SQLite → Postgres when multiple workers/users become real.
 
-Target per-bot max drawdown: ~20% while we learn and tune.
+---
 
-Infrastructure preference
+## Quick operational checklist
 
-Run first on QNAP / home server, with option to move to VPS later for resilience.
+1. Start Streamlit
 
-Minimum viable live monitoring
+- Ensure `DRAGON_MASTER_KEY` is set.
+- Ensure reverse proxy sets auth header OR set `DRAGON_USER_EMAIL`.
+- Create credentials in Tools → Credentials.
 
-For each running bot, dashboard should show at minimum:
+2. Run worker (dry-run first)
 
-Bot/strategy name and strategy version / ID.
+```bash
+PYTHONPATH=src python -m project_dragon.live_worker --dry-run
+```
 
-Symbol / market.
+3. Enable processing
 
-Current position (side, size, average entry).
+- Settings → toggle `live_trading_enabled` ON (still safe with kill switch).
 
-Open PnL and cumulative PnL.
+4. Safety
 
-Duration running (start time and elapsed time).
-
-Time of last trade.
-
-Recent/repeated error indicators.
-
-6. Initial Amendments / Ideas (Draft)
-
-6.0 Settings Granularity Committed for v0/v1
-
-For Project Dragon v0/v1 we will support, at an engine/config level:
-
-Separate dynamic activation percentages for:
-
-Initial entry orders.
-
-DCA ladder orders.
-
-Take-profit / exit orders.
-
-Separate timeframes/intervals per indicator, including at least:
-
-Trend MA interval.
-
-BBands interval.
-
-MACD interval.
-
-RSI interval.
-
-These can still be surfaced as "Advanced" fields in the UI, but they are first-class citizens in the configuration model from the start.
-
-Order-type flexibility & dynamic limits
-
-Strategies can choose between market, limit, and maker-style orders explicitly.
-
-Introduce a configurable dynamic limit behaviour:
-
-Each strategy can specify a target price plus an activation band (e.g. "activate when within X% of the desired level").
-
-Until the market is within that band, the order is considered parked (not resting on the book in live mode; not eligible for fills in backtests).
-
-Once price moves inside the activation band, the order becomes active and behaves like a normal limit/maker order.
-
-If price moves back outside the activation band before the order is filled, the engine should cancel/park the order again.
-
-Activation bands can be configured separately for entry, DCA, and TP orders via the DynamicActivationConfig (entry_pct, dca_pct, tp_pct).
-
-These behaviours must be:
-
-Available consistently in both backtests and live trading.
-
-Visible in the UI (e.g. show whether an order is dynamic/parked/active, and what activation band is configured).
-
-Potential upgrades to the initial idea, inspired by research and experience:
-
-Explicit risk module
-
-Separate risk-engine that can veto trades or reduce size.
-
-Configurable rules: max daily loss, max DD, etc.
-
-Config + code version pinning
-
-Every backtest and live bot run stores:
-
-Strategy name + version.
-
-Parameter snapshot.
-
-Git commit hash (when using Git).
-
-Scenario tags
-
-Allow tagging backtests as:
-
-Bull, bear, chop, high-vol, low-vol.
-
-Later, compare strategy robustness across regimes.
-
-Walk-forward-friendly design
-
-Architect the backtest API so it’s easy to run rolling optimizations.
-
-Diagnostics-first UI
-
-When a bot misbehaves, it should be easy to see:
-
-What it "thought" (signals).
-
-Which rules fired (entries/exits).
-
-Why a trade was or wasn’t taken.
-
-These are drafts — we will keep or discard after discussion.
-
-6.7 UI / UX Overview (Backtesting, Results, Live Trading)
-
-Core UI surfaces
-
-Backtesting workspace
-
-Purpose: configure and run single backtests or parameter sweeps for a given strategy (starting with Dragon DCA ATR).
-
-Key elements:
-
-Strategy selector (e.g. DragonDcaAtr).
-
-Config editor (form bound to DragonAlgoConfig):
-
-General settings (max entries, order types, cooldowns, dynamic activation %, etc.).
-
-Exit settings (SL/TP, ATR TP options, trailing parameters).
-
-DCA settings.
-
-Indicator settings (intervals/lengths for MA/BB/MACD/RSI).
-
-Backtest range selection (symbol, timeframe, start/end).
-
-Run controls:
-
-"Run backtest" (single config).
-
-"Run sweep" (grid search over selected parameters).
-
-Status indicator while backtests are in progress.
-
-Backtest results & analysis
-
-Purpose: compare, filter, and inspect completed backtests.
-
-Key elements:
-
-Results table (one row per backtest run) with:
-
-Strategy name + version.
-
-Symbol / timeframe.
-
-Date range.
-
-Key metrics: net P/L, max DD, Sharpe, Sortino, Win %, Profit Factor, CPC, etc.
-
-Config summary (or a link to view full config).
-
-Flags/tags (e.g. shortlisted / deployed).
-
-Table features:
-
-Sorting on any metric.
-
-Filtering by ranges (e.g. DD < X, Sharpe > Y).
-
-Text search on tags/notes.
-
-Detail view for a single run (when a row is clicked):
-
-Equity curve chart (equity vs time or bar index).
-
-Drawdown chart.
-
-Price chart with overlays:
-
-Strategy indicators (MA, BB, etc.) where practical.
-
-Entry/exit markers (initial entry, DCA levels, TP/SL hits).
-
-Optional average entry line.
-
-Trades table:
-
-Timestamp, side, price, size.
-
-Realized PnL, cumulative PnL.
-
-Note (e.g. Initial-Long, DCA-L2, TP_ATR).
-
-Config snapshot (read-only view of the DragonAlgoConfig used for this run).
-
-Actions:
-
-"Shortlist" (mark as a candidate for deployment).
-
-"Deploy as live bot" (when live trading is available).
-
-Live trading dashboard
-
-Purpose: monitor and manage running bots.
-
-Key elements:
-
-Bots list (one row per live bot):
-
-Bot name/label.
-
-Strategy name + version.
-
-Exchange / venue (Woox, Moomoo, etc.).
-
-Symbol / market.
-
-Status (running/paused/stopped/error).
-
-Current position: side, size, average entry.
-
-Unrealized PnL and realized PnL.
-
-Bot-level equity / PnL summary.
-
-Started at / uptime.
-
-Last trade time.
-
-Table features:
-
-Filter by status, symbol, venue.
-
-Sort by PnL, DD, uptime, etc.
-
-Bot detail view (when a row is clicked):
-
-Equity curve for this bot since start.
-
-Current open orders (including whether they are dynamic/parked/active, with activation bands shown).
-
-Recent trades list.
-
-Config snapshot (strategy + parameters used at launch).
-
-Controls:
-
-Pause / resume.
-
-Stop and flatten.
-
-(Future) Edit certain safe parameters.
-
-Health & safety indicators:
-
-Per-bot drawdown vs configured limit.
-
-API error rates / connection issues.
-
-Visual alerts for bots hitting DD limits or error conditions.
-
-UI technology notes (for implementer)
-
-v0/v1 UI can be built in Streamlit for speed of development:
-
-One multi-page app with:
-
-"Backtesting" page (config + run + immediate results).
-
-"Results" page (historical backtest browser and detailed run view).
-
-"Live Bots" page (dashboard + bot detail views).
-
-Charts: use Plotly or Matplotlib via Streamlit for equity/price/trades overlays.
-
-Longer term, a more custom web UI (React, etc.) can replace Streamlit while reusing the same Python back-end.
-
-7. Next Actions
-
-Trent: answer / comment on Open Questions.
-
-ChatGPT: propose a concrete data model and engine interface based on confirmed choices.
-
-Then: start designing the backtest engine for Dragon DCA ATR.
-
-8. Data Layer & Persistence (Draft)
-
-High-level approach
-
-v0 can run purely from CSV/Parquet OHLCV files and in-memory results.
-
-v1 should introduce a small SQL data layer (likely SQLite initially, with an easy path to Postgres later) for:
-
-Indexing and querying backtest runs.
-
-Storing summary metrics and metadata.
-
-(Optional) Caching candle data locally.
-
-8.1 Candle data
-
-For now, Project Dragon can assume flat files (CSV/Parquet) per symbol + timeframe are the primary source of truth for OHLCV.
-
-If/when a SQL table is introduced for candles, a minimal schema could be:
-
-candles table (per exchange or per data source):
-
-id (PK)
-
-symbol (text)
-
-timeframe (text, e.g. 1m, 5m, 1h)
-
-timestamp (datetime, UTC)
-
-open, high, low, close (real)
-
-volume (real)
-
-Unique index on (symbol, timeframe, timestamp).
-
-Recommendation:
-
-Start with files for v0/v1.
-
-Add a candle table later if data reuse, cross-strategy queries, or volume grows enough to justify it.
-
-8.2 Backtest runs & results
-
-SQL is much more valuable for backtest metadata than for raw candles. Suggested tables:
-
-backtest_runs:
-
-id (PK)
-
-created_at (datetime, UTC)
-
-symbol (text)
-
-timeframe (text)
-
-strategy_name (text, e.g. DragonDcaAtr)
-
-strategy_version (text or int)
-
-config_json (text) – full serialized DragonAlgoConfig for reproducibility.
-
-start_time, end_time (datetime, backtest range)
-
-Key summary metrics as columns, e.g.:
-
-net_profit
-
-max_drawdown
-
-sharpe
-
-sortino
-
-win_rate
-
-profit_factor
-
-cpc_index
-
-etc.
-
-backtest_trades:
-
-id (PK)
-
-run_id (FK → backtest_runs.id)
-
-trade_index (int, sequential for each run)
-
-timestamp (datetime)
-
-side (text: long/short)
-
-price (real)
-
-size (real)
-
-realized_pnl (real)
-
-note (text – e.g. Initial-Long, DCA-L3, TP_ATR, etc.).
-
-(Optional) backtest_equity_points:
-
-id (PK)
-
-run_id (FK)
-
-index or timestamp
-
-equity
-
-Design intent:
-
-Backtest runs are first-class objects that can be searched, sorted, and filtered by:
-
-Strategy version.
-
-Config parameters.
-
-Key metrics (e.g. Sharpe > X, DD < Y, WinRate > Z).
-
-All the raw detail (trades + equity curve) is available for drill-down when a run is opened in the UI.
-
-8.3 Live bots (future)
-
-Future table sketches (not required for v0, but useful to keep in mind):
-
-live_bots:
-
-id (PK)
-
-name / bot_label
-
-exchange / venue
-
-symbol
-
-strategy_name
-
-strategy_version
-
-config_json
-
-status (running/paused/stopped)
-
-started_at, stopped_at
-
-initial_equity, current_equity
-
-live_bot_events / live_bot_logs:
-
-bot_id (FK)
-
-timestamp
-
-event_type (trade, error, restart, risk_cutoff, etc.)
-
-payload_json (for flexible details).
-
-SQL is helpful but not mandatory for v0. The guidance for the next AI:
-
-Use simple file-based storage for raw candles initially.
-
-Consider SQLite for backtest_runs / backtest_trades once we start doing serious parameter sweeps and need fast querying.
-
-9. Implementation Status & Handover Notes
-
-This section is meant as a handover for whoever (or whichever AI) continues implementation.
-
-9.1 Current repo state (as of 2025-11-29)
-
-GitHub repo (name): project_dragon.
-
-Language: Python.
-
-Current core modules under src/project_dragon/:
-
-domain.py – core types (Candle, Order, Position, Trade, BacktestResult).
-
-config_dragon.py – DragonAlgoConfig and related dataclasses, including DynamicActivationConfig (entry_pct/dca_pct/tp_pct).
-
-broker_sim.py – simple long-only broker simulator with:
-
-Market and limit orders.
-
-Fee model.
-
-Single net position.
-
-engine.py – BacktestEngine and BacktestConfig:
-
-Runs a Strategy over an iterable of Candle objects.
-
-Calls strategy.on_bar(index, candle, broker) each bar.
-
-strategy_dragon.py – DragonDcaAtrStrategy skeleton with basic state object (DragonDcaAtrState).
-
-Example script:
-
-examples/run_backtest_example.py:
-
-Generates synthetic candles.
-
-Instantiates DragonDcaAtrStrategy(dragon_config_example).
-
-Runs BacktestEngine.run(...) and prints high-level results.
-
-9.2 What currently works
-
-The package imports correctly when PYTHONPATH=src is set.
-
-python -m examples.run_backtest_example runs end-to-end in a Codespace:
-
-Candles are generated.
-
-BacktestEngine iterates over them.
-
-BrokerSim processes orders.
-
-Strategy hooks are called.
-
-The current strategy implementation is intentionally minimal (no full Haas logic yet). It may:
-
-Open simple initial longs.
-
-Optionally add basic DCA rungs depending on the latest implementation.
-
-It does not yet implement full ATR TP / trailing exit behaviour.
-
-9.3 Next implementation tasks for the Dragon strategy
-
-Indicator & signal layer
-
-Implement MA/BB/MACD/RSI calculations over historical candles.
-
-Mirror the Haas intervals (MA, BB, MACD, RSI have separate *_interval values).
-
-Implement the "indicator consensus" logic as used in the Haas script.
-
-Wire this into _handle_flat_state(...) so entries respect both trend and signal consensus.
-
-DCA ladder (full port)
-
-Port the Haas DCA ladder logic into methods like:
-
-_update_initial_entry(...)
-
-_process_initial_entry_fill(...)
-
-_manage_dca(...)
-
-Respect config flags:
-
-use_avg_entry_for_dca_base
-
-lock_atr_on_entry_for_dca (cached ATR-based deviations vs live deviations).
-
-Ensure behaviour matches the original Haas script for a given config and data.
-
-Take-profit and stop-loss logic
-
-Implement a full update_tp(...) equivalent:
-
-Support both fixed % TP and ATR-on-entry distance.
-
-Implement tpInitDist and dcaRecalcTP semantics (re-anchoring TP after DCA fills).
-
-Implement stop-loss and trailing exit logic similar to updateTrailingExit(...) in the Haas script.
-
-Ensure TP/SL orders integrate with the dynamic limit behaviour (activation bands) where appropriate.
-
-Dynamic limit orders (engine + broker)
-
-Extend BrokerSim (and later live adapters) to support a dynamic limit order wrapper:
-
-Store the logical target price and activation band.
-
-Only submit/keep the order active when within the band.
-
-Cancel/park the order when outside the band.
-
-Expose this via a clean interface so strategies can request:
-
-"place dynamic entry limit" (using DynamicActivationConfig.entry_pct).
-
-"place dynamic DCA limit" (using DynamicActivationConfig.dca_pct).
-
-"place dynamic TP limit" (using DynamicActivationConfig.tp_pct).
-
-Metrics & reporting
-
-Implement calculation of standard metrics on BacktestResult:
-
-Net profit, max drawdown.
-
-Sharpe, Sortino, Profit Factor.
-
-Win %, Common Sense Ratio, CPC, etc.
-
-Store these metrics in a way that can be saved to backtest_runs (SQL or file-based).
-
-Streamlit or web UI prototype
-
-Build a minimal dashboard that can:
-
-Run a single backtest with a chosen DragonAlgoConfig.
-
-Plot equity curve + drawdown.
-
-Show a trades table.
-
-Show key metrics.
-
-Later, expand into a backtest run browser with sorting/filtering.
-
-9.4 Design notes for the next AI
-
-Keep the separation of concerns in mind:
-
-Strategy logic should not depend on Streamlit or SQL directly.
-
-BrokerSim and real exchange adapters should share a common interface.
-
-Data loading (CSV/SQL/API) should live in a dedicated data module.
-
-When expanding the strategy, try to:
-
-Port Haas functions one at a time.
-
-Keep names as close as possible to the original (e.g. updateTP, manageDCA) for easier cross-referencing.
-
-Add docstrings referencing the original Haas behaviour.
-
-10. Change Log
-
-2025-11-26: Initial document created with vision, scope, research summary, open questions, and draft amendments.
-
-2025-11-29: Added data layer & persistence outline, dynamic limit semantics, and implementation handover notes for the next AI/maintainer.
+- Keep global kill switch ON while validating charts/events/positions.
+- Only disable kill switch once confident, with small sizing.
 
