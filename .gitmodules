@@ -1,0 +1,6 @@
+[submodule "app/assets/crypto_icons/spothq/cryptocurrency-icons"]
+	path = app/assets/crypto_icons/spothq/cryptocurrency-icons
+	url = https://github.com/spothq/cryptocurrency-icons.git
+[submodule "app/assets/ui_icons/tabler/_upstream"]
+	path = app/assets/ui_icons/tabler/_upstream
+	url = https://github.com/tabler/tabler-icons.git

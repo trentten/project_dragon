@@ -1,0 +1,14 @@
+
+# --- Dragon local/dev ---
+.env
+.env.*
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Python ---
+__pycache__/
+.pytest_cache/
+.venv/
