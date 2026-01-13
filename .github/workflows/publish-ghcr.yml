@@ -34,7 +34,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
+            type=ref,event=tag
             type=raw,value=stable
 
       - name: Build and push (multi-arch)
