@@ -1,6 +1,6 @@
 services:
   dragon_ui:
-    image: ${DRAGON_IMAGE:-ghcr.io/YOUR_GH_OWNER/YOUR_REPO:stable}
+    image: ${DRAGON_IMAGE:-ghcr.io/trentten/project-dragon:stable}
     container_name: dragon_ui
     restart: unless-stopped
     environment:
@@ -19,7 +19,7 @@ services:
       --server.port 8501
 
   dragon_worker:
-    image: ${DRAGON_IMAGE:-ghcr.io/YOUR_GH_OWNER/YOUR_REPO:stable}
+    image: ${DRAGON_IMAGE:-ghcr.io/trentten/project-dragon:stable}
     container_name: dragon_worker
     restart: unless-stopped
     environment:
