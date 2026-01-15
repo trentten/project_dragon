@@ -18,9 +18,9 @@ services:
       --server.address 0.0.0.0
       --server.port 8501
 
-  dragon_worker:
+  live_worker:
     image: ghcr.io/trentten/project_dragon:v0.1.3
-    container_name: dragon_worker
+    container_name: live_worker
     restart: unless-stopped
     environment:
       TZ: Australia/Brisbane
@@ -32,3 +32,18 @@ services:
       - /share/Container/dragon-test/logs:/app/logs
     command: >
       bash -lc "PYTHONPATH=src python -m project_dragon.live_worker"
+
+  backtest_worker:
+    image: ghcr.io/trentten/project_dragon:v0.1.3
+    container_name: backtest_worker
+    restart: unless-stopped
+    environment:
+      TZ: Australia/Brisbane
+      DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
+      DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+    volumes:
+      - /share/Container/dragon-test/data:/app/data
+      - /share/Container/dragon-test/config:/app/config
+      - /share/Container/dragon-test/logs:/app/logs
+    command: >
+      bash -lc "PYTHONPATH=src python -m project_dragon.backtest_worker"
