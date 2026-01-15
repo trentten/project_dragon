@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional
+import re
 
 import streamlit as st
 
@@ -12,12 +13,203 @@ except Exception:  # pragma: no cover
 
 
 def inject_trade_stream_css(max_width_px: int = 1920) -> None:
-    """Global CSS tweaks for a tighter, wider layout (Phase 1)."""
+    """Global CSS for a tighter, wider layout + Dragon dark theme.
+
+    Important: do NOT override Streamlit focus rings globally.
+    """
+
+    # Dragon palette (presentation-only)
+    app_bg = "#1c1c1d"
+    sidebar_bg = "#111112"
+    card_bg = "#262627"
+    border = "#323233"
+    input_bg = "#333334"
+    text = "rgba(242, 242, 242, 0.96)"
+    text_muted = "rgba(242, 242, 242, 0.70)"
+    accent = "#F28C28"
+    selected_bg = "#3d3d3e"
+    accent_overlay = "rgba(242, 140, 40, 0.10)"
+
+    # Tabler icon data-URIs for CSS pseudo-elements.
+    # Use as_img=True and extract the <img src="..."> data uri.
+    try:
+        from project_dragon.ui.icons import render_tabler_icon  # local import to avoid heavy deps at module import time
+
+        _src_re = re.compile(r'src="([^"]+)"', flags=re.IGNORECASE)
+
+        def _tabler_data_uri(name: str, *, size_px: int = 18, color: str = accent) -> str:
+            html = render_tabler_icon(name, size_px=size_px, color=color, variant="filled", as_img=True)
+            m = _src_re.search(html)
+            return m.group(1) if m else ""
+
+        nav_dashboard = _tabler_data_uri("layout-dashboard")
+        nav_backtest = _tabler_data_uri("flask")
+        nav_results = _tabler_data_uri("presentation-analytics")
+        nav_runs = _tabler_data_uri("binoculars")
+        nav_sweeps = _tabler_data_uri("sort-descending-2")
+        nav_bots = _tabler_data_uri("atom-2")
+        nav_accounts = _tabler_data_uri("user")
+        nav_jobs = _tabler_data_uri("stack-2")
+        nav_cache = _tabler_data_uri("chart-candle")
+        nav_settings = _tabler_data_uri("settings")
+
+        act_rerun = _tabler_data_uri("replace")
+        act_create_bot = _tabler_data_uri("copy-plus")
+        act_open_sweep = _tabler_data_uri("versions")
+        act_play = _tabler_data_uri("player-play")
+        act_pause = _tabler_data_uri("player-pause")
+        act_cancel = _tabler_data_uri("circle-x")
+        act_delete = _tabler_data_uri("trash")
+    except Exception:  # pragma: no cover
+        nav_dashboard = nav_backtest = nav_results = nav_runs = nav_sweeps = ""
+        nav_bots = nav_accounts = nav_jobs = nav_cache = nav_settings = ""
+        act_rerun = act_create_bot = act_open_sweep = ""
+        act_play = act_pause = act_cancel = act_delete = ""
 
     max_width_px = int(max(1200, min(2400, max_width_px)))
     st.markdown(
         f"""
         <style>
+                    /* ---- Dragon theme palette (do not touch focus rings) ---- */
+                    div[data-testid="stAppViewContainer"] {{
+                        background-color: {app_bg};
+                        color: {text};
+                    }}
+
+                    header[data-testid="stHeader"] {{
+                        background-color: {app_bg};
+                    }}
+
+                    section[data-testid="stSidebar"] {{
+                        background-color: {sidebar_bg};
+                        border-right: 1px solid {border};
+                    }}
+
+                    /* Bordered containers (cards) */
+                    div[data-testid="stVerticalBlockBorderWrapper"] > div {{
+                        background-color: {card_bg};
+                        border: 1px solid {border};
+                        border-radius: 0.75rem;
+                    }}
+
+                    /* Muted text */
+                    .dragon-muted {{
+                        color: {text_muted};
+                    }}
+
+                    /* Inputs: match palette (no focus overrides) */
+                    div[data-testid="stTextInput"] input,
+                    div[data-testid="stNumberInput"] input,
+                    div[data-testid="stTextArea"] textarea {{
+                        background-color: {input_bg};
+                        border-color: {border};
+                        color: {text};
+                    }}
+
+                    /* Selectbox container */
+                    div[data-testid="stSelectbox"] > div > div {{
+                        background-color: {input_bg};
+                        border-color: {border};
+                        color: {text};
+                    }}
+
+                    /* Buttons: neutral outline; no orange outlines */
+                    div[data-testid="stButton"] > button,
+                    div[data-testid="baseButton-secondary"] > button,
+                    div[data-testid="baseButton-primary"] > button {{
+                        border-color: {border};
+                    }}
+
+                    /* --- Icon button helpers (CSS pseudo-elements) --- */
+                    div[class*="st-key-nav_btn_"] button,
+                    div[class*="st-key-run_actions_"] button,
+                    div[class*="st-key-rerun_sweep_btn_"] button,
+                    div[class*="st-key-delete_sweep_btn_"] button,
+                    div[class*="st-key-sweep_pause_"] button,
+                    div[class*="st-key-sweep_resume_"] button,
+                    div[class*="st-key-sweep_cancel_"] button,
+                    div[class*="st-key-detail_resume"] button,
+                    div[class*="st-key-detail_pause"] button,
+                    div[class*="st-key-detail_stop"] button,
+                    div[class*="st-key-cancel_job_"] button,
+                    div[class*="st-key-acct_delete_"] button {{
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 0.45rem;
+                    }}
+                    div[class*="st-key-nav_btn_"] button::before,
+                    div[class*="st-key-run_actions_"] button::before,
+                    div[class*="st-key-rerun_sweep_btn_"] button::before,
+                    div[class*="st-key-delete_sweep_btn_"] button::before,
+                    div[class*="st-key-sweep_pause_"] button::before,
+                    div[class*="st-key-sweep_resume_"] button::before,
+                    div[class*="st-key-sweep_cancel_"] button::before,
+                    div[class*="st-key-detail_resume"] button::before,
+                    div[class*="st-key-detail_pause"] button::before,
+                    div[class*="st-key-detail_stop"] button::before,
+                    div[class*="st-key-cancel_job_"] button::before,
+                    div[class*="st-key-acct_delete_"] button::before {{
+                        content: "";
+                        width: 18px;
+                        height: 18px;
+                        background-repeat: no-repeat;
+                        background-position: center;
+                        background-size: 18px 18px;
+                        flex: 0 0 18px;
+                    }}
+
+                    /* Sidebar nav selected styling (background + subtle orange tint + optional left bar)
+                         Keep it scoped to nav buttons only. */
+                    section[data-testid="stSidebar"] div[class*="st-key-nav_btn_"] button {{
+                        background-color: {sidebar_bg};
+                        border: 1px solid {border};
+                        color: {text};
+                        justify-content: flex-start;
+                        width: 100%;
+                        position: relative;
+                    }}
+                    section[data-testid="stSidebar"] div[class*="st-key-nav_btn_"] button[kind="primary"] {{
+                        background-color: {selected_bg};
+                        background-image: linear-gradient(0deg, {accent_overlay}, {accent_overlay});
+                    }}
+                    section[data-testid="stSidebar"] div[class*="st-key-nav_btn_"] button[kind="primary"]::after {{
+                        content: "";
+                        position: absolute;
+                        left: 0;
+                        top: 4px;
+                        bottom: 4px;
+                        width: 3px;
+                        background: {accent};
+                        border-radius: 2px;
+                    }}
+
+                    /* ---- Sidebar nav icons (Tabler filled) ---- */
+                      div[class*="st-key-nav_btn_dashboard"] button::before {{ background-image: url("{nav_dashboard}"); }}
+                      div[class*="st-key-nav_btn_backtest"] button::before {{ background-image: url("{nav_backtest}"); }}
+                      div[class*="st-key-nav_btn_results"] button::before {{ background-image: url("{nav_results}"); }}
+                      div[class*="st-key-nav_btn_runs_explorer"] button::before {{ background-image: url("{nav_runs}"); }}
+                      div[class*="st-key-nav_btn_sweeps"] button::before {{ background-image: url("{nav_sweeps}"); }}
+                      div[class*="st-key-nav_btn_live"] button::before {{ background-image: url("{nav_bots}"); }}
+                      div[class*="st-key-nav_btn_accounts"] button::before {{ background-image: url("{nav_accounts}"); }}
+                      div[class*="st-key-nav_btn_jobs"] button::before {{ background-image: url("{nav_jobs}"); }}
+                      div[class*="st-key-nav_btn_candle_cache"] button::before {{ background-image: url("{nav_cache}"); }}
+                      div[class*="st-key-nav_btn_settings"] button::before {{ background-image: url("{nav_settings}"); }}
+
+                    /* ---- Action button icons (Tabler filled) ---- */
+                      div[class*="st-key-run_actions_rerun_"] button::before {{ background-image: url("{act_rerun}"); }}
+                      div[class*="st-key-run_actions_create_bot_"] button::before {{ background-image: url("{act_create_bot}"); }}
+                      div[class*="st-key-run_actions_open_sweep_"] button::before {{ background-image: url("{act_open_sweep}"); }}
+                      div[class*="st-key-rerun_sweep_btn_"] button::before {{ background-image: url("{act_rerun}"); }}
+                      div[class*="st-key-delete_sweep_btn_"] button::before {{ background-image: url("{act_delete}"); }}
+                      div[class*="st-key-sweep_pause_"] button::before {{ background-image: url("{act_pause}"); }}
+                      div[class*="st-key-sweep_resume_"] button::before {{ background-image: url("{act_play}"); }}
+                      div[class*="st-key-sweep_cancel_"] button::before {{ background-image: url("{act_cancel}"); }}
+                      div[class*="st-key-detail_resume"] button::before {{ background-image: url("{act_play}"); }}
+                      div[class*="st-key-detail_pause"] button::before {{ background-image: url("{act_pause}"); }}
+                      div[class*="st-key-detail_stop"] button::before {{ background-image: url("{act_cancel}"); }}
+                      div[class*="st-key-cancel_job_"] button::before {{ background-image: url("{act_cancel}"); }}
+                      div[class*="st-key-acct_delete_"] button::before {{ background-image: url("{act_delete}"); }}
+
           /* Wider content area (Streamlit 'wide' still has a max-width + padding) */
           div[data-testid="stAppViewContainer"] .block-container {{
             max-width: {max_width_px}px;
@@ -73,18 +265,18 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
             margin-bottom: 0.25rem;
             font-size: 0.8rem;
             font-weight: 600;
-            border: 1px solid rgba(148,163,184,0.30);
-            background: rgba(148,163,184,0.10);
-            color: rgba(226,232,240,0.95);
+                        border: 1px solid rgba(255,255,255,0.12);
+                        background: rgba(242,242,242,0.06);
+                        color: {text};
           }}
 
           /* KPI tile */
                     .dragon-kpi-card {{
-                        border: 1px solid rgba(148,163,184,0.22);
+                        border: 1px solid {border};
                         border-radius: 0.75rem;
                         padding: 0.45rem 0.60rem;
                         margin-bottom: 24px;
-                        background: rgba(148,163,184,0.06);
+                        background: rgba(242,242,242,0.04);
                         display: block;
                         width: 100%;
                         box-sizing: border-box;
@@ -97,7 +289,7 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                     }}
           .dragon-kpi-label {{
             font-size: 0.78rem;
-            color: rgba(148,163,184,0.95);
+                        color: {text_muted};
             margin-bottom: 0.15rem;
           }}
           .dragon-kpi-value {{
@@ -107,7 +299,7 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
           }}
           .dragon-kpi-subtext {{
             font-size: 0.78rem;
-            color: rgba(148,163,184,0.95);
+                        color: {text_muted};
             margin-top: 0.15rem;
           }}
 
@@ -142,7 +334,7 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                     border-spacing: 0;
                                 }}
                                 .dragon-metrics-table tr {{
-                                    border-bottom: 1px solid rgba(148,163,184,0.16);
+                                    border-bottom: 1px solid rgba(255,255,255,0.08);
                                 }}
                                 .dragon-metrics-table tr:last-child {{
                                     border-bottom: none;
@@ -153,7 +345,7 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                     vertical-align: middle;
                                 }}
                                 .dragon-metrics-table td.label {{
-                                    color: rgba(148,163,184,0.95);
+                                    color: {text_muted};
                                     font-weight: 650;
                                     white-space: nowrap;
                                 }}
@@ -163,10 +355,10 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                     white-space: nowrap;
                                 }}
                                 .dragon-row-bg {{
-                                    background: rgba(148,163,184,0.06);
+                                    background: rgba(242,242,242,0.04);
                                 }}
                                 .dragon-muted {{
-                                    color: rgba(148,163,184,0.85);
+                                    color: {text_muted};
                                     font-size: 0.86rem;
                                 }}
 
@@ -180,7 +372,7 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                     font-size: 0.86rem;
                                 }}
                                 .dragon-kv-table td.label {{
-                                    color: rgba(148,163,184,0.95);
+                                    color: {text_muted};
                                     font-weight: 700;
                                 }}
                                 .dragon-kv-table td.value {{
@@ -201,7 +393,7 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                 }}
                                 .dragon-ratio-header .label {{
                                     font-size: 0.86rem;
-                                    color: rgba(148,163,184,0.95);
+                                    color: {text_muted};
                                     font-weight: 700;
                                 }}
                                 .dragon-ratio-header .value {{
@@ -213,8 +405,8 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                     height: 12px;
                                     border-radius: 999px;
                                     overflow: hidden;
-                                    background: rgba(148,163,184,0.14);
-                                    border: 1px solid rgba(148,163,184,0.18);
+                                    background: rgba(242,242,242,0.10);
+                                    border: 1px solid rgba(255,255,255,0.12);
                                 }}
                                 .dragon-splitbar .long {{
                                     height: 100%;
@@ -338,19 +530,34 @@ def aggrid_pill_style(kind: str) -> Any:
                 if (!s) { return {}; }
                 const parts = s.split('→').map(x => x.trim());
                 const eff = (parts.length >= 2 && parts[1]) ? parts[1] : parts[0];
+
+                // More specific terms first.
+                if (eff.includes('cancelling') || eff.includes('canceling')) {
+                    return { color: '#b6d4fe', backgroundColor: 'rgba(56,139,253,0.14)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
+                }
                 if (eff.includes('error')) {
-                    return { color: '#ff7b72', backgroundColor: 'rgba(248,81,73,0.18)', fontWeight: '800', textAlign: 'center', borderRadius: '999px' };
+                    return { color: '#ff7b72', backgroundColor: 'rgba(248,81,73,0.18)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
+                }
+                if (eff.includes('fail')) {
+                    return { color: '#ff7b72', backgroundColor: 'rgba(248,81,73,0.18)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
                 }
                 if (eff.includes('run')) {
-                    return { color: '#7ee787', backgroundColor: 'rgba(46,160,67,0.18)', fontWeight: '800', textAlign: 'center', borderRadius: '999px' };
+                    return { color: '#7ee787', backgroundColor: 'rgba(46,160,67,0.18)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
+                }
+                if (eff.includes('done') || eff.includes('complete') || eff.includes('success')) {
+                    // Differentiate "Done" from "Running" (purple vs green).
+                    return { color: '#a371f7', backgroundColor: 'rgba(163,113,247,0.18)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
                 }
                 if (eff.includes('pause')) {
-                    return { color: '#facc15', backgroundColor: 'rgba(250,204,21,0.16)', fontWeight: '800', textAlign: 'center', borderRadius: '999px' };
+                    return { color: '#facc15', backgroundColor: 'rgba(250,204,21,0.16)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
                 }
                 if (eff.includes('queue') || eff.includes('starting') || eff.includes('stopping')) {
-                    return { color: '#b6d4fe', backgroundColor: 'rgba(56,139,253,0.14)', fontWeight: '800', textAlign: 'center', borderRadius: '999px' };
+                    return { color: '#b6d4fe', backgroundColor: 'rgba(56,139,253,0.14)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
                 }
-                return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.12)', fontWeight: '700', textAlign: 'center', borderRadius: '999px' };
+                if (eff.includes('cancel')) {
+                    return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.10)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
+                }
+                return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
             }
             """
         )
@@ -362,12 +569,12 @@ def aggrid_pill_style(kind: str) -> Any:
             const s = (params.value || '').toString().trim().toUpperCase();
             if (!s) { return { color: '#94a3b8', textAlign: 'center' }; }
             if (s.includes('RISK') || s.includes('OPEN')) {
-                return { color: '#ff7b72', backgroundColor: 'rgba(248,81,73,0.14)', fontWeight: '800', textAlign: 'center', borderRadius: '999px' };
+                return { color: '#ff7b72', backgroundColor: 'rgba(248,81,73,0.14)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
             }
             if (s.includes('HALF_OPEN') || s.includes('DEG') || s.includes('STALE') || s.includes('HEDGE') || s.includes('KILL') || s.includes('WARN')) {
-                return { color: '#facc15', backgroundColor: 'rgba(250,204,21,0.14)', fontWeight: '800', textAlign: 'center', borderRadius: '999px' };
+                return { color: '#facc15', backgroundColor: 'rgba(250,204,21,0.14)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
             }
-            return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.10)', fontWeight: '700', textAlign: 'center', borderRadius: '999px' };
+            return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.10)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
         }
         """
     )

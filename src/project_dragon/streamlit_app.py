@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -26,6 +25,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import logging
 import streamlit as st
+
+try:
+    from project_dragon._version import __version__  # type: ignore
+except Exception:  # pragma: no cover
+    __version__ = "0"  # type: ignore
 
 try:
     from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, GridUpdateMode, JsCode  # type: ignore
@@ -69,6 +73,7 @@ from project_dragon.live.trade_config import (
 from project_dragon.storage import (
     SweepMeta,
     add_bot_event,
+    bulk_enqueue_backtest_run_jobs,
     claim_job,
     count_backtest_runs_missing_details,
     count_bots_for_account,
@@ -85,6 +90,8 @@ from project_dragon.storage import (
     get_app_settings,
     get_backtest_run,
     get_backtest_run_chart_artifacts,
+    get_backtest_run_job_counts_by_sweep,
+    get_backtest_run_job_counts_by_parent,
     get_bot,
     get_bot_context,
     get_bot_snapshot,
@@ -94,6 +101,9 @@ from project_dragon.storage import (
     get_current_user_email,
     get_symbols_primary_category_map,
     get_sweep,
+    get_sweep_parent_jobs_by_sweep,
+    set_job_pause_requested,
+    set_job_cancel_requested,
     get_job,
     get_or_create_user_id,
     get_user_setting,
@@ -163,6 +173,54 @@ from project_dragon.ui.components import (
 )
 from project_dragon.ui.global_filters import apply_global_filters, ensure_global_filters_initialized, get_global_filters, set_global_filters
 from project_dragon.strategy_dragon import DragonDcaAtrStrategy
+
+from project_dragon.time_utils import DEFAULT_DISPLAY_TZ_NAME, fmt_date, fmt_dt, fmt_dt_short, get_display_tz_name, to_local_display
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+
+def _ui_display_tz():
+    """Global UI display timezone (presentation-only).
+
+    Stored per-user via user_settings key 'display_timezone'.
+    Falls back to DEFAULT_DISPLAY_TZ_NAME.
+    """
+
+    name = str(st.session_state.get("display_timezone_name") or "").strip() or DEFAULT_DISPLAY_TZ_NAME
+    if ZoneInfo is None:  # pragma: no cover
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        try:
+            return ZoneInfo(DEFAULT_DISPLAY_TZ_NAME)
+        except Exception:
+            return timezone.utc
+
+
+def _ui_local_date_iso(value: Any, tz: Any) -> Optional[str]:
+    """Convert a timestamp to a local ISO date (YYYY-MM-DD) for UI display."""
+
+    try:
+        dt_local = to_local_display(value, tz)
+        return dt_local.date().isoformat() if dt_local is not None else None
+    except Exception:
+        return None
+
+
+def _ui_local_dt_ampm(value: Any, tz: Any) -> Optional[str]:
+    """Run-date display format used across run grids: DD/MM hh:mm AM/PM (local tz)."""
+
+    try:
+        dt_local = to_local_display(value, tz)
+        if dt_local is None:
+            return None
+        return dt_local.strftime("%d/%m %I:%M %p")
+    except Exception:
+        return None
 
 
 def _build_live_bots_overview_df(bots: List[Dict[str, Any]], user_id: str | int) -> pd.DataFrame:
@@ -563,6 +621,33 @@ def _render_live_bots_aggrid(df: pd.DataFrame, *, grid_key: str = "live_bots_ove
     status_badge_style = aggrid_pill_style("status")
     flags_style = aggrid_pill_style("risk")
 
+    status_cap_formatter = JsCode(
+        """
+        function(params) {
+            try {
+                const v = (params && params.value !== undefined && params.value !== null) ? params.value.toString() : '';
+                const s = v.trim();
+                if (!s) return '';
+
+                function cap1(x) {
+                    const t = (x || '').toString().trim();
+                    if (!t) return '';
+                    return t.charAt(0).toUpperCase() + t.slice(1);
+                }
+
+                // Preserve desired-state arrows while capitalizing each part.
+                if (s.indexOf('→') >= 0) {
+                    const parts = s.split('→').map(p => cap1(p));
+                    return parts.join(' → ');
+                }
+                return cap1(s);
+            } catch (e) {
+                return (params && params.value !== undefined && params.value !== null) ? params.value : '';
+            }
+        }
+        """
+    )
+
     pnl_style = JsCode(
         r"""
         function(params) {
@@ -639,6 +724,7 @@ def _render_live_bots_aggrid(df: pd.DataFrame, *, grid_key: str = "live_bots_ove
             "Status",
             width=150,
             cellStyle=status_badge_style,
+            valueFormatter=status_cap_formatter,
             cellClass="ag-center-aligned-cell",
             wrapHeaderText=True,
             autoHeaderHeight=True,
@@ -778,84 +864,82 @@ def _aggrid_dark_custom_css() -> dict:
             "--ag-header-font-size": "14px",
             "--ag-row-height": "36px",
             "--ag-header-height": "40px",
-            "--ag-background-color": "#1D2737",
-            "--ag-odd-row-background-color": "#223046",
-            "--ag-header-background-color": "#2A4569",
-            "--ag-header-foreground-color": "#FFFFFF",
-            "--ag-foreground-color": "#FFFFFF",
-            "--ag-secondary-foreground-color": "#CBD5E1",
-            "--ag-border-color": "#3B516F",
-            "--ag-row-border-color": "#2D3F5B",
+            "--ag-background-color": "#262627",
+            "--ag-odd-row-background-color": "#242425",
+            "--ag-header-background-color": "#2d2d2e",
+            "--ag-header-foreground-color": "rgba(242,242,242,0.96)",
+            "--ag-foreground-color": "rgba(242,242,242,0.96)",
+            "--ag-secondary-foreground-color": "rgba(242,242,242,0.70)",
+            "--ag-border-color": "#323233",
+            "--ag-row-border-color": "#2f2f30",
             "--ag-cell-horizontal-padding": "10px",
             "--ag-border-radius": "6px",
-            "--ag-row-hover-color": "rgba(59, 130, 246, 0.12)",
-            "--ag-selected-row-background-color": "rgba(59, 130, 246, 0.18)",
-            "--ag-control-panel-background-color": "#1D2737",
-            "--ag-menu-background-color": "#1D2737",
-            "--ag-popup-background-color": "#1D2737",
+            "--ag-row-hover-color": "rgba(242, 242, 242, 0.05)",
+            "--ag-selected-row-background-color": "rgba(242, 140, 40, 0.14)",
+            "--ag-control-panel-background-color": "#262627",
+            "--ag-menu-background-color": "#262627",
+            "--ag-popup-background-color": "#262627",
             "--ag-popup-shadow": "0 8px 24px rgba(0,0,0,0.35)",
-            "--ag-input-background-color": "#223046",
-            "--ag-input-border-color": "#3B516F",
-            "--ag-input-focus-border-color": "#60a5fa",
-            "border": "1px solid #3B516F",
+            "--ag-input-background-color": "#333334",
+            "--ag-input-border-color": "#323233",
+            "border": "1px solid #323233",
             "border-radius": "6px",
-            "background-color": "#1D2737",
-            "color": "#FFFFFF",
+            "background-color": "#262627",
+            "color": "rgba(242,242,242,0.96)",
             "font-family": "Roboto,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif",
         },
-        ".ag-root-wrapper-body": {"background-color": "#1D2737"},
+        ".ag-root-wrapper-body": {"background-color": "#262627"},
         ".ag-header": {
             "border-bottom": "1px solid rgba(255,255,255,0.10)",
-            "background-color": "#2A4569",
+            "background-color": "#2d2d2e",
         },
         ".ag-header-cell-label": {
             "font-weight": "500",
             "letter-spacing": "0.00em",
-            "color": "#FFFFFF",
+            "color": "rgba(242,242,242,0.96)",
             "white-space": "normal",
             "line-height": "1.1",
         },
-        ".ag-header-cell-text": {"color": "#FFFFFF", "white-space": "normal"},
+        ".ag-header-cell-text": {"color": "rgba(242,242,242,0.96)", "white-space": "normal"},
         ".ag-header-cell": {"align-items": "center"},
-        ".ag-row:nth-child(even) .ag-cell": {"background-color": "#1F2B3F"},
+        ".ag-row:nth-child(even) .ag-cell": {"background-color": "#242425"},
         ".ag-cell": {
             "padding-left": "10px",
             "padding-right": "10px",
             "font-variant-numeric": "tabular-nums",
-            "color": "#FFFFFF",
+            "color": "rgba(242,242,242,0.96)",
         },
         # Actions column: tighter padding so icon buttons fit without a huge column.
         ".ag-cell[col-id='actions']": {"padding-left": "2px", "padding-right": "2px"},
         ".ag-cell-wrapper": {"align-items": "center", "height": "100%"},
         ".ag-cell-value": {"display": "flex", "align-items": "center", "height": "100%"},
-        ".ag-row": {"background-color": "#223046"},
+        ".ag-row": {"background-color": "#262627"},
         ".ag-body-viewport": {"color-scheme": "dark"},
         ".ag-popup": {"color-scheme": "dark"},
         ".ag-popup-child": {
-            "background-color": "#1D2737",
-            "border": "1px solid #3B516F",
+            "background-color": "#262627",
+            "border": "1px solid #323233",
             "box-shadow": "0 8px 24px rgba(0,0,0,0.35)",
-            "color": "#FFFFFF",
+            "color": "rgba(242,242,242,0.96)",
         },
         ".ag-menu": {
-            "background-color": "#1D2737",
-            "color": "#FFFFFF",
-            "border": "1px solid #3B516F",
+            "background-color": "#262627",
+            "color": "rgba(242,242,242,0.96)",
+            "border": "1px solid #323233",
             "color-scheme": "dark",
         },
-        ".ag-menu-option": {"color": "#FFFFFF"},
-        ".ag-menu-option:hover": {"background-color": "rgba(59, 130, 246, 0.16)"},
-        ".ag-filter": {"background-color": "#1D2737", "color": "#FFFFFF"},
-        ".ag-filter-body": {"background-color": "#1D2737"},
-        ".ag-filter-apply-panel": {"background-color": "#1D2737"},
+        ".ag-menu-option": {"color": "rgba(242,242,242,0.96)"},
+        ".ag-menu-option:hover": {"background-color": "rgba(242, 242, 242, 0.06)"},
+        ".ag-filter": {"background-color": "#262627", "color": "rgba(242,242,242,0.96)"},
+        ".ag-filter-body": {"background-color": "#262627"},
+        ".ag-filter-apply-panel": {"background-color": "#262627"},
         ".ag-input-field-input": {
-            "background-color": "#223046",
-            "border": "1px solid #3B516F",
-            "color": "#FFFFFF",
+            "background-color": "#333334",
+            "border": "1px solid #323233",
+            "color": "rgba(242,242,242,0.96)",
         },
-        ".ag-input-field-input:focus": {"border-color": "#60a5fa"},
-        ".ag-picker-field-wrapper": {"background-color": "#223046", "border": "1px solid #3B516F"},
-        ".ag-select": {"background-color": "#223046", "color": "#FFFFFF"},
+        ".ag-picker-field-wrapper": {"background-color": "#333334", "border": "1px solid #323233"},
+        ".ag-select": {"background-color": "#333334", "color": "rgba(242,242,242,0.96)"},
         ".ag-right-aligned-cell": {"font-variant-numeric": "tabular-nums"},
         ".ag-center-aligned-cell": {"justify-content": "center"},
     }
@@ -1527,12 +1611,17 @@ def init_state_defaults(settings: Dict[str, Any]) -> None:
     # Migrate old keys to the new required names.
     if "results_show_all_runs" not in st.session_state and "results_show_all" in st.session_state:
         st.session_state["results_show_all_runs"] = bool(st.session_state.get("results_show_all"))
-    _seed("results_show_all_runs", True)
+    # Default OFF: match Results/Sweeps UX expectation (apply minimum filters by default).
+    _seed("results_show_all_runs", False)
 
 
     if "sweeps_show_all_runs" not in st.session_state and "sweeps_show_all" in st.session_state:
         st.session_state["sweeps_show_all_runs"] = bool(st.session_state.get("sweeps_show_all"))
-    _seed("sweeps_show_all_runs", True)
+    # Default OFF: match Results/Sweeps UX expectation (apply minimum filters by default).
+    _seed("sweeps_show_all_runs", False)
+
+    # Runs Explorer should mirror Results/Sweeps.
+    _seed("runs_explorer_show_all_runs", False)
 
 
 def _reset_backtest_ui_state() -> None:
@@ -1541,8 +1630,6 @@ def _reset_backtest_ui_state() -> None:
         if k.startswith("bt_"):
             st.session_state.pop(k, None)
     st.session_state.pop("data_source_mode", None)
-
-EXECUTOR = ThreadPoolExecutor(max_workers=2)
 JOB_LOCK = threading.Lock()
 
 _STREAMLIT_WORKER_ID = f"streamlit:{os.getpid()}:{uuid.uuid4().hex[:10]}"
@@ -1633,13 +1720,11 @@ def _sweep_combo_key(keys: Sequence[str], combo: Sequence[Any]) -> str:
 
 
 def _job_scheduler_tick(*, force: bool = False) -> Dict[str, int]:
-    """Best-effort in-process job scheduler.
+    """Legacy in-process job recovery helper (deprecated).
 
-    Backtest/sweep jobs are executed in-process via ThreadPoolExecutor. This tick:
-    - Requeues orphaned in-process running jobs after restart.
-    - Submits any queued backtest/sweep jobs.
-
-    It is safe to call on every Streamlit rerun (internally throttled unless force=True).
+    Backtests/sweeps are now executed by the dedicated `backtest_worker` process.
+    This function remains only to reconcile legacy in-process jobs (requeue/cancel)
+    after a Streamlit restart.
     """
 
     global _LAST_JOB_TICK_TS
@@ -1656,46 +1741,13 @@ def _job_scheduler_tick(*, force: bool = False) -> Dict[str, int]:
     try:
         with _job_conn() as conn:
             reconcile_counts = reconcile_inprocess_jobs_after_restart(conn, current_worker_id=_STREAMLIT_WORKER_ID)
-            jobs = list_jobs(conn, limit=200)
     except Exception:
         return {"requeued": 0, "cancelled": 0, "submitted": 0}
-
-    # Submit any queued in-process jobs.
-    submitted = 0
-    for job in jobs:
-        try:
-            if (job.get("status") or "").strip().lower() != "queued":
-                continue
-            job_type = (job.get("job_type") or "").strip().lower()
-            if job_type not in {"backtest", "sweep"}:
-                continue
-            job_id = int(job.get("id"))
-        except Exception:
-            continue
-
-        payload_raw = job.get("payload_json") or job.get("payload")
-        payload: Dict[str, Any] = {}
-        if isinstance(payload_raw, str) and payload_raw.strip():
-            try:
-                payload = json.loads(payload_raw)
-            except Exception:
-                payload = {}
-        elif isinstance(payload_raw, dict):
-            payload = payload_raw
-
-        try:
-            if job_type == "backtest":
-                enqueue_backtest_job(payload, existing_job_id=job_id)
-            elif job_type == "sweep":
-                enqueue_sweep_job(payload, existing_job_id=job_id)
-            submitted += 1
-        except Exception:
-            continue
 
     return {
         "requeued": int((reconcile_counts or {}).get("requeued") or 0),
         "cancelled": int((reconcile_counts or {}).get("cancelled") or 0),
-        "submitted": int(submitted),
+        "submitted": 0,
     }
 
 
@@ -1979,8 +2031,10 @@ def _init_sweepable_state(base_key: str, *, default_value: Any, sweep_field_key:
     max_key = f"{base_key}_max"
     step_key = f"{base_key}_step"
     list_key = f"{base_key}_list"
+    sweep_kind_key = f"{base_key}_sweep_kind"
 
     _seed_state(mode_key, "fixed")
+    _seed_state(sweep_kind_key, "range")
 
     if value_key not in st.session_state:
         if base_key in st.session_state and st.session_state.get(base_key) is not None:
@@ -2013,9 +2067,12 @@ def _init_sweepable_state(base_key: str, *, default_value: Any, sweep_field_key:
                 else:
                     approx_step = 1.0
                 _seed_state(step_key, approx_step)
+                # Still seed list input so the user can switch to list mode.
+                _seed_state(list_key, str(default_values or ""))
             except Exception:
                 pass
         else:
+            _seed_state(sweep_kind_key, "list")
             _seed_state(list_key, str(default_values))
     else:
         _seed_state(list_key, str(default_values or ""))
@@ -2043,12 +2100,15 @@ def render_sweepable_number(
     min_key = f"{base_key}_min"
     max_key = f"{base_key}_max"
     step_key = f"{base_key}_step"
+    list_key = f"{base_key}_list"
+    sweep_kind_key = f"{base_key}_sweep_kind"
 
     # Keep a stable bool alongside the canonical string mode.
     mode_val = str(st.session_state.get(mode_key) or "fixed").strip().lower()
     st.session_state[mode_bool_key] = (mode_val == "sweep")
 
-    cols = st.columns([6, 2, 10])
+    # Keep the sweep toggle close to the sweep inputs.
+    cols = st.columns([6, 1, 11], gap="small")
     with cols[0]:
         kwargs: Dict[str, Any] = {
             "label": label,
@@ -2082,66 +2142,97 @@ def render_sweepable_number(
     sweep_values: Optional[list[Any]] = None
     if str(mode_val).strip().lower() == "sweep":
         with cols[2]:
-            mini = st.columns(3)
-            mini[0].caption("Low")
-            mini[1].caption("High")
-            mini[2].caption("Step")
-            mini[0].number_input(
-                "Min",
-                value=float(st.session_state.get(min_key) or 0.0),
-                key=_wkey(min_key),
+            kind = st.radio(
+                "Sweep type",
+                options=["Range", "List"],
+                index=0
+                if str(st.session_state.get(sweep_kind_key) or "range").strip().lower() != "list"
+                else 1,
+                horizontal=True,
+                key=_wkey(sweep_kind_key),
                 on_change=_sync_model_from_widget,
-                args=(min_key,),
+                args=(sweep_kind_key,),
                 label_visibility="collapsed",
+                help="Use a stepped range (min/max/step) or an explicit comma-separated list.",
             )
-            mini[1].number_input(
-                "Max",
-                value=float(st.session_state.get(max_key) or 0.0),
-                key=_wkey(max_key),
-                on_change=_sync_model_from_widget,
-                args=(max_key,),
-                label_visibility="collapsed",
-            )
-            mini[2].number_input(
-                "Step",
-                min_value=0.0,
-                value=float(st.session_state.get(step_key) or 0.0),
-                key=_wkey(step_key),
-                on_change=_sync_model_from_widget,
-                args=(step_key,),
-                label_visibility="collapsed",
-            )
-
-            try:
-                vmin = float(st.session_state.get(min_key))
-                vmax = float(st.session_state.get(max_key))
-                vstep = float(st.session_state.get(step_key))
-            except (TypeError, ValueError):
-                vmin, vmax, vstep = 0.0, 0.0, 0.0
+            kind_norm = str(kind or "Range").strip().lower()
+            st.session_state[sweep_kind_key] = "list" if kind_norm == "list" else "range"
 
             meta = SWEEPABLE_FIELDS.get(sweep_field_key)
-            value_type = (meta or {}).get("type", float) if isinstance(meta, dict) else float
-
-            if vstep <= 0 or vmax < vmin:
-                sweep_values = []
+            if kind_norm == "list":
+                raw = st.text_input(
+                    "Sweep values",
+                    value=str(st.session_state.get(list_key) or ""),
+                    key=_wkey(list_key),
+                    on_change=_sync_model_from_widget,
+                    args=(list_key,),
+                    label_visibility="collapsed",
+                    help="Comma-separated values (e.g., 1, 2.5, 5)",
+                )
+                if meta:
+                    sweep_values = _parse_sweep_values(str(raw or ""), meta)
+                else:
+                    sweep_values = [x.strip() for x in str(raw or "").split(",") if x.strip()]
             else:
-                vals: list[Any] = []
-                cur = vmin
-                # inclusive range with float tolerance
-                guard = 0
-                while cur <= vmax + 1e-12 and guard < 200_000:
-                    guard += 1
-                    try:
-                        if value_type is int:
-                            vals.append(int(round(cur)))
-                        elif value_type is bool:
-                            vals.append(bool(cur))
-                        else:
-                            vals.append(float(cur))
-                    except Exception:
-                        vals.append(cur)
-                    cur += vstep
-                sweep_values = vals
+                mini = st.columns(3, gap="small")
+                mini[0].caption("Low")
+                mini[1].caption("High")
+                mini[2].caption("Step")
+                mini[0].number_input(
+                    "Min",
+                    value=float(st.session_state.get(min_key) or 0.0),
+                    key=_wkey(min_key),
+                    on_change=_sync_model_from_widget,
+                    args=(min_key,),
+                    label_visibility="collapsed",
+                )
+                mini[1].number_input(
+                    "Max",
+                    value=float(st.session_state.get(max_key) or 0.0),
+                    key=_wkey(max_key),
+                    on_change=_sync_model_from_widget,
+                    args=(max_key,),
+                    label_visibility="collapsed",
+                )
+                mini[2].number_input(
+                    "Step",
+                    min_value=0.0,
+                    value=float(st.session_state.get(step_key) or 0.0),
+                    key=_wkey(step_key),
+                    on_change=_sync_model_from_widget,
+                    args=(step_key,),
+                    label_visibility="collapsed",
+                )
+
+                try:
+                    vmin = float(st.session_state.get(min_key))
+                    vmax = float(st.session_state.get(max_key))
+                    vstep = float(st.session_state.get(step_key))
+                except (TypeError, ValueError):
+                    vmin, vmax, vstep = 0.0, 0.0, 0.0
+
+                value_type = (meta or {}).get("type", float) if isinstance(meta, dict) else float
+
+                if vstep <= 0 or vmax < vmin:
+                    sweep_values = []
+                else:
+                    vals: list[Any] = []
+                    cur = vmin
+                    # inclusive range with float tolerance
+                    guard = 0
+                    while cur <= vmax + 1e-12 and guard < 200_000:
+                        guard += 1
+                        try:
+                            if value_type is int:
+                                vals.append(int(round(cur)))
+                            elif value_type is bool:
+                                vals.append(bool(cur))
+                            else:
+                                vals.append(float(cur))
+                        except Exception:
+                            vals.append(cur)
+                        cur += vstep
+                    sweep_values = vals
 
     fixed_value = st.session_state.get(value_key)
     return fixed_value, sweep_values
@@ -2693,6 +2784,33 @@ def render_live_bot_detail(bot_id: int) -> None:
         st.rerun()
         return
 
+    tz = _ui_display_tz()
+
+    def _df_local_times(df_in: pd.DataFrame) -> pd.DataFrame:
+        if df_in is None or df_in.empty:
+            return df_in
+        df = df_in.copy()
+        # Common timestamp columns across bot tables.
+        for col in (
+            "ts",
+            "timestamp",
+            "event_ts",
+            "created_at",
+            "updated_at",
+            "opened_at",
+            "closed_at",
+            "heartbeat_at",
+            "snapshot_updated_at",
+            "lease_expires_at",
+            "last_used_at",
+        ):
+            if col in df.columns:
+                try:
+                    df[col] = df[col].apply(lambda v: fmt_dt_short(v, tz))
+                except Exception:
+                    pass
+        return df
+
     _set_selected_bot(bot_id)
 
     config_dict = None
@@ -2884,7 +3002,7 @@ def render_live_bot_detail(bot_id: int) -> None:
             # Lease info (best-effort; useful for multi-worker correctness debugging).
             if job_claimed_by or job_lease_expires_at or (job_stale_reclaims or 0) > 0:
                 st.write(f"Claimed by: **{job_claimed_by or 'n/a'}**")
-                st.write(f"Lease expires: **{job_lease_expires_at or 'n/a'}**")
+                st.write(f"Lease expires: **{fmt_dt_short(job_lease_expires_at, tz)}**")
                 st.write(f"Stale reclaims: **{job_stale_reclaims}**")
 
             # Health signals from worker runtime
@@ -2900,7 +3018,10 @@ def render_live_bot_detail(bot_id: int) -> None:
                 ok = bool(hedge.get("ok"))
                 reason = str(hedge.get("reason") or "unknown")
                 checked_at = str(hedge.get("checked_at") or "")
-                st.write(f"Hedge mode: **{'PASS' if ok else reason.upper()}**" + (f" • {checked_at}" if checked_at else ""))
+                checked_disp = fmt_dt_short(checked_at, tz) if checked_at else ""
+                st.write(
+                    f"Hedge mode: **{'PASS' if ok else reason.upper()}**" + (f" • {checked_disp}" if checked_disp else "")
+                )
             st.write(f"Desired action: **{desired_action_disp}**")
 
             try:
@@ -3045,7 +3166,9 @@ def render_live_bot_detail(bot_id: int) -> None:
             lease_note = f" • ⚠ reclaimed {int(job_stale_reclaims)}x"
     except Exception:
         lease_note = ""
-    controls[3].caption(f"Worker: {worker_id or 'n/a'} • Heartbeat: {hb_at or 'n/a'} • Snapshot: {snap_at or 'n/a'}{lease_note}")
+    controls[3].caption(
+        f"Worker: {worker_id or 'n/a'} • Heartbeat: {fmt_dt_short(hb_at, tz)} • Snapshot: {fmt_dt_short(snap_at, tz)}{lease_note}"
+    )
 
     # --- Tabs ---------------------------------------------------------
     tab_overview, tab_positions, tab_orders_fills, tab_ledger, tab_events, tab_config = st.tabs(
@@ -3260,7 +3383,7 @@ def render_live_bot_detail(bot_id: int) -> None:
 
         st.markdown("#### Recent events")
         if events:
-            st.dataframe(pd.DataFrame(events[:10]), hide_index=True, width="stretch")
+            st.dataframe(_df_local_times(pd.DataFrame(events[:10])), hide_index=True, width="stretch")
         else:
             st.info("No events yet.")
 
@@ -3421,7 +3544,7 @@ def render_live_bot_detail(bot_id: int) -> None:
             display_rows: List[Dict[str, Any]] = []
             for r in raw_rows[:50]:
                 display_rows.append({k: r.get(k) for k in show_fields})
-            st.dataframe(pd.DataFrame(display_rows), hide_index=True, width="stretch")
+            st.dataframe(_df_local_times(pd.DataFrame(display_rows)), hide_index=True, width="stretch")
         else:
             st.info("No raw positions in snapshot.")
 
@@ -3506,7 +3629,7 @@ def render_live_bot_detail(bot_id: int) -> None:
                             "Unrealized PnL": unreal_leg,
                             "Realized": realized_leg,
                             "DCA Fills": dca_fills,
-                            "Opened At": leg.get("opened_at"),
+                            "Opened At": fmt_dt_short(leg.get("opened_at"), tz),
                         }
                     )
             if position_rows:
@@ -3516,7 +3639,7 @@ def render_live_bot_detail(bot_id: int) -> None:
 
         st.markdown("#### Previous Positions")
         if history_rows:
-            st.dataframe(pd.DataFrame(history_rows), hide_index=True, width="stretch")
+            st.dataframe(_df_local_times(pd.DataFrame(history_rows)), hide_index=True, width="stretch")
         else:
             st.info("No position history yet.")
 
@@ -3524,12 +3647,12 @@ def render_live_bot_detail(bot_id: int) -> None:
         sub_a, sub_b = st.tabs(["Open Orders", "Recent Fills"])
         with sub_a:
             if open_orders:
-                st.dataframe(pd.DataFrame(open_orders), hide_index=True, width="stretch")
+                st.dataframe(_df_local_times(pd.DataFrame(open_orders)), hide_index=True, width="stretch")
             else:
                 st.info("No open orders.")
         with sub_b:
             if fills:
-                st.dataframe(pd.DataFrame(fills), hide_index=True, width="stretch")
+                st.dataframe(_df_local_times(pd.DataFrame(fills)), hide_index=True, width="stretch")
             else:
                 st.info("No fills recorded.")
 
@@ -3542,13 +3665,13 @@ def render_live_bot_detail(bot_id: int) -> None:
 
         rows = list_ledger(conn, bot_id, limit=500)
         if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.dataframe(_df_local_times(pd.DataFrame(rows)), hide_index=True, width="stretch")
         else:
             st.info("No ledger rows yet.")
 
     with tab_events:
         if events:
-            st.dataframe(pd.DataFrame(events), hide_index=True, width="stretch")
+            st.dataframe(_df_local_times(pd.DataFrame(events)), hide_index=True, width="stretch")
         else:
             st.info("No events yet.")
 
@@ -3660,532 +3783,136 @@ def render_live_bot_detail(bot_id: int) -> None:
             st.json(config_dict)
 
 
-def enqueue_sweep_job(payload: Dict[str, Any], *, existing_job_id: Optional[int] = None) -> int:
+def enqueue_sweep_job(payload: Dict[str, Any]) -> Dict[str, int]:
+    """Enqueue child `backtest_run` jobs for a sweep (planner-only).
+
+    Streamlit no longer executes sweeps in-process.
+    """
+
     sweep_id = payload.get("sweep_id")
-    if existing_job_id is None:
-        with _job_conn() as conn:
-            job_id = create_job(conn, "sweep", payload)
-            if sweep_id is not None:
-                set_job_link(conn, job_id, sweep_id=sweep_id)
-    else:
-        job_id = int(existing_job_id)
+    if sweep_id is None:
+        raise ValueError("enqueue_sweep_job requires payload['sweep_id']")
 
-    def worker(job_id: int, payload: Dict[str, Any]) -> None:
-        conn = _job_conn()
-        try:
-            sweep_id_local = payload.get("sweep_id")
-            if not claim_job(conn, int(job_id), _STREAMLIT_WORKER_ID):
-                return
-            update_job(conn, job_id, progress=0.0)
-            if sweep_id_local is not None:
-                update_sweep_status(sweep_id_local, "running")
-            base_config = _dragon_config_from_snapshot(payload["base_config"])
-            base_data_settings = DataSettings(**payload["data_settings"])
-            combos = payload["combos"]
-            keys = payload["keys"]
+    base_cfg = _dragon_config_from_snapshot(payload.get("base_config") or {})
+    base_ds = DataSettings(**(payload.get("data_settings") or {}))
+    combos = payload.get("combos") or []
+    keys = payload.get("keys") or []
 
-            sweep_assets_raw = payload.get("sweep_assets")
-            sweep_assets: list[str] = []
-            if isinstance(sweep_assets_raw, list):
-                sweep_assets = [str(s).strip() for s in sweep_assets_raw if str(s).strip()]
-            if not sweep_assets:
-                # Backwards compatibility: older sweeps didn't store asset snapshots.
-                sym0 = str(base_data_settings.symbol or "").strip()
-                if sym0:
-                    sweep_assets = [sym0]
+    sweep_assets_raw = payload.get("sweep_assets")
+    sweep_assets: list[str] = []
+    if isinstance(sweep_assets_raw, list):
+        sweep_assets = [str(s).strip() for s in sweep_assets_raw if str(s).strip()]
+    if not sweep_assets:
+        sym0 = str(getattr(base_ds, "symbol", "") or "").strip()
+        if sym0:
+            sweep_assets = [sym0]
 
-            total_runs = int(len(combos or [])) * int(len(sweep_assets) if sweep_assets else 1)
+    metadata_common = payload.get("metadata") or {}
+    if not isinstance(metadata_common, dict):
+        metadata_common = {}
 
-            # Resume support: skip combos that already have a saved run for this sweep.
-            completed_keys: set[str] = set()
-            if sweep_id_local is not None:
+    jobs_to_enqueue: list[tuple[str, Dict[str, Any], Optional[str]]] = []
+    for sym in (sweep_assets or [""]):
+        sym_norm = str(sym or "").strip()
+        for combo_index, combo in enumerate(combos or [], start=1):
+            try:
+                overrides = dict(zip(list(keys), list(combo)))
+            except Exception:
+                overrides = {}
+
+            param_key = _sweep_combo_key(keys, combo)
+            pair_key = f"{sym_norm}|{param_key}" if sym_norm else param_key
+
+            cfg = deepcopy(base_cfg)
+            ds_variant = deepcopy(base_ds)
+            if sym_norm:
+                ds_variant.symbol = sym_norm
+            for field_key, value in (overrides or {}).items():
+                _apply_sweep_override(cfg, ds_variant, str(field_key), value)
+
+            cfg_snapshot = _jsonify(cfg)
+            if not isinstance(cfg_snapshot, dict):
                 try:
-                    existing_runs = list_runs_for_sweep(str(sweep_id_local))
-                    for r in existing_runs or []:
-                        meta_raw = r.get("metadata_json")
-                        meta = {}
-                        if isinstance(meta_raw, str) and meta_raw.strip():
-                            try:
-                                meta = json.loads(meta_raw)
-                            except Exception:
-                                meta = {}
-                        if isinstance(meta, dict):
-                            ck = meta.get("sweep_combo_key")
-                            if isinstance(ck, str) and ck.strip():
-                                completed_keys.add(ck.strip())
+                    cfg_snapshot = asdict(cfg)
                 except Exception:
-                    completed_keys = set()
+                    cfg_snapshot = {}
 
-            # Back-compat: if this is a single-asset sweep and older keys were combo-only,
-            # treat them as completed too.
-            if len(sweep_assets) == 1:
-                sym_only = str(sweep_assets[0] or "").strip()
-                if sym_only:
-                    for ck in list(completed_keys):
-                        if "|" not in ck:
-                            completed_keys.add(f"{sym_only}|{ck}")
+            ds_snapshot = asdict(ds_variant)
 
-            done_count = 0
-            remaining: list[tuple[str, int, Any, Dict[str, Any], str, str]] = []
-            for sym in (sweep_assets or [""]):
-                sym_norm = str(sym or "").strip()
-                for idx0, combo in enumerate(combos or [], start=1):
-                    try:
-                        overrides = dict(zip(keys, combo))
-                    except Exception:
-                        overrides = {}
-                    param_key = _sweep_combo_key(keys, combo)
-                    pair_key = f"{sym_norm}|{param_key}" if sym_norm else param_key
-                    if pair_key in completed_keys:
-                        done_count += 1
-                        continue
-                    remaining.append((sym_norm, idx0, combo, overrides, param_key, pair_key))
-
-            if total_runs > 0 and done_count > 0:
-                update_job(
-                    conn,
-                    job_id,
-                    progress=float(done_count) / float(total_runs),
-                    message=f"Resuming sweep: {done_count}/{total_runs} complete",
-                )
-
-            if total_runs > 0 and done_count >= total_runs:
-                dedupe_note = ""
-                if sweep_id_local is not None:
-                    try:
-                        dd = dedupe_sweep_runs(str(sweep_id_local))
-                        removed = int(dd.get("removed") or 0)
-                        if removed > 0:
-                            dedupe_note = f" (deduped {removed} duplicates)"
-                    except Exception:
-                        dedupe_note = ""
-                update_job(
-                    conn,
-                    job_id,
-                    status="done",
-                    finished_at=datetime.now(timezone.utc).isoformat(),
-                    progress=1.0,
-                    message=f"Sweep complete (already finished){dedupe_note}",
-                )
-                if sweep_id_local is not None:
-                    update_sweep_status(sweep_id_local, "done")
-                return
-
-            # Load candles once per symbol (cached in-memory for this worker).
-            candles_by_symbol: dict[str, tuple[list[Candle], str, str]] = {}
-            if base_data_settings.data_source == "synthetic":
-                c0, lbl0, sym0, tf0 = load_candles_for_settings(base_data_settings)
-                candles_by_symbol[""] = (c0, sym0, tf0)
-            else:
-                tf0 = str(base_data_settings.timeframe or "").strip()
-                for sym in (sweep_assets or [str(base_data_settings.symbol or "").strip()]):
-                    sym_norm = str(sym or "").strip()
-                    ds_sym = deepcopy(base_data_settings)
-                    ds_sym.symbol = sym_norm
-                    c0, _lbl0, sym_store, tf_store = load_candles_for_settings(ds_sym)
-                    candles_by_symbol[sym_norm] = (c0, sym_store, tf_store)
-
-            for idx, (sym_run, combo_index, combo, overrides, _param_key, pair_key) in enumerate(
-                remaining,
-                start=done_count + 1,
-            ):
-                job_state = get_job(conn, job_id)
-                if job_state and job_state.get("status") == "cancel_requested":
-                    update_job(conn, job_id, status="cancelled", finished_at=datetime.now(timezone.utc).isoformat(), message="Cancelled")
-                    if sweep_id_local is not None:
-                        update_sweep_status(sweep_id_local, "cancelled")
-                    return
-
-                cfg = deepcopy(base_config)
-                ds_variant = deepcopy(base_data_settings)
-                if sym_run:
-                    ds_variant.symbol = sym_run
-                for field_key, value in overrides.items():
-                    _apply_sweep_override(cfg, ds_variant, field_key, value)
-
-                candles_tuple = candles_by_symbol.get(str(ds_variant.symbol or "").strip()) or candles_by_symbol.get("")
-                candles = candles_tuple[0] if candles_tuple else []
-                storage_symbol = candles_tuple[1] if candles_tuple else (str(ds_variant.symbol or "").strip())
-                storage_timeframe = candles_tuple[2] if candles_tuple else (str(ds_variant.timeframe or "").strip())
-
-                # Warmup: sweeps previously bypassed `run_single_backtest`, which meant higher-timeframe
-                # indicators (e.g. 60m MA on 15m candles) would only become valid after a long delay.
-                warmup_candles: List[Candle] = []
-                try:
-                    if ds_variant.data_source != "synthetic" and candles:
-                        tf = str(ds_variant.timeframe or base_data_settings.timeframe or "")
-                        base_min = timeframe_to_minutes(tf) or 1
-
-                        def _bars_needed(interval_min: int, length: int) -> int:
-                            step = max(1, int(round(max(int(interval_min or 1), 1) / float(base_min))))
-                            return step * max(int(length or 1), 1)
-
-                        max_req = max(
-                            _bars_needed(cfg.trend.ma_interval_min, int(getattr(cfg.trend, "ma_len", 1) or 1)),
-                            _bars_needed(cfg.bbands.interval_min, int(getattr(cfg.bbands, "length", 1) or 1)),
-                            _bars_needed(
-                                cfg.macd.interval_min,
-                                int(getattr(cfg.macd, "slow", 26) or 26) + int(getattr(cfg.macd, "signal", 9) or 9),
-                            ),
-                            _bars_needed(cfg.rsi.interval_min, int(getattr(cfg.rsi, "length", 14) or 14) + 1),
-                            _bars_needed(cfg.trend.ma_interval_min, int(getattr(cfg.exits, "tp_atr_period", 1) or 1) + 1),
-                        )
-                        warmup_bars = max(int(max_req), 0)
-                        if warmup_bars > 0:
-                            first_ts = getattr(candles[0], "timestamp", None)
-                            if first_ts is not None:
-                                first_dt = _normalize_timestamp(first_ts)
-                                if first_dt is None:
-                                    first_dt = first_ts.replace(tzinfo=timezone.utc)
-                                first_ms = int(first_dt.timestamp() * 1000)
-                                ms_per_bar = max(int(base_min) * 60_000, 60_000)
-                                slack_bars = max(10, int(round(float(warmup_bars) * 0.10)))
-                                since_ms = max(0, int(first_ms) - int((warmup_bars + slack_bars) * ms_per_bar))
-                                until_ms = max(0, int(first_ms) - 1)
-                                exchange_id = ds_variant.exchange_id or base_data_settings.exchange_id or "binance"
-                                symbol = ds_variant.symbol or base_data_settings.symbol or "BTC/USDT"
-                                market_type = (ds_variant.market_type or base_data_settings.market_type or "unknown")
-                                warm_limit = min(max(int(warmup_bars) + int(slack_bars) + 10, 0), 250_000)
-                                warmup_candles = get_candles_with_cache(
-                                    exchange_id=exchange_id,
-                                    symbol=symbol,
-                                    timeframe=tf,
-                                    limit=warm_limit if warm_limit > 0 else None,
-                                    since=int(since_ms),
-                                    until=int(until_ms),
-                                    range_mode="range",
-                                    market_type=market_type,
-                                )
-                                if warmup_candles:
-                                    trimmed = []
-                                    for c in warmup_candles:
-                                        try:
-                                            ts_ms = int(c.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                                        except Exception:
-                                            continue
-                                        if ts_ms < first_ms:
-                                            trimmed.append(c)
-                                    if len(trimmed) > warmup_bars:
-                                        warmup_candles = trimmed[-warmup_bars:]
-                                    else:
-                                        warmup_candles = trimmed
-                except Exception:
-                    warmup_candles = []
-
-                engine = BacktestEngine(BacktestConfig(initial_balance=ds_variant.initial_balance, fee_rate=ds_variant.fee_rate))
-                strategy = DragonDcaAtrStrategy(config=cfg)
-                try:
-                    if warmup_candles:
-                        strategy.prime_history(warmup_candles)
-                except Exception:
-                    pass
-
-                result = engine.run(candles, strategy)
-                if not result.candles:
-                    result.candles = candles
-
-                metadata_common = payload.get("metadata", {})
-                metadata_payload = {
-                    **metadata_common,
-                    "symbol": ds_variant.symbol or storage_symbol,
-                    "timeframe": ds_variant.timeframe or storage_timeframe,
-                    "start_time": result.start_time.isoformat() if getattr(result, "start_time", None) else None,
-                    "end_time": result.end_time.isoformat() if getattr(result, "end_time", None) else None,
-                    "prefer_bbo_maker": cfg.general.prefer_bbo_maker,
-                    "bbo_queue_level": cfg.general.bbo_queue_level,
+            md = dict(metadata_common)
+            md.update(
+                {
                     "sweep_combo_index": int(combo_index),
                     "sweep_combo_key": str(pair_key),
                     "sweep_overrides": overrides,
+                    "symbol": str(ds_snapshot.get("symbol") or "").strip() or None,
+                    "timeframe": str(ds_snapshot.get("timeframe") or "").strip() or None,
                 }
-                cfg_for_storage: Any = cfg
-                try:
-                    cfg_for_storage = asdict(cfg)
-                except Exception:
-                    cfg_for_storage = cfg
-                try:
-                    fut_meta = metadata_common.get("_futures") if isinstance(metadata_common, dict) else None
-                    if isinstance(cfg_for_storage, dict) and isinstance(fut_meta, dict) and fut_meta.get("leverage") is not None:
-                        cfg_for_storage = dict(cfg_for_storage)
-                        cfg_for_storage["_futures"] = {"leverage": int(fut_meta.get("leverage"))}
-                except Exception:
-                    pass
-                save_backtest_run(cfg_for_storage, result.metrics, metadata_payload, sweep_id=payload.get("sweep_id"), result=result)
-
-                progress = idx / max(total_runs, 1)
-                update_job(conn, job_id, progress=progress, message=f"Run {idx}/{total_runs}")
-                if sweep_id_local is not None:
-                    update_sweep_status(sweep_id_local, "running")
-
-            dedupe_note = ""
-            if sweep_id_local is not None:
-                try:
-                    dd = dedupe_sweep_runs(str(sweep_id_local))
-                    removed = int(dd.get("removed") or 0)
-                    if removed > 0:
-                        dedupe_note = f" (deduped {removed} duplicates)"
-                except Exception:
-                    dedupe_note = ""
-
-            update_job(
-                conn,
-                job_id,
-                status="done",
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                progress=1.0,
-                message=f"Sweep complete{dedupe_note}",
             )
-            if sweep_id_local is not None:
-                update_sweep_status(sweep_id_local, "done")
-        except Exception as exc:
-            if payload.get("sweep_id") is not None:
-                update_sweep_status(payload.get("sweep_id"), "failed", error_message=str(exc))
-            update_job(conn, job_id, status="failed", error_text=str(exc), finished_at=datetime.now(timezone.utc).isoformat())
-        finally:
-            conn.close()
 
-    EXECUTOR.submit(worker, job_id, payload)
-    return job_id
+            job_payload = {
+                "sweep_id": str(sweep_id),
+                "config": cfg_snapshot,
+                "data_settings": ds_snapshot,
+                "metadata": md,
+            }
+
+            job_key = (
+                f"backtest_run:sweep:{str(sweep_id)}:{pair_key}:"
+                f"{str(ds_snapshot.get('data_source') or '')}:"
+                f"{str(ds_snapshot.get('exchange_id') or '')}:"
+                f"{str(ds_snapshot.get('market_type') or '')}:"
+                f"{str(ds_snapshot.get('symbol') or '')}:"
+                f"{str(ds_snapshot.get('timeframe') or '')}"
+            )
+            jobs_to_enqueue.append((job_key, job_payload, str(sweep_id)))
+
+    with open_db_connection() as conn:
+        res = bulk_enqueue_backtest_run_jobs(conn, jobs=jobs_to_enqueue)
+    created = int((res or {}).get("created") or 0)
+    existing = int((res or {}).get("existing") or 0)
+    return {"created": created, "existing": existing, "total": int(created + existing)}
+
+
+def enqueue_sweep_parent_job(*, sweep_id: str, user_id: Optional[str] = None) -> int:
+    """Enqueue a `sweep_parent` planner job.
+
+    Streamlit only enqueues the parent; the backtest worker expands it into child
+    `backtest_run` jobs.
+    """
+
+    sid = str(sweep_id or "").strip()
+    if not sid:
+        raise ValueError("enqueue_sweep_parent_job requires sweep_id")
+    job_key = f"sweep_parent:{sid}"
+    group_key = f"sweep:{sid}"
+    payload = {"sweep_id": sid, "user_id": (str(user_id).strip() if user_id else None)}
+
+    with _job_conn() as conn:
+        job_id = create_job(conn, "sweep_parent", payload, sweep_id=sid, job_key=job_key, group_key=group_key)
+        update_job(conn, int(job_id), status="queued", progress=0.0, message="Queued (awaiting backtest_worker)")
+    return int(job_id)
 
 
 def enqueue_backtest_job(payload: Dict[str, Any], *, existing_job_id: Optional[int] = None) -> int:
-    """Launch a background backtest job and persist the resulting run.
+    """Enqueue a `backtest_run` job for the dedicated backtest worker."""
 
-    When `existing_job_id` is provided, the job is resumed/re-executed using the
-    existing DB row (used for restart recovery).
-    """
+    if existing_job_id is not None:
+        return int(existing_job_id)
 
-    if existing_job_id is None:
-        with _job_conn() as conn:
-            job_id = create_job(conn, "backtest", payload)
-    else:
-        job_id = int(existing_job_id)
-
-    def worker(job_id: int, payload: Dict[str, Any]) -> None:
-        conn = _job_conn()
-        try:
-            if not claim_job(conn, int(job_id), _STREAMLIT_WORKER_ID):
-                return
-            update_job(conn, job_id, progress=0.0)
-
-            config = _dragon_config_from_snapshot(payload.get("config") or {})
-            data_settings = DataSettings(**(payload.get("data_settings") or {}))
-
-            artifacts = run_single_backtest(config, data_settings)
-            result = artifacts.result
-
-            metadata_payload = dict(payload.get("metadata") or {})
-            metadata_payload.setdefault("symbol", artifacts.storage_symbol)
-            metadata_payload.setdefault("timeframe", artifacts.storage_timeframe)
-            metadata_payload.setdefault(
-                "start_time",
-                result.start_time.isoformat() if getattr(result, "start_time", None) else None,
-            )
-            metadata_payload.setdefault(
-                "end_time",
-                result.end_time.isoformat() if getattr(result, "end_time", None) else None,
-            )
-            metadata_payload.setdefault("prefer_bbo_maker", config.general.prefer_bbo_maker)
-            metadata_payload.setdefault("bbo_queue_level", config.general.bbo_queue_level)
-
-            try:
-                metadata_payload.setdefault(
-                    "initial_balance",
-                    float(getattr(data_settings, "initial_balance", 0.0) or 0.0),
-                )
-            except Exception:
-                pass
-            try:
-                metadata_payload.setdefault(
-                    "fee_rate",
-                    float(getattr(data_settings, "fee_rate", 0.0) or 0.0),
-                )
-            except Exception:
-                pass
-
-            config_for_storage = payload.get("config") if isinstance(payload.get("config"), dict) else config
-            run_id = save_backtest_run(config_for_storage, result.metrics, metadata_payload, sweep_id=None, result=result)
-            set_job_link(conn, job_id, run_id=run_id)
-            update_job(
-                conn,
-                job_id,
-                status="done",
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                progress=1.0,
-                message=f"Backtest complete: {artifacts.data_label}",
-            )
-        except Exception as exc:
-            update_job(
-                conn,
-                job_id,
-                status="failed",
-                error_text=str(exc),
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
-        finally:
-            conn.close()
-
-    EXECUTOR.submit(worker, job_id, payload)
-    return job_id
+    with _job_conn() as conn:
+        job_id = create_job(conn, "backtest_run", payload, sweep_id=None)
+        update_job(conn, int(job_id), status="queued", progress=0.0, message="Queued (awaiting backtest_worker)")
+    return int(job_id)
 
 
 def enqueue_live_bot_job(payload: Dict[str, Any]) -> int:
-    """Launch a background live_bot job with a heartbeat loop."""
-
-    class StubWooXClient:
-        def __init__(self) -> None:
-            self.last_order = None
-
-        def set_position_mode(self, mode: str):
-            return {}
-
-        def get_positions(self, symbol: str):
-            return {"rows": []}
-
-        def get_orders(self, symbol: str, status: str = "INCOMPLETE"):
-            return {"rows": []}
-
-        def place_order(self, body):
-            self.last_order = body
-            return {"orderId": "stub", "clientOrderId": body.get("clientOrderId")}
-
-        def cancel_order(self, order_id, symbol: str, client_order_id=None):
-            return {}
-
-        def get_orderbook(self, symbol: str, depth: int = 1):
-            return {"bids": [[100.0, 1]], "asks": [[101.0, 1]]}
+    """Enqueue a `live_bot` job for the dedicated `live_worker` process."""
 
     with _job_conn() as conn:
         job_id = create_job(conn, "live_bot", payload, bot_id=payload.get("bot_id"))
-
-    def worker(job_id: int, payload: Dict[str, Any]) -> None:
-        conn = _job_conn()
-        try:
-            bot_id = payload.get("bot_id")
-            update_job(conn, job_id, status="running", started_at=datetime.now(timezone.utc).isoformat())
-            exchange_id = payload.get("exchange_id", "woox")
-            symbol = payload.get("symbol", "")
-            timeframe = payload.get("timeframe", "1m")
-            bbo_level = int(payload.get("bbo_queue_level", 1) or 1)
-            prefer_bbo = bool(payload.get("prefer_bbo_maker", True))
-            cfg_dict = payload.get("config") or asdict(dragon_config_example)
-            if bot_id is not None:
-                set_bot_status(
-                    conn,
-                    bot_id,
-                    status="starting",
-                    heartbeat_msg="Starting live bot job",
-                )
-
-            api_key = os.environ.get("WOOX_API_KEY") or "stub"
-            api_secret = os.environ.get("WOOX_API_SECRET") or "stub"
-            base_url = os.environ.get("WOOX_BASE_URL", "https://api.woox.io")
-
-            try:
-                if exchange_id.lower() == "woox":
-                    client = StubWooXClient() if "stub" in {api_key, api_secret} else WooXClient(api_key, api_secret, base_url=base_url)
-                    broker = WooXBroker(client, symbol=symbol, bot_id=f"live-{job_id}", prefer_bbo_maker=prefer_bbo, bbo_level=bbo_level)
-                else:
-                    client = StubWooXClient()
-                    broker = WooXBroker(client, symbol=symbol, bot_id=f"live-{job_id}", prefer_bbo_maker=prefer_bbo, bbo_level=bbo_level)
-            except Exception as exc:
-                update_job(
-                    conn,
-                    job_id,
-                    status="failed",
-                    finished_at=datetime.now(timezone.utc).isoformat(),
-                    message=f"Broker init failed: {exc}",
-                )
-                if bot_id is not None:
-                    set_bot_status(
-                        conn,
-                        bot_id,
-                        status="error",
-                        heartbeat_msg="Broker init failed",
-                        last_error=str(exc),
-                    )
-                return
-
-            tf_minutes = max(1, timeframe_to_minutes(timeframe) or 1)
-            sleep_seconds = max(1.0, min(120.0, tf_minutes * 60))
-
-            while True:
-                job_state = get_job(conn, job_id)
-                bot_state = get_bot(conn, bot_id) if bot_id is not None else None
-                if job_state and job_state.get("status") == "cancel_requested":
-                    update_job(
-                        conn,
-                        job_id,
-                        status="cancelled",
-                        finished_at=datetime.now(timezone.utc).isoformat(),
-                        message="Cancelled by user",
-                    )
-                    if bot_id is not None:
-                        set_bot_status(
-                            conn,
-                            bot_id,
-                            status="stopped",
-                            desired_status="stopped",
-                            heartbeat_msg="Cancelled by user",
-                        )
-                    break
-
-                desired_status = bot_state.get("desired_status") if isinstance(bot_state, dict) else None
-                if desired_status == "stopped":
-                    update_job(
-                        conn,
-                        job_id,
-                        status="cancelled",
-                        finished_at=datetime.now(timezone.utc).isoformat(),
-                        message="Stopped by user",
-                    )
-                    if bot_id is not None:
-                        set_bot_status(conn, bot_id, status="stopped", heartbeat_msg="Stopped")
-                    break
-
-                if desired_status == "paused":
-                    pause_msg = "Paused by user"
-                    update_job(conn, job_id, status="running", message=pause_msg, progress=0.0)
-                    if bot_id is not None:
-                        set_bot_status(conn, bot_id, status="paused", heartbeat_msg=pause_msg)
-                    time.sleep(min(30.0, sleep_seconds))
-                    continue
-
-                now_ts = datetime.now(timezone.utc).isoformat()
-                last_price = None
-                try:
-                    ob = broker.get_best_bid_ask()
-                    if ob:
-                        last_price = sum(ob) / 2.0
-                except Exception:
-                    last_price = None
-                open_orders = len(broker.open_orders) if hasattr(broker, "open_orders") else 0
-                prog = (time.time() % sleep_seconds) / sleep_seconds
-                msg = f"Heartbeat {now_ts} | symbol={symbol} tf={timeframe} | last_price={last_price or 'n/a'} | open_orders={open_orders}"
-                update_job(conn, job_id, status="running", progress=prog, message=msg)
-                if bot_id is not None:
-                    set_bot_status(conn, bot_id, status="running", heartbeat_msg=msg)
-                time.sleep(sleep_seconds)
-        except Exception as exc:
-            update_job(
-                conn,
-                job_id,
-                status="failed",
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                message=str(exc),
-            )
-            if payload.get("bot_id") is not None:
-                set_bot_status(
-                    conn,
-                    payload.get("bot_id"),
-                    status="error",
-                    heartbeat_msg="Live bot failed",
-                    last_error=str(exc),
-                )
-        finally:
-            conn.close()
-
-    EXECUTOR.submit(worker, job_id, payload)
-    return job_id
+        update_job(conn, int(job_id), status="queued", progress=0.0, message="Queued (awaiting live_worker)")
+    return int(job_id)
 
 
 def trades_to_dataframe(trades: List[Trade]) -> pd.DataFrame:
@@ -5428,9 +5155,11 @@ def render_run_header(run_row: Dict[str, Any]) -> None:
     start_dt = _normalize_timestamp(start_raw)
     end_dt = _normalize_timestamp(end_raw)
 
+    tz = _ui_display_tz()
+
     short_id = str(run_id)[:8] if run_id else ""
-    start_txt = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if start_dt else "—"
-    end_txt = end_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if end_dt else "—"
+    start_txt = fmt_dt(start_dt, tz) if start_dt else "—"
+    end_txt = fmt_dt(end_dt, tz) if end_dt else "—"
     dur_txt = (end_dt - start_dt) if (start_dt and end_dt) else "—"
 
     # Compact header line (replaces giant hero title)
@@ -5495,8 +5224,10 @@ def render_run_stats(run_row: Dict[str, Any]) -> None:
     end_raw = end_raw or metadata.get("end_time") or metadata.get("end_ts")
     start_dt = _normalize_timestamp(start_raw)
     end_dt = _normalize_timestamp(end_raw)
-    start_txt = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if start_dt else "—"
-    end_txt = end_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if end_dt else "—"
+
+    tz = _ui_display_tz()
+    start_txt = fmt_dt(start_dt, tz) if start_dt else "—"
+    end_txt = fmt_dt(end_dt, tz) if end_dt else "—"
     dur_txt = str(end_dt - start_dt) if (start_dt and end_dt) else "—"
 
     with left:
@@ -5542,7 +5273,7 @@ def render_run_stats(run_row: Dict[str, Any]) -> None:
                             hold_txt = f"{hours}h {mins}m" if mins else f"{hours}h"
                         else:
                             hold_txt = f"{mins}m" if mins else "<1m"
-                        st.write(f"Avg time in position: **{hold_txt}**")
+                        st.write(f"Avg Pos Time: **{hold_txt}**")
                 except Exception:
                     pass
 
@@ -5556,8 +5287,8 @@ def render_run_stats(run_row: Dict[str, Any]) -> None:
 
         with st.container(border=True):
             st.markdown("**Run window**")
-            st.write(f"Start (UTC): **{start_txt}**")
-            st.write(f"End (UTC): **{end_txt}**")
+            st.write(f"Start: **{start_txt}**")
+            st.write(f"End: **{end_txt}**")
             st.write(f"Duration: **{dur_txt}**")
 
     # Note: drawdown and win rate are displayed as percentages in UI.
@@ -6041,7 +5772,6 @@ def render_run_detail_from_db(
                 if st.button(
                     "Re-Run",
                     key=f"run_actions_rerun_{rid}",
-                    icon="🔁",
                     disabled=not bool(rid),
                     use_container_width=True,
                 ):
@@ -6065,7 +5795,6 @@ def render_run_detail_from_db(
                 if st.button(
                     "Create bot",
                     key=f"run_actions_create_bot_{rid}",
-                    icon="🟢",
                     disabled=not bool(rid),
                     use_container_width=True,
                 ):
@@ -6081,7 +5810,6 @@ def render_run_detail_from_db(
                 if st.button(
                     "Open sweep",
                     key=f"run_actions_open_sweep_{rid}",
-                    icon="📂",
                     disabled=open_sweep_disabled,
                     use_container_width=True,
                 ):
@@ -6124,8 +5852,9 @@ def render_run_detail_from_db(
 
         # Run window: Start/End/Duration (only here; do not repeat elsewhere)
         if start_dt and end_dt:
-            start_txt = start_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            end_txt = end_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            tz = _ui_display_tz()
+            start_txt = fmt_dt(start_dt, tz)
+            end_txt = fmt_dt(end_dt, tz)
             dur_txt = str(end_dt - start_dt)
         else:
             start_txt = end_txt = dur_txt = "—"
@@ -6471,7 +6200,7 @@ def render_run_detail_from_db(
         _add_float_row(exec_rows, label="Fees", keys=["fees_total", "fees"], fmt_fn=lambda x: fmt_num(x, 2), color_metric="fees_total", abs_value=True)
         _add_float_row(
             exec_rows,
-            label="Avg Time in Position",
+            label="Avg Pos Time",
             keys=["avg_position_time_s"],
             fmt_fn=_fmt_seconds_compact,
             color_metric="avg_position_time_s",
@@ -6542,15 +6271,45 @@ def render_run_detail_from_db(
     # Trades table after charts (full-width AGGrid)
     st.markdown("#### Trades")
     if not trades_df.empty:
+        trades_table_df = trades_df.reset_index(drop=True).copy()
+
+        # Presentation-only formatting: convert timestamps to display timezone and render
+        # as a stable string to avoid browser/JS timezone interpretation.
+        if "timestamp" in trades_table_df.columns:
+            ts_utc = pd.to_datetime(trades_table_df["timestamp"], utc=True, errors="coerce")
+            try:
+                tz = _ui_display_tz()
+                ts_local = ts_utc.dt.tz_convert(tz)
+            except Exception:
+                ts_local = ts_utc
+
+            # Hidden numeric sort key (ms since epoch) for AGGrid.
+            try:
+                ts_utc_naive = ts_utc.dt.tz_convert("UTC").dt.tz_localize(None)
+                trades_table_df["timestamp_sort_ms"] = (ts_utc_naive.astype("int64") // 1_000_000).astype("Int64")
+            except Exception:
+                trades_table_df["timestamp_sort_ms"] = pd.Series([pd.NA] * len(trades_table_df), dtype="Int64")
+
+            trades_table_df["timestamp"] = ts_local.dt.strftime("%d/%m/%y %I:%M %p").fillna("—")
+
         if AgGrid is None or GridOptionsBuilder is None:
-            st.dataframe(trades_df, width="stretch", hide_index=True)
+            st.dataframe(
+                trades_table_df.drop(columns=["timestamp_sort_ms"], errors="ignore"),
+                width="stretch",
+                hide_index=True,
+            )
         else:
-            gb_t = GridOptionsBuilder.from_dataframe(trades_df)
+            gb_t = GridOptionsBuilder.from_dataframe(trades_table_df)
             gb_t.configure_default_column(filter=True, sortable=True, resizable=True)
+            if "timestamp_sort_ms" in trades_table_df.columns:
+                gb_t.configure_column("timestamp_sort_ms", hide=True, sortable=True, filter=False)
+            if "timestamp" in trades_table_df.columns:
+                # Prevent lexicographic sorting of DD/MM/YY strings.
+                gb_t.configure_column("timestamp", header_name="Time", sortable=False)
             gb_t.configure_grid_options(headerHeight=44, rowHeight=34, suppressRowHoverHighlight=False, animateRows=False)
             grid_opts_t = gb_t.build()
             AgGrid(
-                trades_df,
+                trades_table_df,
                 gridOptions=grid_opts_t,
                 update_mode=GridUpdateMode.NO_UPDATE,
                 data_return_mode=DataReturnMode.AS_INPUT,
@@ -6854,6 +6613,7 @@ def _apply_sweep_definition_to_backtest_ui(
     _set_model_and_widget("bt_sweep_name", sweep_name)
 
     params = definition.get("params") if isinstance(definition.get("params"), dict) else {}
+    params_mode = definition.get("params_mode") if isinstance(definition.get("params_mode"), dict) else {}
     for field_key, raw_values in (params or {}).items():
         base_key = _SWEEP_FIELD_KEY_TO_BASE_KEY.get(str(field_key))
         if not base_key or not isinstance(raw_values, list) or not raw_values:
@@ -6882,23 +6642,36 @@ def _apply_sweep_definition_to_backtest_ui(
         if not parsed:
             continue
 
+        mode_hint = str((params_mode or {}).get(str(field_key)) or "").strip().lower()
+        list_str = ", ".join([str(v).strip() for v in raw_values if str(v).strip()])
+
         if value_type in {int, float}:
             try:
                 vals = sorted({float(x) for x in parsed})
-                if len(vals) == 1:
-                    vmin = vmax = vals[0]
-                    vstep = 1.0
+                diffs = [round(vals[i + 1] - vals[i], 12) for i in range(len(vals) - 1)] if len(vals) >= 2 else []
+                diffs_pos = [d for d in diffs if d > 0]
+                uniform_step = False
+                vstep = 1.0
+                if diffs_pos:
+                    vstep = min(diffs_pos) if diffs_pos else 1.0
+                    uniform_step = (max(diffs_pos) - min(diffs_pos)) <= 1e-9
+
+                wants_list = mode_hint == "list" or (mode_hint not in {"range", "list"} and not uniform_step)
+                if wants_list:
+                    _set_model_and_widget(f"{base_key}_sweep_kind", "list")
+                    _set_model_and_widget(f"{base_key}_list", list_str)
                 else:
-                    diffs = [round(vals[i + 1] - vals[i], 12) for i in range(len(vals) - 1)]
-                    diffs = [d for d in diffs if d > 0]
-                    vstep = min(diffs) if diffs else 1.0
                     vmin = float(min(vals))
                     vmax = float(max(vals))
-                _set_model_and_widget(f"{base_key}_min", float(vmin))
-                _set_model_and_widget(f"{base_key}_max", float(vmax))
-                _set_model_and_widget(f"{base_key}_step", float(vstep))
+                    _set_model_and_widget(f"{base_key}_sweep_kind", "range")
+                    _set_model_and_widget(f"{base_key}_min", float(vmin))
+                    _set_model_and_widget(f"{base_key}_max", float(vmax))
+                    _set_model_and_widget(f"{base_key}_step", float(vstep))
             except Exception:
                 pass
+        else:
+            # Non-numeric sweeps (select/list) use the comma list UI.
+            _set_model_and_widget(f"{base_key}_list", list_str)
 
 
 def _apply_run_config_to_backtest_ui(run_row: Dict[str, Any], *, settings: Dict[str, Any]) -> None:
@@ -7467,9 +7240,7 @@ def main() -> None:
     # Global Filters session state (Phase 1)
     ensure_global_filters_initialized()
 
-    # Ensure in-process jobs (backtest/sweep) resume after a Streamlit restart.
-    with _perf("job_scheduler_tick"):
-        _job_scheduler_tick()
+    # Backtests/sweeps are executed by worker processes, not Streamlit.
 
     query_params = st.query_params
     qp_page = (_extract_query_param(query_params, "page") or "").strip()
@@ -7571,7 +7342,6 @@ def main() -> None:
         label: str,
         page_param: str,
         *,
-        icon: str = "",
         display_label: str | None = None,
         clear_bot: bool = True,
     ) -> None:
@@ -7579,9 +7349,8 @@ def main() -> None:
         # being one click behind.
         active = (st.session_state.get("current_page", "Dashboard") == label)
         shown = display_label if display_label is not None else label
-        button_label = (f"{icon} {shown}".strip() if icon else shown)
         if st.sidebar.button(
-            button_label,
+            shown,
             width="stretch",
             key=f"nav_btn_{page_param}",
             type="primary" if active else "secondary",
@@ -7594,22 +7363,22 @@ def main() -> None:
             # which would reset Streamlit session_state and break input persistence.
             st.rerun()
 
-    _nav_button("Dashboard", "Dashboard", icon="🏠")
+    _nav_button("Dashboard", "dashboard")
 
     st.sidebar.markdown("### Backtesting")
-    _nav_button("Backtest", "Backtest", icon="🧪")
-    _nav_button("Results", "Results", icon="📊")
-    _nav_button("Runs Explorer", "Runs Explorer", icon="🔎")
-    _nav_button("Sweeps", "Sweeps", icon="🧹")
+    _nav_button("Backtest", "backtest")
+    _nav_button("Results", "results")
+    _nav_button("Runs Explorer", "runs_explorer")
+    _nav_button("Sweeps", "sweeps")
 
     st.sidebar.markdown("### Live")
-    _nav_button("Live Bots", "Live", icon="🛰️", display_label="Bots")
+    _nav_button("Live Bots", "live", display_label="Bots")
 
     st.sidebar.markdown("### Tools")
-    _nav_button("Accounts", "Accounts", icon="👤")
-    _nav_button("Jobs", "Jobs", icon="🧰")
-    _nav_button("Candle Cache", "Candle Cache", icon="🕯️")
-    _nav_button("Settings", "Settings", icon="⚙️")
+    _nav_button("Accounts", "accounts")
+    _nav_button("Jobs", "jobs")
+    _nav_button("Candle Cache", "candle_cache")
+    _nav_button("Settings", "settings")
 
     # Re-read current_page after sidebar clicks (button triggers a rerun already).
     current_page = st.session_state.get("current_page", "Dashboard")
@@ -7623,8 +7392,13 @@ def main() -> None:
     user_email = get_current_user_email()
     with open_db_connection() as _id_conn:
         user_id = get_or_create_user_id(user_email, conn=_id_conn)
+        # Global presentation timezone (per-user). This does not affect DB storage (UTC).
+        try:
+            st.session_state["display_timezone_name"] = get_display_tz_name(_id_conn, str(user_id))
+        except Exception:
+            st.session_state.setdefault("display_timezone_name", DEFAULT_DISPLAY_TZ_NAME)
     st.sidebar.caption(f"User: {user_email}")
-    st.sidebar.caption("Version: v0")
+    st.sidebar.caption(f"v{__version__}")
 
     # --- Global Filters (sidebar) -------------------------------------
     with _job_conn() as _gf_conn:
@@ -8477,6 +8251,8 @@ def main() -> None:
         st.subheader("Accounts")
         st.caption("Accounts manage exchange keys (encrypted) and reusable bot account selection.")
 
+        tz = _ui_display_tz()
+
         with _job_conn() as conn:
             accounts_all = get_account_snapshots(conn, user_id, include_deleted=True)
             creds = list_credentials(conn, user_id)
@@ -8490,7 +8266,7 @@ def main() -> None:
                         "Label": a.get("label"),
                         "Status": a.get("status"),
                         "Credential ID": a.get("credential_id"),
-                        "Last Update": a.get("snapshot_updated_at"),
+                        "Last Update": fmt_dt_short(a.get("snapshot_updated_at"), tz),
                         "Risk": (
                             ("BLOCKED" + (f" ({a.get('snapshot_risk_reason')})" if a.get("snapshot_risk_reason") else ""))
                             if a.get("snapshot_risk_blocked")
@@ -8502,8 +8278,8 @@ def main() -> None:
                         "Wallet": a.get("snapshot_wallet_balance"),
                         "Margin": a.get("snapshot_margin_ratio"),
                         "Error": a.get("snapshot_last_error"),
-                        "Updated": a.get("updated_at"),
-                        "Created": a.get("created_at"),
+                        "Updated": fmt_dt_short(a.get("updated_at"), tz),
+                        "Created": fmt_dt_short(a.get("created_at"), tz),
                     }
                     for a in accounts_all
                 ]
@@ -8569,10 +8345,14 @@ def main() -> None:
                         cred_row = None
                     if cred_row:
                         st.write(f"Credential ID: **{cred_row.get('id')}**")
-                        st.caption(f"API key: {mask_api_key(cred_row.get('api_key'))} • Last used: {cred_row.get('last_used_at') or 'n/a'}")
+                        st.caption(
+                            f"API key: {mask_api_key(cred_row.get('api_key'))} • Last used: {fmt_dt_short(cred_row.get('last_used_at'), tz)}"
+                        )
                     else:
                         st.write(f"Credential ID: **{a.get('credential_id')}**")
-                    st.caption(f"Created: {a.get('created_at')} • Updated: {a.get('updated_at')}")
+                    st.caption(
+                        f"Created: {fmt_dt_short(a.get('created_at'), tz)} • Updated: {fmt_dt_short(a.get('updated_at'), tz)}"
+                    )
                     with _job_conn() as conn:
                         bot_count = count_bots_for_account(conn, user_id, int(aid)) if aid is not None else 0
                     st.caption(f"Bots using this account: {bot_count}")
@@ -8727,6 +8507,8 @@ def main() -> None:
         st.warning("Credentials are now managed via Tools → Accounts. This page is kept for backward compatibility.")
         st.caption("Read-only view. Create/rotate keys via Tools → Accounts.")
 
+        tz = _ui_display_tz()
+
         with _job_conn() as conn:
             creds = list_credentials(conn, user_id)
 
@@ -8738,8 +8520,8 @@ def main() -> None:
                         "Exchange": c.get("exchange_id"),
                         "Label": c.get("label"),
                         "API Key": mask_api_key(c.get("api_key")),
-                        "Updated": c.get("updated_at"),
-                        "Last Used": c.get("last_used_at"),
+                        "Updated": fmt_dt_short(c.get("updated_at"), tz),
+                        "Last Used": fmt_dt_short(c.get("last_used_at"), tz),
                     }
                     for c in creds
                 ]
@@ -8753,6 +8535,15 @@ def main() -> None:
         if current_page == "Runs Explorer":
             st.subheader("Runs Explorer")
             st.caption("Compare run metrics and strategy config side-by-side (with diff highlighting).")
+
+            # Match Results/Sweeps: minimum filters apply by default.
+            show_all_runs_explorer = st.checkbox(
+                "Show all runs (ignore minimum filters)",
+                value=bool(st.session_state.get("runs_explorer_show_all_runs", False)),
+                key=_wkey("runs_explorer_show_all_runs"),
+                on_change=_sync_model_from_widget,
+                args=("runs_explorer_show_all_runs",),
+            )
 
             # Reuse global filter chips for consistency with Results.
             try:
@@ -9135,6 +8926,25 @@ def main() -> None:
                 limit=int(results_grid_limit),
                 offset=0,
             )
+
+            # Apply minimum return filter unless "Show all" is enabled.
+            # (We do this before heavy config/metrics JSON parsing.)
+            if not bool(show_all_runs_explorer):
+                try:
+                    min_ret_pct = float(settings.get("min_net_return_pct", 20.0))
+                except Exception:
+                    min_ret_pct = 20.0
+                min_ret_frac = min_ret_pct / 100.0
+                try:
+                    rows = [
+                        r
+                        for r in (rows or [])
+                        if (_safe_float((r or {}).get("net_return_pct")) is not None)
+                        and (float(_safe_float((r or {}).get("net_return_pct")) or 0.0) >= float(min_ret_frac))
+                    ]
+                    total_count = int(len(rows))
+                except Exception:
+                    pass
 
             if not rows:
                 st.info("No runs found for the current filters.")
@@ -9531,6 +9341,13 @@ def main() -> None:
 
             df = pd.DataFrame(base_rows)
 
+            # Default ordering: CPC Index desc.
+            try:
+                if "cpc_index" in df.columns:
+                    df = df.sort_values(by="cpc_index", ascending=False, na_position="last")
+            except Exception:
+                pass
+
             # Match Results grid: normalize market label used by Asset renderer.
             if "market_type" in df.columns and "market" not in df.columns:
                 df["market"] = df["market_type"]
@@ -9716,6 +9533,16 @@ def main() -> None:
             )
 
             # --- Grid ----------------------------------------------------
+            # Presentation-only: convert date columns to local strings before AGGrid.
+            try:
+                tz = _ui_display_tz()
+                if "created_at" in df.columns:
+                    df["created_at"] = [_ui_local_dt_ampm(v, tz) for v in df["created_at"].tolist()]
+                for _c in ("start_date", "end_date"):
+                    if _c in df.columns:
+                        df[_c] = [_ui_local_date_iso(v, tz) for v in df[_c].tolist()]
+            except Exception:
+                pass
             gb = GridOptionsBuilder.from_dataframe(df)
             gb.configure_default_column(filter=True, sortable=True, resizable=True)
             gb.configure_selection("multiple", use_checkbox=True)
@@ -9736,7 +9563,6 @@ def main() -> None:
                     headerName=header_map.get("created_at", "Run Date"),
                     pinned="left",
                     width=120,
-                    valueFormatter=date_formatter,
                     hide=("created_at" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
@@ -9747,7 +9573,6 @@ def main() -> None:
                     headerName=header_map.get("start_date", "Start"),
                     pinned="left",
                     width=110,
-                    valueFormatter=date_formatter,
                     hide=("start_date" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
@@ -9759,7 +9584,6 @@ def main() -> None:
                     headerName=header_map.get("end_date", "End"),
                     pinned="left",
                     width=110,
-                    valueFormatter=date_formatter,
                     hide=("end_date" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
@@ -9857,7 +9681,7 @@ def main() -> None:
                 elif mk == "roi_pct_on_margin":
                     fmt = roi_pct_formatter
                     style = metrics_gradient_style
-                elif mk == "max_drawdown_pct":
+                elif mk in {"max_drawdown_pct", "max_drawdown", "max_dd_pct", "max_dd"}:
                     fmt = pct_formatter
                     style = dd_style
                 elif mk in {"net_profit", "sharpe", "sortino", "profit_factor", "cpc_index", "common_sense_ratio"}:
@@ -9872,6 +9696,25 @@ def main() -> None:
                     cellStyle=style,
                     cellClass="ag-center-aligned-cell",
                 )
+
+            # Guardrail: ensure core % columns keep % formatting even when the metric-selection
+            # UI changes (e.g., adding config columns causes reruns).
+            for core_pct_col, core_style in (
+                ("net_return_pct", metrics_gradient_style),
+                ("max_drawdown_pct", dd_style),
+                ("max_drawdown", dd_style),
+                ("win_rate", metrics_gradient_style),
+            ):
+                if core_pct_col in df.columns:
+                    gb.configure_column(
+                        core_pct_col,
+                        headerName=header_map.get(core_pct_col, core_pct_col.replace("_", " ").title()),
+                        width=130,
+                        type=["numericColumn"],
+                        valueFormatter=pct_formatter,
+                        cellStyle=core_style,
+                        cellClass="ag-center-aligned-cell",
+                    )
 
             # Config columns: label headings + diff highlighting
             for k in effective_cfg_keys:
@@ -9926,7 +9769,9 @@ def main() -> None:
             grid = AgGrid(
                 df,
                 gridOptions=gb.build(),
-                update_mode=GridUpdateMode.MODEL_CHANGED,
+                # Sorting/filtering should be client-side (no rerun). Only selection should rerun
+                # (for CSV selection/export) to keep the UI responsive.
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
                 data_return_mode=DataReturnMode.AS_INPUT,
                 enable_enterprise_modules=False,
                 allow_unsafe_jscode=True,
@@ -9936,6 +9781,32 @@ def main() -> None:
                 key="runs_explorer_compare_grid",
                 columns_state=columns_state,
             )
+
+            # Open run detail reliably when exactly one row is selected.
+            # (If multiple rows are selected we assume the user is doing CSV export.)
+            try:
+                sel_raw = grid.get("selected_rows")
+                sel: list[dict[str, Any]] = []
+                if sel_raw is None:
+                    sel = []
+                elif isinstance(sel_raw, list):
+                    sel = sel_raw
+                elif isinstance(sel_raw, pd.DataFrame):
+                    sel = sel_raw.to_dict("records")
+                else:
+                    sel = list(sel_raw)
+                if isinstance(sel, list) and len(sel) == 1:
+                    rid = str((sel[0] or {}).get("run_id") or "").strip()
+                    if rid:
+                        last_opened = str(st.session_state.get("_runs_explorer_last_opened_run_id") or "").strip()
+                        if rid != last_opened:
+                            st.session_state["_runs_explorer_last_opened_run_id"] = rid
+                            st.session_state["deep_link_run_id"] = rid
+                            st.session_state["current_page"] = "Run"
+                            _update_query_params(page="Run", run_id=rid)
+                            st.rerun()
+            except Exception:
+                pass
 
             export_cols = [c for c in df.columns if not c.startswith("__diff__")]
             export_df = df[export_cols].copy()
@@ -10131,6 +10002,7 @@ def main() -> None:
             st.rerun()
 
         # Two-column layout.
+        run_feedback = None
         left, right = st.columns([2, 1], gap="large")
 
         # --- One-time migration: legacy allow_long/allow_short -> Trade direction ---
@@ -10159,6 +10031,7 @@ def main() -> None:
 
         # Collect per-field sweep specs (keyed by SWEEPABLE_FIELDS keys)
         sweep_specs: Dict[str, List[Any]] = {}
+        sweep_param_modes: Dict[str, str] = {}
         sweep_mode_active = False
         swept_missing: List[str] = []
 
@@ -10166,6 +10039,16 @@ def main() -> None:
             nonlocal sweep_mode_active
             if str(st.session_state.get(f"{base_key}_mode") or "fixed").strip().lower() == "sweep":
                 sweep_mode_active = True
+                try:
+                    kind_key = f"{base_key}_sweep_kind"
+                    if kind_key in st.session_state:
+                        kind_val = str(st.session_state.get(kind_key) or "range").strip().lower()
+                        sweep_param_modes[sweep_field_key] = "list" if kind_val == "list" else "range"
+                    else:
+                        # Select-type sweeps are list-based.
+                        sweep_param_modes[sweep_field_key] = "list"
+                except Exception:
+                    sweep_param_modes[sweep_field_key] = "range"
                 if sweep_values:
                     sweep_specs[sweep_field_key] = list(sweep_values)
 
@@ -11215,6 +11098,9 @@ def main() -> None:
                 run_button_label = "Start sweep" if sweep_mode_active else "Run backtest"
                 run_clicked = st.button(run_button_label, type="primary")
 
+                # Keep run confirmations directly under the Run section.
+                run_feedback = st.empty()
+
         # --- Execute (payload paths preserved) ---------------------------
         fee_rate = float(fee_rate_input)
 
@@ -11466,7 +11352,11 @@ def main() -> None:
                     payload["metadata"]["leverage"] = int(lev_bt)
 
                 job_id = enqueue_backtest_job(payload)
-                st.success(f"Backtest job queued: #{job_id}")
+                msg = f"Backtest job queued: #{job_id}"
+                if run_feedback is not None:
+                    run_feedback.success(msg)
+                else:
+                    st.success(msg)
             else:
                 candles, data_source_label, storage_symbol, storage_timeframe = load_data()
                 data_source_key = "ccxt" if data_source == "Crypto (CCXT)" else "synthetic"
@@ -11489,8 +11379,47 @@ def main() -> None:
                 if lev_bt != 1 and isinstance(base_config_snapshot, dict):
                     base_config_snapshot["_futures"] = {"leverage": int(lev_bt)}
 
+                metadata_common = {
+                    "strategy_name": "DragonDcaAtr",
+                    "strategy_version": "0.1.0",
+                    "initial_balance": initial_balance,
+                    "fee_rate": fee_rate,
+                    "data_source": data_source_key,
+                    "exchange_id": ccxt_exchange_id if data_source_key == "ccxt" else None,
+                    "market_type": market_type.lower() if data_source_key == "ccxt" else None,
+                    "candle_count": len(candles),
+                    "prefer_bbo_maker": config.general.prefer_bbo_maker,
+                    "bbo_queue_level": config.general.bbo_queue_level,
+                }
+                if lev_bt != 1:
+                    metadata_common["_futures"] = {"leverage": int(lev_bt)}
+                    metadata_common["leverage"] = int(lev_bt)
+
+                field_meta: dict[str, dict[str, Any]] = {}
+                for k in sweep_specs.keys():
+                    meta = SWEEPABLE_FIELDS.get(k)
+                    if not meta:
+                        continue
+                    t = meta.get("type")
+                    try:
+                        type_name = str(getattr(t, "__name__", "str"))
+                    except Exception:
+                        type_name = "str"
+                    path_val = meta.get("path")
+                    path_list: list[str] = []
+                    if isinstance(path_val, (list, tuple)):
+                        path_list = [str(p).strip() for p in path_val if str(p).strip()]
+                    field_meta[str(k)] = {
+                        "target": str(meta.get("target") or "config"),
+                        "path": path_list,
+                        "type": type_name,
+                    }
+
                 sweep_definition = {
                     "params": {key: [str(v) for v in values] for key, values in sweep_specs.items()},
+                    "params_mode": {key: str(sweep_param_modes.get(key) or "range") for key in sweep_specs.keys()},
+                    "field_meta": field_meta,
+                    "metadata_common": metadata_common,
                     "base_config": base_config_snapshot,
                     "data_settings": _jsonify(base_data_settings),
                 }
@@ -11573,45 +11502,25 @@ def main() -> None:
                     )
                 )
 
-                items = list(sweep_specs.items())
-                keys = [k for k, _ in items]
-                value_lists = [vals for _, vals in items]
-                combos = list(itertools.product(*value_lists))
                 sweep_assets_job = (
                     [str(s).strip() for s in (sweep_assets_snapshot or []) if str(s).strip()]
                     if sweep_scope != "single_asset"
                     else [str(storage_symbol or "").strip()] if str(storage_symbol or "").strip() else []
                 )
-                total_runs = int(len(combos)) * int(len(sweep_assets_job) if sweep_assets_job else 1)
-                metadata_common = {
-                    "strategy_name": "DragonDcaAtr",
-                    "strategy_version": "0.1.0",
-                    "initial_balance": initial_balance,
-                    "fee_rate": fee_rate,
-                    "data_source": data_source_key,
-                    "exchange_id": ccxt_exchange_id if data_source_key == "ccxt" else None,
-                    "market_type": market_type.lower() if data_source_key == "ccxt" else None,
-                    "candle_count": len(candles),
-                    "prefer_bbo_maker": config.general.prefer_bbo_maker,
-                    "bbo_queue_level": config.general.bbo_queue_level,
-                }
-                if lev_bt != 1:
-                    metadata_common["_futures"] = {"leverage": int(lev_bt)}
-                    metadata_common["leverage"] = int(lev_bt)
+                total_combos = 1
+                try:
+                    for _k, vals in sweep_specs.items():
+                        total_combos *= max(1, int(len(vals or [])))
+                except Exception:
+                    total_combos = 0
+                total_runs = int(total_combos) * int(len(sweep_assets_job) if sweep_assets_job else 1)
 
-                payload = {
-                    "sweep_id": sweep_id,
-                    "base_config": base_config_snapshot if isinstance(base_config_snapshot, dict) else asdict(config),
-                    "data_settings": asdict(base_data_settings),
-                    "keys": keys,
-                    "combos": [list(c) for c in combos],
-                    "sweep_assets": sweep_assets_job,
-                    "sweep_scope": str(sweep_scope),
-                    "sweep_category_id": int(sweep_category_id) if sweep_category_id is not None else None,
-                    "metadata": metadata_common,
-                }
-                job_id = enqueue_sweep_job(payload)
-                st.success(f"Sweep job queued: #{job_id} ({total_runs} runs)")
+                parent_job_id = enqueue_sweep_parent_job(sweep_id=str(sweep_id), user_id=str(user_id or "").strip() or None)
+                msg = f"Sweep queued: sweep_id={sweep_id} ({total_runs} runs) – parent job_id={int(parent_job_id)}"
+                if run_feedback is not None:
+                    run_feedback.success(msg)
+                else:
+                    st.success(msg)
 
     if current_page == "Live Bots":
         st.subheader("Live Bots")
@@ -12289,6 +12198,15 @@ def main() -> None:
                         """
                 )
 
+        # Default ordering: CPC Index desc (falls back to current ordering if missing).
+        # Do this before computing pre_selected row indices.
+        try:
+            if "cpc_index" in getattr(df, "columns", []):
+                df = df.sort_values(by="cpc_index", ascending=False, na_position="last")
+                df = df.reset_index(drop=True)
+        except Exception:
+            pass
+
         # Ensure this is defined before use below (avoids UnboundLocalError)
         active_run_id = str(st.session_state.get("runs_explorer_active_run_id") or "").strip()
 
@@ -12461,6 +12379,17 @@ def main() -> None:
             """
         )
 
+        # Presentation-only: convert date columns to local strings before AGGrid.
+        try:
+            tz = _ui_display_tz()
+            if "created_at" in df.columns:
+                df["created_at"] = [_ui_local_dt_ampm(v, tz) for v in df["created_at"].tolist()]
+            for _c in ("start_date", "end_date"):
+                if _c in df.columns:
+                    df[_c] = [_ui_local_date_iso(v, tz) for v in df[_c].tolist()]
+        except Exception:
+            pass
+
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(filter=True, sortable=True, resizable=True)
         # Place selection checkboxes inside the Asset column (not as a separate left column).
@@ -12493,7 +12422,6 @@ def main() -> None:
             gb.configure_column(
                 "created_at",
                 headerName=header_map.get("created_at", "Run Date"),
-                valueFormatter=date_formatter,
                 width=_w(120),
                 hide=("created_at" not in visible_cols),
                 wrapHeaderText=True,
@@ -12504,7 +12432,6 @@ def main() -> None:
             gb.configure_column(
                 "start_date",
                 headerName=header_map.get("start_date", "Start"),
-                valueFormatter=date_formatter,
                 width=_w(110),
                 hide=("start_date" not in visible_cols),
                 wrapHeaderText=True,
@@ -12515,7 +12442,6 @@ def main() -> None:
             gb.configure_column(
                 "end_date",
                 headerName=header_map.get("end_date", "End"),
-                valueFormatter=date_formatter,
                 width=_w(110),
                 hide=("end_date" not in visible_cols),
                 wrapHeaderText=True,
@@ -12597,9 +12523,9 @@ def main() -> None:
                             headerCheckboxSelection=True if col == "symbol" else None,
                         )
 
-        for col in ("net_return_pct", "max_drawdown_pct", "win_rate"):
+        for col in ("net_return_pct", "max_drawdown_pct", "max_drawdown", "win_rate"):
             if col in df.columns:
-                if col == "max_drawdown_pct":
+                if col in {"max_drawdown_pct", "max_drawdown"}:
                     gb.configure_column(
                         col,
                         headerName=header_map.get(col, "Max Drawdown"),
@@ -12887,7 +12813,8 @@ def main() -> None:
         grid = AgGrid(
             df,
             gridOptions=grid_options,
-            update_mode=(GridUpdateMode.MODEL_CHANGED | GridUpdateMode.VALUE_CHANGED),
+            # Sorting/filtering should be client-side (no rerun). Only selection + edits should rerun.
+            update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.VALUE_CHANGED),
             data_return_mode=DataReturnMode.AS_INPUT,
             fit_columns_on_grid_load=False,
             allow_unsafe_jscode=True,
@@ -14316,6 +14243,18 @@ def main() -> None:
             ".ag-center-aligned-cell": {"justify-content": "center"},
         }
 
+        # Presentation-only: render date columns as local strings before sending to AGGrid.
+        # This avoids JS Date parsing and keeps sorting stable.
+        try:
+            tz = _ui_display_tz()
+            if "created_at" in df.columns:
+                df["created_at"] = [_ui_local_dt_ampm(v, tz) for v in df["created_at"].tolist()]
+            for _c in ("start_date", "end_date"):
+                if _c in df.columns:
+                    df[_c] = [_ui_local_date_iso(v, tz) for v in df[_c].tolist()]
+        except Exception:
+            pass
+
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(filter=True, sortable=True, resizable=True)
         # IMPORTANT: `use_checkbox=True` creates a separate selection column.
@@ -14342,7 +14281,6 @@ def main() -> None:
             gb.configure_column(
                 "created_at",
                 headerName=header_map.get("created_at", "Run Date"),
-                valueFormatter=date_formatter,
                 width=120,
                 hide=("created_at" not in visible_cols),
                 wrapHeaderText=True,
@@ -14860,6 +14798,194 @@ def main() -> None:
             if "base_config_json" in df_sweeps.columns:
                 df_sweeps["direction"] = df_sweeps["base_config_json"].apply(infer_trade_direction_label)
 
+        # Job-based progress (child backtest_run jobs).
+        if not df_sweeps.empty and "id" in df_sweeps.columns:
+            try:
+                sweep_ids = [str(v).strip() for v in df_sweeps["id"].tolist() if str(v).strip()]
+                counts_by_sweep: dict[str, dict[str, int]] = {}
+                parent_by_sweep: dict[str, dict[str, Any]] = {}
+                counts_by_parent: dict[int, dict[str, int]] = {}
+                if sweep_ids:
+                    with open_db_connection() as _jc_conn:
+                        # Prefer parent-job-based aggregation when present.
+                        try:
+                            parent_by_sweep = get_sweep_parent_jobs_by_sweep(_jc_conn, sweep_ids=sweep_ids)
+                        except Exception:
+                            parent_by_sweep = {}
+
+                        parent_ids: list[int] = []
+                        for sid, info in (parent_by_sweep or {}).items():
+                            try:
+                                pid = int((info or {}).get("parent_job_id"))
+                                if pid > 0:
+                                    parent_ids.append(pid)
+                            except Exception:
+                                continue
+                        parent_ids = sorted(set(parent_ids))
+                        if parent_ids:
+                            try:
+                                counts_by_parent = get_backtest_run_job_counts_by_parent(_jc_conn, parent_job_ids=parent_ids)
+                            except Exception:
+                                counts_by_parent = {}
+
+                        # Legacy fallback for older sweeps without a parent job.
+                        counts_by_sweep = get_backtest_run_job_counts_by_sweep(_jc_conn, sweep_ids=sweep_ids)
+
+                def _parent_id_for(sid: Any) -> Optional[int]:
+                    try:
+                        info = parent_by_sweep.get(str(sid)) if isinstance(parent_by_sweep, dict) else None
+                        if not isinstance(info, dict):
+                            return None
+                        pid = info.get("parent_job_id")
+                        return int(pid) if pid is not None else None
+                    except Exception:
+                        return None
+
+                def _parent_status_for(sid: Any) -> str:
+                    try:
+                        info = parent_by_sweep.get(str(sid)) if isinstance(parent_by_sweep, dict) else None
+                        if not isinstance(info, dict):
+                            return ""
+                        return str(info.get("status") or "")
+                    except Exception:
+                        return ""
+
+                def _parent_pause_for(sid: Any) -> int:
+                    try:
+                        info = parent_by_sweep.get(str(sid)) if isinstance(parent_by_sweep, dict) else None
+                        if not isinstance(info, dict):
+                            return 0
+                        return int(info.get("pause_requested") or 0)
+                    except Exception:
+                        return 0
+
+                def _parent_cancel_for(sid: Any) -> int:
+                    try:
+                        info = parent_by_sweep.get(str(sid)) if isinstance(parent_by_sweep, dict) else None
+                        if not isinstance(info, dict):
+                            return 0
+                        return int(info.get("cancel_requested") or 0)
+                    except Exception:
+                        return 0
+
+                def _c(sid: Any, key: str) -> int:
+                    try:
+                        pid = _parent_id_for(sid)
+                        if pid is not None and pid in (counts_by_parent or {}):
+                            return int((counts_by_parent.get(int(pid), {}) or {}).get(key) or 0)
+                        return int((counts_by_sweep.get(str(sid), {}) or {}).get(key) or 0)
+                    except Exception:
+                        return 0
+
+                df_sweeps = df_sweeps.copy()
+                df_sweeps["parent_job_id"] = df_sweeps["id"].apply(lambda sid: _parent_id_for(sid))
+                df_sweeps["parent_job_status"] = df_sweeps["id"].apply(lambda sid: _parent_status_for(sid) or None)
+                df_sweeps["parent_pause_requested"] = df_sweeps["id"].apply(lambda sid: _parent_pause_for(sid) or 0)
+                df_sweeps["parent_cancel_requested"] = df_sweeps["id"].apply(lambda sid: _parent_cancel_for(sid) or 0)
+                df_sweeps["jobs_total"] = df_sweeps["id"].apply(lambda sid: _c(sid, "total"))
+                df_sweeps["jobs_done"] = df_sweeps["id"].apply(lambda sid: _c(sid, "done"))
+                df_sweeps["jobs_failed"] = df_sweeps["id"].apply(lambda sid: _c(sid, "failed"))
+                df_sweeps["jobs_cancelled"] = df_sweeps["id"].apply(lambda sid: _c(sid, "cancelled"))
+                df_sweeps["jobs_running"] = df_sweeps["id"].apply(lambda sid: _c(sid, "running"))
+                df_sweeps["jobs_queued"] = df_sweeps["id"].apply(lambda sid: _c(sid, "queued"))
+
+                def _pct(terminal: Any, total: Any) -> Optional[float]:
+                    try:
+                        t = int(total or 0)
+                        d = int(terminal or 0)
+                        if t <= 0:
+                            return None
+                        return float(d) * 100.0 / float(t)
+                    except Exception:
+                        return None
+
+                def _terminal(r: dict) -> int:
+                    try:
+                        return int(r.get("jobs_done") or 0) + int(r.get("jobs_failed") or 0) + int(r.get("jobs_cancelled") or 0)
+                    except Exception:
+                        return 0
+
+                df_sweeps["jobs_progress_pct"] = df_sweeps.apply(lambda r: _pct(_terminal(dict(r)), r.get("jobs_total")), axis=1)
+            except Exception:
+                pass
+
+        # Status pills + capitalization for the Sweeps grid.
+        # Prefer a derived label when pause/cancel is requested on the parent job.
+        try:
+            if not df_sweeps.empty and "status" in df_sweeps.columns:
+                df_sweeps = df_sweeps.copy()
+
+                def _cap1(s: Any) -> str:
+                    raw = str(s or "").strip()
+                    if not raw:
+                        return ""
+                    return raw[:1].upper() + raw[1:]
+
+                def _status_label(row: dict) -> str:
+                    try:
+                        raw = str(row.get("status") or "").strip().lower()
+                        parent_status = str(row.get("parent_job_status") or "").strip().lower()
+                        # Parent control-plane signals are more immediate than sweep.status.
+                        try:
+                            pause = int(row.get("parent_pause_requested") or 0) == 1
+                        except Exception:
+                            pause = False
+                        try:
+                            cancel = int(row.get("parent_cancel_requested") or 0) == 1
+                        except Exception:
+                            cancel = False
+
+                        try:
+                            jobs_total = int(row.get("jobs_total") or 0)
+                        except Exception:
+                            jobs_total = 0
+                        try:
+                            jobs_done = int(row.get("jobs_done") or 0)
+                        except Exception:
+                            jobs_done = 0
+                        try:
+                            jobs_failed = int(row.get("jobs_failed") or 0)
+                        except Exception:
+                            jobs_failed = 0
+                        try:
+                            jobs_cancelled = int(row.get("jobs_cancelled") or 0)
+                        except Exception:
+                            jobs_cancelled = 0
+                        terminal_children = jobs_done + jobs_failed + jobs_cancelled
+
+                        terminal = raw in {"done", "failed", "cancelled", "canceled"}
+                        if cancel:
+                            # If cancellation is effectively complete, show Cancelled.
+                            if parent_status in {"cancelled", "canceled"}:
+                                return "Cancelled"
+                            if jobs_total > 0 and terminal_children >= jobs_total and jobs_cancelled > 0:
+                                return "Cancelled"
+                            # Parent job may finish as done/failed even when cancellation was requested;
+                            # if any children were cancelled, treat the sweep as Cancelled.
+                            if parent_status in {"done", "failed", "error"} and jobs_cancelled > 0:
+                                return "Cancelled"
+                            if not terminal:
+                                return "Cancelling"
+                        if pause and not terminal:
+                            return "Paused"
+                        if raw in {"cancelled", "canceled"}:
+                            return "Cancelled"
+                        if raw in {"done", "complete", "completed", "success", "succeeded"}:
+                            return "Done"
+                        if raw in {"failed", "failure", "error"}:
+                            return "Failed"
+                        if raw in {"running", "planning", "processing"}:
+                            return "Running"
+                        if raw in {"queued", "pending"}:
+                            return "Queued"
+                        return _cap1(raw)
+                    except Exception:
+                        return _cap1(row.get("status"))
+
+                df_sweeps["status"] = df_sweeps.apply(lambda r: _status_label(dict(r)), axis=1)
+        except Exception:
+            pass
+
         # Derive a display market label for consistent "Asset - Market" rendering.
         if not df_sweeps.empty and "market" not in df_sweeps.columns:
             def _infer_market_from_sweep_row(row: dict) -> str:
@@ -15136,9 +15262,14 @@ def main() -> None:
                     except Exception:
                         return ""
 
+                tz = _ui_display_tz()
                 rng = df_sweeps.apply(lambda r: _extract_sweep_range(dict(r)), axis=1)
-                df_sweeps["start_date"] = [sd.date().isoformat() if sd else None for sd, _ in rng]
-                df_sweeps["end_date"] = [ed.date().isoformat() if ed else None for _, ed in rng]
+                df_sweeps["start_date"] = [
+                    (_ui_local_date_iso(sd, tz) if sd else None) for sd, _ in rng
+                ]
+                df_sweeps["end_date"] = [
+                    (_ui_local_date_iso(ed, tz) if ed else None) for _, ed in rng
+                ]
                 df_sweeps["duration"] = [_fmt_td(sd, ed) for sd, ed in rng]
         except Exception:
             pass
@@ -15159,6 +15290,12 @@ def main() -> None:
             "exchange_id",
             "range_mode",
             "user_id",
+
+            # Parent/job control-plane columns (used only for derived status).
+            "parent_job_id",
+            "parent_job_status",
+            "parent_pause_requested",
+            "parent_cancel_requested",
         }
         df_sweeps_display = df_sweeps.drop(columns=[c for c in hidden_sweep_cols if c in df_sweeps.columns], errors="ignore")
         # Default ordering for the Sweeps overview grid.
@@ -15171,6 +15308,11 @@ def main() -> None:
             "timeframe",
             "direction",
             "run_count",
+            "jobs_progress_pct",
+            "status",
+            "jobs_total",
+            "jobs_done",
+            "jobs_failed",
             "created_at",
             "start_date",
             "end_date",
@@ -15179,7 +15321,6 @@ def main() -> None:
             "best_sharpe",
             "best_roi_pct_on_margin",
             "best_cpc_index",
-            "status",
         ]
         existing_sweeps = [c for c in sweeps_order if c in df_sweeps_display.columns]
         rest_sweeps = [c for c in df_sweeps_display.columns if c not in existing_sweeps]
@@ -15223,6 +15364,17 @@ def main() -> None:
             )
         df_sweeps_display = fr.df
         st.caption(f"{int(len(df_sweeps_display))} rows shown / {total_sweeps} total")
+
+        # Ensure timestamp columns are presentation-safe for AGGrid (strings, not datetimes).
+        # Use ISO local dates so lexical sort works and the browser can't reinterpret timezones.
+        try:
+            tz = _ui_display_tz()
+            if "created_at" in df_sweeps_display.columns:
+                df_sweeps_display["created_at"] = [
+                    _ui_local_dt_ampm(v, tz) for v in df_sweeps_display["created_at"].tolist()
+                ]
+        except Exception:
+            pass
 
         # IMPORTANT: streamlit-aggrid `pre_selected_rows` expects 0-based positional indices.
         # Ensure a clean RangeIndex so we can reliably preselect by row number.
@@ -15426,6 +15578,84 @@ def main() -> None:
             """
         )
 
+        jobs_progress_renderer_sweeps = JsCode(
+            """
+            class JobsProgressRenderer {
+                init(params) {
+                    const v = Number(params.value);
+                    const total = (params && params.data && params.data.jobs_total !== undefined && params.data.jobs_total !== null)
+                        ? Number(params.data.jobs_total)
+                        : NaN;
+
+                    // Conditional: only render when it is meaningful.
+                    if (!isFinite(v) || !isFinite(total) || total <= 0) {
+                        const empty = document.createElement('div');
+                        empty.style.width = '100%';
+                        empty.style.textAlign = 'center';
+                        empty.style.color = '#64748b';
+                        empty.innerText = '';
+                        this.eGui = empty;
+                        return;
+                    }
+
+                    const pct = Math.max(0, Math.min(100, v));
+
+                    let barRgb = '56,139,253';
+                    let textColor = '#b6d4fe';
+                    if (pct >= 95) {
+                        barRgb = '46,160,67';
+                        textColor = '#7ee787';
+                    } else if (pct >= 50) {
+                        barRgb = '250,204,21';
+                        textColor = '#facc15';
+                    }
+
+                    const wrap = document.createElement('div');
+                    wrap.style.display = 'flex';
+                    wrap.style.alignItems = 'center';
+                    wrap.style.justifyContent = 'center';
+                    wrap.style.width = '100%';
+                    wrap.style.height = '100%';
+
+                    const outer = document.createElement('div');
+                    outer.style.width = '100%';
+                    outer.style.maxWidth = '110px';
+                    outer.style.height = '14px';
+                    outer.style.borderRadius = '999px';
+                    outer.style.backgroundColor = 'rgba(148,163,184,0.14)';
+                    outer.style.position = 'relative';
+                    outer.style.overflow = 'hidden';
+
+                    const inner = document.createElement('div');
+                    inner.style.height = '100%';
+                    inner.style.width = pct.toFixed(0) + '%';
+                    inner.style.backgroundColor = `rgba(${barRgb},0.35)`;
+
+                    const label = document.createElement('div');
+                    label.style.position = 'absolute';
+                    label.style.top = '0';
+                    label.style.left = '0';
+                    label.style.right = '0';
+                    label.style.bottom = '0';
+                    label.style.display = 'flex';
+                    label.style.alignItems = 'center';
+                    label.style.justifyContent = 'center';
+                    label.style.fontSize = '11px';
+                    label.style.fontWeight = '500';
+                    label.style.color = textColor;
+                    label.innerText = pct.toFixed(0) + '%';
+
+                    outer.appendChild(inner);
+                    outer.appendChild(label);
+                    wrap.appendChild(outer);
+                    this.eGui = wrap;
+                }
+                getGui() { return this.eGui; }
+                refresh(params) { return false; }
+            }
+            """
+        )
+
         pct_formatter = JsCode(
             """
             function(params) {
@@ -15563,19 +15793,47 @@ def main() -> None:
                         ver = st.session_state.get("sweeps_visible_cols_version")
                     except Exception:
                         ver = None
+                    # v2: add Best ROI/CPC.
                     if not isinstance(ver, int) or ver < 2:
-                        required = [
+                        required_v2 = [
                             c
                             for c in ("best_roi_pct_on_margin", "best_cpc_index")
                             if c in df_sweeps_display.columns and c not in saved_cols
                         ]
-                        if required:
-                            saved_cols = list(saved_cols) + required
+                        if required_v2:
+                            saved_cols = list(saved_cols) + required_v2
                             try:
                                 with open_db_connection() as _prefs_conn:
                                     set_user_setting(_prefs_conn, user_id, "ui.sweeps.visible_cols", list(saved_cols))
                                     set_user_setting(_prefs_conn, user_id, "ui.sweeps.visible_cols_version", 2)
                                 st.session_state["sweeps_visible_cols_version"] = 2
+                                ver = 2
+                            except Exception:
+                                pass
+
+                    # v3: ensure Jobs % is visible by default.
+                    if not isinstance(ver, int) or ver < 3:
+                        required_v3 = [
+                            c
+                            for c in ("jobs_progress_pct",)
+                            if c in df_sweeps_display.columns and c not in saved_cols
+                        ]
+                        if required_v3:
+                            # Insert Jobs % just before Status if present; otherwise append.
+                            out_cols = list(saved_cols)
+                            try:
+                                idx = out_cols.index("status")
+                                for c in required_v3:
+                                    out_cols.insert(idx, c)
+                                    idx += 1
+                            except ValueError:
+                                out_cols.extend(required_v3)
+                            saved_cols = out_cols
+                            try:
+                                with open_db_connection() as _prefs_conn:
+                                    set_user_setting(_prefs_conn, user_id, "ui.sweeps.visible_cols", list(saved_cols))
+                                    set_user_setting(_prefs_conn, user_id, "ui.sweeps.visible_cols_version", 3)
+                                st.session_state["sweeps_visible_cols_version"] = 3
                             except Exception:
                                 pass
 
@@ -15593,6 +15851,10 @@ def main() -> None:
             "timeframe",
             "direction",
             "run_count",
+            "jobs_progress_pct",
+            "status",
+            "jobs_total",
+            "jobs_failed",
             "created_at",
             "start_date",
             "end_date",
@@ -15601,7 +15863,6 @@ def main() -> None:
             "best_sharpe",
             "best_roi_pct_on_margin",
             "best_cpc_index",
-            "status",
             "sweep_actions",
         ]
         _persisted_visible = st.session_state.get("sweeps_visible_cols")
@@ -15662,6 +15923,72 @@ def main() -> None:
             """
         )
 
+        # Date formatting (UTC) for sweeps overview.
+        ddmm_hhmm_utc_formatter = JsCode(
+            """
+            function(params) {
+                try {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    const s = v.toString().trim();
+                    if (!s) return '';
+
+                    let d;
+                    if (/^[0-9]+$/.test(s)) {
+                        const n = parseInt(s, 10);
+                        d = new Date(n > 1000000000000 ? n : (n * 1000));
+                    } else {
+                        d = new Date(s);
+                    }
+                    if (isNaN(d.getTime())) return s;
+
+                    const dd = String(d.getUTCDate()).padStart(2, '0');
+                    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const hh = String(d.getUTCHours()).padStart(2, '0');
+                    const mi = String(d.getUTCMinutes()).padStart(2, '0');
+                    return `${dd}/${mm} ${hh}:${mi}`;
+                } catch (e) {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    return v;
+                }
+            }
+            """
+        )
+
+        ddmm_yy_formatter = JsCode(
+            """
+            function(params) {
+                try {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    const s = v.toString().trim();
+                    if (!s) return '';
+
+                    // Fast-path for YYYY-MM-DD.
+                    const m = s.match(/^([0-9]{4})-([0-9]{2})-([0-9]{2})/);
+                    if (m) {
+                        return `${m[3]}/${m[2]}/${m[1].slice(2)}`;
+                    }
+
+                    let d;
+                    if (/^[0-9]+$/.test(s)) {
+                        const n = parseInt(s, 10);
+                        d = new Date(n > 1000000000000 ? n : (n * 1000));
+                    } else {
+                        d = new Date(s);
+                    }
+                    if (isNaN(d.getTime())) return s;
+
+                    const dd = String(d.getUTCDate()).padStart(2, '0');
+                    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const yy = String(d.getUTCFullYear()).slice(2);
+                    return `${dd}/${mm}/${yy}`;
+                } catch (e) {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    return v;
+                }
+            }
+            """
+        )
+
         asset_renderer_sweeps = JsCode(
             """
             class AssetRenderer {
@@ -15709,7 +16036,15 @@ def main() -> None:
         if "name" in df_sweeps_display.columns:
             gb_s.configure_column("name", headerName="Name", width=220, filter=True, hide=("name" not in visible_cols_sweeps))
         if "status" in df_sweeps_display.columns:
-            gb_s.configure_column("status", headerName="Status", width=120, filter=True, hide=("status" not in visible_cols_sweeps))
+            gb_s.configure_column(
+                "status",
+                headerName="Status",
+                width=130,
+                filter=True,
+                cellStyle=aggrid_pill_style("status"),
+                cellClass="ag-center-aligned-cell",
+                hide=("status" not in visible_cols_sweeps),
+            )
         if "symbol" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "symbol",
@@ -15764,6 +16099,79 @@ def main() -> None:
                 hide=("run_count" not in visible_cols_sweeps),
             )
 
+        if "jobs_progress_pct" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "jobs_progress_pct",
+                headerName="Jobs %",
+                width=140,
+                filter=False,
+                type=["numericColumn"],
+                cellRenderer=jobs_progress_renderer_sweeps,
+                cellClass="ag-center-aligned-cell",
+                hide=("jobs_progress_pct" not in visible_cols_sweeps),
+            )
+        if "jobs_total" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "jobs_total",
+                headerName="Jobs",
+                width=90,
+                filter=False,
+                type=["numericColumn"],
+                cellClass="ag-center-aligned-cell",
+                hide=("jobs_total" not in visible_cols_sweeps),
+            )
+        if "jobs_done" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "jobs_done",
+                headerName="Done",
+                width=90,
+                filter=False,
+                type=["numericColumn"],
+                cellClass="ag-center-aligned-cell",
+                hide=("jobs_done" not in visible_cols_sweeps),
+            )
+        if "jobs_failed" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "jobs_failed",
+                headerName="Failed",
+                width=95,
+                filter=False,
+                type=["numericColumn"],
+                cellClass="ag-center-aligned-cell",
+                hide=("jobs_failed" not in visible_cols_sweeps),
+            )
+
+        if "created_at" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "created_at",
+                headerName="Run Date",
+                width=160,
+                filter=True,
+                hide=("created_at" not in visible_cols_sweeps),
+            )
+
+        if "start_date" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "start_date",
+                headerName="Start",
+                width=110,
+                filter=True,
+                valueFormatter=ddmm_yy_formatter,
+                cellClass="ag-center-aligned-cell",
+                hide=("start_date" not in visible_cols_sweeps),
+            )
+
+        if "end_date" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "end_date",
+                headerName="End",
+                width=110,
+                filter=True,
+                valueFormatter=ddmm_yy_formatter,
+                cellClass="ag-center-aligned-cell",
+                hide=("end_date" not in visible_cols_sweeps),
+            )
+
         if "best_net_return_pct" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "best_net_return_pct",
@@ -15808,25 +16216,6 @@ def main() -> None:
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
                 hide=("best_cpc_index" not in visible_cols_sweeps),
-            )
-
-        if "start_date" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "start_date",
-                headerName="Start",
-                valueFormatter=date_formatter,
-                width=110,
-                cellClass="ag-center-aligned-cell",
-                hide=("start_date" not in visible_cols_sweeps),
-            )
-        if "end_date" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "end_date",
-                headerName="End",
-                valueFormatter=date_formatter,
-                width=110,
-                cellClass="ag-center-aligned-cell",
-                hide=("end_date" not in visible_cols_sweeps),
             )
         if "duration" in df_sweeps_display.columns:
             gb_s.configure_column(
@@ -16006,6 +16395,102 @@ def main() -> None:
         if sweep_row is not None:
             st.markdown("---")
             st.markdown(f"### Selected sweep: {sweep_row.get('name')} (#{selected_sweep_id})")
+
+            # --- Sweep control plane (pause/resume/cancel) ----------------
+            try:
+                with open_db_connection() as _ctrl_conn:
+                    parent_info = get_sweep_parent_jobs_by_sweep(_ctrl_conn, sweep_ids=[str(selected_sweep_id)])
+                p = (parent_info or {}).get(str(selected_sweep_id)) if isinstance(parent_info, dict) else None
+            except Exception:
+                p = None
+
+            if not isinstance(p, dict) or p.get("parent_job_id") is None:
+                st.warning("This sweep has no parent planner job yet (sweep_parent).")
+            else:
+                parent_job_id = int(p.get("parent_job_id"))
+                pause_req = int(p.get("pause_requested") or 0)
+                cancel_req = int(p.get("cancel_requested") or 0)
+                parent_status = str(p.get("status") or "")
+
+                state_label = "Running"
+                if cancel_req:
+                    # Prefer showing Cancelled when the sweep's children are all terminal (and at least one was cancelled)
+                    # or when the parent job is already cancelled.
+                    counts_row: Optional[dict] = None
+                    try:
+                        if "jobs_total" in df_sweeps.columns and "id" in df_sweeps.columns:
+                            m = df_sweeps[df_sweeps["id"].astype(str) == str(selected_sweep_id)]
+                            if not m.empty:
+                                counts_row = dict(m.iloc[0].to_dict())
+                    except Exception:
+                        counts_row = None
+
+                    try:
+                        jobs_total = int((counts_row or sweep_row).get("jobs_total") or 0)
+                    except Exception:
+                        jobs_total = 0
+                    try:
+                        jobs_done = int((counts_row or sweep_row).get("jobs_done") or 0)
+                    except Exception:
+                        jobs_done = 0
+                    try:
+                        jobs_failed = int((counts_row or sweep_row).get("jobs_failed") or 0)
+                    except Exception:
+                        jobs_failed = 0
+                    try:
+                        jobs_cancelled = int((counts_row or sweep_row).get("jobs_cancelled") or 0)
+                    except Exception:
+                        jobs_cancelled = 0
+                    terminal_children = jobs_done + jobs_failed + jobs_cancelled
+
+                    if parent_status in {"cancelled", "canceled"}:
+                        state_label = "Cancelled"
+                    elif jobs_total > 0 and terminal_children >= jobs_total and jobs_cancelled > 0:
+                        state_label = "Cancelled"
+                    elif parent_status in {"done", "failed", "error"} and jobs_cancelled > 0:
+                        state_label = "Cancelled"
+                    else:
+                        state_label = "Cancelling"
+                elif pause_req:
+                    state_label = "Paused"
+                elif parent_status in {"done"}:
+                    state_label = "Planned"
+                elif parent_status in {"failed", "error"}:
+                    state_label = "Error"
+
+                st.caption(f"Sweep control: state={state_label} (parent_job_id={parent_job_id}, status={parent_status})")
+
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 3], gap="small")
+                with c1:
+                    pause_btn = st.button("Pause", key=f"sweep_pause_{selected_sweep_id}", disabled=bool(cancel_req) or bool(pause_req))
+                with c2:
+                    resume_btn = st.button("Resume", key=f"sweep_resume_{selected_sweep_id}", disabled=bool(cancel_req) or (not bool(pause_req)))
+                with c3:
+                    cancel_btn = st.button(
+                        "Cancel",
+                        key=f"sweep_cancel_{selected_sweep_id}",
+                        disabled=bool(cancel_req),
+                        help="Stops new child job claims; running children may finish (v1).",
+                    )
+
+                if pause_btn:
+                    with open_db_connection() as _ctrl_conn:
+                        set_job_pause_requested(_ctrl_conn, parent_job_id, True)
+                    st.success("Pause requested.")
+                    st.rerun()
+
+                if resume_btn:
+                    with open_db_connection() as _ctrl_conn:
+                        set_job_pause_requested(_ctrl_conn, parent_job_id, False)
+                    st.success("Resumed.")
+                    st.rerun()
+
+                if cancel_btn:
+                    with open_db_connection() as _ctrl_conn:
+                        set_job_cancel_requested(_ctrl_conn, parent_job_id, True)
+                    st.success("Cancel requested.")
+                    st.rerun()
+
             try:
                 definition = json.loads(sweep_row.get("sweep_definition_json", "{}"))
             except (TypeError, json.JSONDecodeError):
@@ -16015,6 +16500,7 @@ def main() -> None:
                     st.json(definition)
                 else:
                     st.info("Unable to parse sweep definition.")
+
 
         # --- Runs grid (bottom, Results-style) ---------------------------
         st.markdown("---")
@@ -16183,6 +16669,13 @@ def main() -> None:
                 continue
             ordered_cols.append(c)
         df = df[ordered_cols]
+
+        # Default ordering: CPC Index desc (before computing pre-selected row indices).
+        try:
+            if "cpc_index" in df.columns:
+                df = df.sort_values(by="cpc_index", ascending=False, na_position="last")
+        except Exception:
+            pass
 
         # Ensure positional indices for preselection.
         df = df.reset_index(drop=True)
@@ -16578,6 +17071,18 @@ def main() -> None:
             """
         )
 
+        # Presentation-only: convert date columns to local strings before AGGrid.
+        # For the Sweeps > Runs grid, show Run Date as DD/MM hh:mm AM/PM.
+        try:
+            tz = _ui_display_tz()
+            if "created_at" in df.columns:
+                df["created_at"] = [_ui_local_dt_ampm(v, tz) for v in df["created_at"].tolist()]
+            for _c in ("start_date", "end_date"):
+                if _c in df.columns:
+                    df[_c] = [_ui_local_date_iso(v, tz) for v in df[_c].tolist()]
+        except Exception:
+            pass
+
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_default_column(filter=True, sortable=True, resizable=True)
         # IMPORTANT: `use_checkbox=True` creates a separate selection column.
@@ -16588,6 +17093,17 @@ def main() -> None:
         # Prefer set filters when enterprise modules are enabled
         sym_filter = "agSetColumnFilter" if use_enterprise else True
 
+        # Show Run Date first (requested), then Asset.
+        if "created_at" in df.columns:
+            gb.configure_column(
+                "created_at",
+                headerName=header_map.get("created_at", "Run Date"),
+                width=160,
+                pinned="left",
+                hide=("created_at" not in visible_cols),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+            )
         gb.configure_column(
             "symbol",
             headerName=header_map.get("symbol", "Asset"),
@@ -16601,16 +17117,6 @@ def main() -> None:
             checkboxSelection=True,
             headerCheckboxSelection=False,
         )
-        if "created_at" in df.columns:
-            gb.configure_column(
-                "created_at",
-                headerName=header_map.get("created_at", "Run Date"),
-                valueFormatter=date_formatter,
-                width=120,
-                hide=("created_at" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
         if "start_date" in df.columns:
             gb.configure_column(
                 "start_date",
@@ -17095,6 +17601,61 @@ def main() -> None:
                 _update_query_params(page="Run", run_id=new_active)
                 st.rerun()
 
+        # --- Sweep actions (bottom of page) ------------------------------
+        st.markdown("---")
+        with st.container(border=True):
+            st.markdown("#### Sweep actions")
+
+            a = st.columns([1, 1, 3])
+
+            # Re-run / edit sweep: open Backtest page prefilled from this sweep definition.
+            if a[0].button("Re-run sweep", key=f"rerun_sweep_btn_{selected_sweep_id}"):
+                try:
+                    _apply_sweep_definition_to_backtest_ui(sweep_row or {}, settings=settings)
+                    st.session_state["current_page"] = "Backtest"
+                    st.session_state["deep_link_sweep_id"] = str(selected_sweep_id)
+                    _update_query_params(page="Backtest", sweep_id=str(selected_sweep_id), run_id=None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to open Backtest from sweep: {exc}")
+
+            # Delete sweep (and all runs) with checkbox confirmation.
+            confirm_delete = st.checkbox(
+                "I understand this will delete the sweep and all its runs",
+                value=False,
+                key=f"confirm_delete_sweep_{selected_sweep_id}",
+            )
+            if a[1].button(
+                "Delete sweep + runs",
+                key=f"delete_sweep_btn_{selected_sweep_id}",
+                type="primary",
+                disabled=not bool(confirm_delete),
+            ):
+                try:
+                    from project_dragon.storage import delete_sweep_and_runs  # local import
+
+                    res = delete_sweep_and_runs(user_id=user_id, sweep_id=str(selected_sweep_id))
+                    st.success(
+                        f"Deleted sweep. runs={int(res.get('runs_deleted') or 0)}, details={int(res.get('details_deleted') or 0)}"
+                    )
+                except Exception as exc:
+                    st.error(f"Delete failed: {exc}")
+                    return
+
+                # Clear selection + deep links so the page doesn't try to render deleted content.
+                for k in (
+                    "deep_link_sweep_id",
+                    "sweeps_selected_sweep_id",
+                    "sweeps_list_selected_ids",
+                    "sweeps_active_run_id",
+                    "deep_link_run_id",
+                ):
+                    st.session_state.pop(k, None)
+                _update_query_params(page="Sweeps", sweep_id=None, run_id=None)
+                st.rerun()
+
+            a[2].caption("Re-run opens Backtest prefilled; delete is irreversible.")
+
         # (Removed) Selected run section: selection already navigates to Run detail.
 
     if current_page == "Run":
@@ -17124,6 +17685,7 @@ def main() -> None:
 
     if current_page == "Candle Cache":
         st.subheader("Candle cache")
+        tz = _ui_display_tz()
         exchange_options = ["woo", "binance", "bybit", "okx", "kraken", "Custom…"]
         exchange_choice = st.selectbox("Exchange", exchange_options, index=0, key="cache_exchange_choice")
         if exchange_choice == "Custom…":
@@ -17213,9 +17775,7 @@ def main() -> None:
             if min_ts is None or max_ts is None:
                 st.info("No cache coverage for this selection yet.")
             else:
-                start_iso = datetime.utcfromtimestamp(min_ts / 1000.0).isoformat()
-                end_iso = datetime.utcfromtimestamp(max_ts / 1000.0).isoformat()
-                st.success(f"Coverage: {start_iso} → {end_iso}")
+                st.success(f"Coverage: {fmt_dt(min_ts, tz)} → {fmt_dt(max_ts, tz)}")
 
         if cols_cache[1].button("Purge old data"):
             with open_db_connection() as conn:
@@ -17228,7 +17788,7 @@ def main() -> None:
             for row in cache_rows:
                 for key in ("min_ts", "max_ts"):
                     if row.get(key) is not None:
-                        row[key] = datetime.utcfromtimestamp(row[key] / 1000.0).isoformat()
+                        row[key] = fmt_dt(row[key], tz)
             st.dataframe(pd.DataFrame(cache_rows), hide_index=True, width="stretch")
         else:
             st.info("No cached candles yet.")
@@ -17237,20 +17797,7 @@ def main() -> None:
         st.subheader("Jobs")
         auto = st.toggle("Auto refresh", value=True)
 
-        top_controls = st.columns([1, 3])
-        if top_controls[0].button(
-            "Resume orphaned jobs now",
-            help="Re-queues stranded backtest/sweep jobs after a Streamlit restart and submits any queued work.",
-            key="jobs_resume_orphans_now",
-        ):
-            counts = _job_scheduler_tick(force=True)
-            st.success(
-                f"Job recovery: requeued={int(counts.get('requeued') or 0)}, "
-                f"cancelled={int(counts.get('cancelled') or 0)}, "
-                f"submitted={int(counts.get('submitted') or 0)}"
-            )
-            st.rerun()
-        top_controls[1].caption("Backup control for restart-recovery of in-process jobs.")
+        st.caption("Backtest jobs run in `project_dragon.backtest_worker`; live bots run in `project_dragon.live_worker`.")
 
         def _render_job_row(job: dict, sweeps: dict, allow_cancel: bool = True) -> None:
             job_id = job.get("id")
@@ -17347,31 +17894,91 @@ def main() -> None:
 
         def _render_jobs_once() -> None:
             with _job_conn() as conn:
-                jobs = list_jobs(conn)
+                # NOTE: `list_jobs()` is limited; for correctness (and to avoid showing
+                # 0 active when active jobs exist beyond the limit), query active + history separately.
+                try:
+                    total_jobs = int(conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()[0])
+                except Exception:
+                    total_jobs = 0
+
+                def _rows_to_jobs(rows: list[Any]) -> list[dict[str, Any]]:
+                    out: list[dict[str, Any]] = []
+                    for r in rows or []:
+                        try:
+                            d = dict(r)
+                        except Exception:
+                            continue
+                        if d.get("run_id") is not None:
+                            d["run_id"] = str(d["run_id"])
+                        out.append(d)
+                    return out
+
+                if conn.row_factory is None:
+                    conn.row_factory = sqlite3.Row
+
+                active_statuses = ("queued", "running", "cancel_requested")
+                active_rows = conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    WHERE status IN ('queued','running','cancel_requested')
+                    ORDER BY COALESCE(updated_at, created_at) DESC
+                    """
+                ).fetchall()
+                history_rows = conn.execute(
+                    """
+                    SELECT * FROM jobs
+                    WHERE status NOT IN ('queued','running','cancel_requested')
+                    ORDER BY COALESCE(created_at, started_at, finished_at, id) DESC
+                    LIMIT 20
+                    """
+                ).fetchall()
+
+                jobs_running = _rows_to_jobs(active_rows)
+                jobs_history = _rows_to_jobs(history_rows)
                 sweeps = {str(row.get("id")): row for row in list_sweeps()} if "list_sweeps" in globals() else {}
 
-            running_statuses = {"queued", "running"}
-            jobs_running = [j for j in jobs if j.get("status") in running_statuses]
-            jobs_history = [j for j in jobs if j.get("status") not in running_statuses]
-            jobs_history = sorted(
-                jobs_history,
-                key=lambda j: j.get("created_at") or j.get("started_at") or j.get("finished_at") or j.get("id"),
-                reverse=True,
-            )
+            st.caption(f"Total jobs in DB: {total_jobs}")
 
-            st.markdown("### Active jobs")
-            if not jobs_running:
-                st.info("No running jobs. Queue a backtest or sweep to see jobs here.")
-            for job in jobs_running:
-                _render_job_row(job, sweeps, allow_cancel=True)
+            backtest_types = {"backtest_run", "sweep_parent"}
+            bot_types = {"live_bot"}
+            active_backtests = [j for j in jobs_running if str(j.get("job_type") or "") in backtest_types]
+            active_bots = [j for j in jobs_running if str(j.get("job_type") or "") in bot_types]
+            active_other = [
+                j
+                for j in jobs_running
+                if j not in active_backtests and j not in active_bots
+            ]
+
+            st.markdown(f"### Active backtests ({len(active_backtests)})")
+            if not active_backtests:
+                st.info("No active backtests.")
+            else:
+                limit_active_backtests = 20
+                if len(active_backtests) > limit_active_backtests:
+                    st.caption(f"Showing {limit_active_backtests} of {len(active_backtests)} active backtests")
+                for job in active_backtests[:limit_active_backtests]:
+                    _render_job_row(job, sweeps, allow_cancel=True)
+
+            st.divider()
+            st.markdown(f"### Active bots ({len(active_bots)})")
+            if not active_bots:
+                st.info("No active bots.")
+            else:
+                for job in active_bots:
+                    _render_job_row(job, sweeps, allow_cancel=True)
+
+            if active_other:
+                st.divider()
+                st.markdown(f"### Active other ({len(active_other)})")
+                for job in active_other:
+                    _render_job_row(job, sweeps, allow_cancel=True)
 
             st.divider()
             st.markdown("### Recent jobs (history)")
             if not jobs_history:
                 st.info("No past jobs yet.")
             else:
-                history_limit = 50
-                for job in jobs_history[:history_limit]:
+                for job in jobs_history:
                     _render_job_row(job, sweeps, allow_cancel=False)
 
         def jobs_panel() -> None:
@@ -17404,6 +18011,8 @@ def main() -> None:
             bbo_level_val = int(current_settings.get("bbo_queue_level", 1))
             live_kill_val = bool(current_settings.get("live_kill_switch_enabled", False))
             live_trading_enabled_val = bool(current_settings.get("live_trading_enabled", False))
+
+            display_tz_name_val = get_user_setting(conn, user_id, "display_timezone", default=DEFAULT_DISPLAY_TZ_NAME)
 
             left_col, right_col = st.columns(2)
 
@@ -17448,6 +18057,33 @@ def main() -> None:
                         step=100,
                         help="Max rows loaded for the Results page and Sweeps → Runs table. Higher values can slow down rendering.",
                         key="settings_results_grid_limit",
+                    )
+
+                    tz_common = [
+                        "Australia/Brisbane",
+                        "UTC",
+                        "Australia/Sydney",
+                        "Australia/Melbourne",
+                        "Asia/Singapore",
+                        "Asia/Hong_Kong",
+                        "Asia/Tokyo",
+                        "Europe/London",
+                        "Europe/Berlin",
+                        "America/New_York",
+                        "America/Chicago",
+                        "America/Los_Angeles",
+                    ]
+                    tz_current = str(display_tz_name_val or "").strip() or DEFAULT_DISPLAY_TZ_NAME
+                    if tz_current not in tz_common:
+                        tz_options = [tz_current] + tz_common
+                    else:
+                        tz_options = tz_common
+                    display_tz_input = st.selectbox(
+                        "Display timezone",
+                        options=tz_options,
+                        index=max(0, tz_options.index(tz_current)) if tz_current in tz_options else 0,
+                        help="Applies to all timestamps in the UI. Stored per user. DB remains UTC.",
+                        key="settings_display_timezone",
                     )
 
             with right_col:
@@ -17555,6 +18191,8 @@ def main() -> None:
                 set_setting(conn, "jobs_refresh_seconds", float(jobs_refresh_input))
                 set_setting(conn, "prefer_bbo_maker", bool(prefer_bbo_input))
                 set_setting(conn, "bbo_queue_level", int(bbo_level_input))
+                set_user_setting(conn, user_id, "display_timezone", str(display_tz_input))
+                st.session_state["display_timezone_name"] = str(display_tz_input)
                 st.session_state["jobs_refresh_seconds"] = float(jobs_refresh_input)
                 st.success("Settings saved.")
                 st.rerun()
@@ -17651,6 +18289,12 @@ def main() -> None:
                     st.markdown("### Categories")
                     if cats:
                         df_c = pd.DataFrame(cats)
+                        if "updated_at" in df_c.columns:
+                            try:
+                                _tz = _ui_display_tz()
+                                df_c["updated_at"] = df_c["updated_at"].apply(lambda v: fmt_dt_short(v, _tz))
+                            except Exception:
+                                pass
                         show_cols = [c for c in ["name", "source", "member_count", "updated_at"] if c in df_c.columns]
                         st.dataframe(df_c[show_cols], hide_index=True, width="stretch")
                     else:

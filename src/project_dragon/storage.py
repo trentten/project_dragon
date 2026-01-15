@@ -14,6 +14,7 @@ import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Tuple
 from uuid import uuid4
@@ -100,6 +101,7 @@ def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_type TEXT NOT NULL,
+            job_key TEXT,
             status TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             sweep_id INTEGER,
@@ -1186,6 +1188,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_net_return_pct ON backtest_runs(net_return_pct)")
 
+    # Deterministic backtest run idempotency key. Requires SQLite JSON1.
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_key ON backtest_runs(json_extract(metadata_json,'$.run_key'))"
+        )
+    except sqlite3.OperationalError:
+        # Older/stripped SQLite builds may not support JSON1.
+        pass
+
     # Symbols metadata + cached icons (local icon pack, stored as data URIs)
     conn.execute(
         """
@@ -1479,6 +1490,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         pass
     job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "job_key" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN job_key TEXT")
+        except sqlite3.OperationalError:
+            pass
     if "sweep_id" not in job_columns:
         try:
             conn.execute("ALTER TABLE jobs ADD COLUMN sweep_id INTEGER")
@@ -1497,6 +1513,40 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if "worker_id" not in job_columns:
         try:
             conn.execute("ALTER TABLE jobs ADD COLUMN worker_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+    # Parent/group linkage for sweep planning (additive / ALTER-only).
+    if "parent_job_id" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN parent_job_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+    if "group_key" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN group_key TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+    # Sweep/job control plane (pause/cancel) (additive / ALTER-only).
+    if "pause_requested" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    if "cancel_requested" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    if "paused_at" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+    if "cancelled_at" not in job_columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cancelled_at TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -1557,7 +1607,52 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
 
+    # Backfill pause/cancel flags NULLs for legacy rows.
+    try:
+        conn.execute(
+            "UPDATE jobs SET pause_requested = COALESCE(pause_requested, 0) WHERE pause_requested IS NULL"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "UPDATE jobs SET cancel_requested = COALESCE(cancel_requested, 0) WHERE cancel_requested IS NULL"
+        )
+    except sqlite3.OperationalError:
+        pass
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_worker_id ON jobs(worker_id)")
+
+    # Idempotent enqueue for planner/UIs (NULLs are allowed; duplicates are prevented when job_key is set).
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_job_key_unique ON jobs(job_key)")
+    except sqlite3.OperationalError:
+        pass
+
+    # Fast sweep progress / dashboards.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_sweep_type_status ON jobs(sweep_id, job_type, status)")
+
+    # Fast parent/group progress aggregation.
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_parent_type_status ON jobs(parent_job_id, job_type, status)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_group_type_status ON jobs(group_key, job_type, status)")
+    except sqlite3.OperationalError:
+        pass
+
+    # Control plane + dashboards.
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_type_status_group ON jobs(job_type, status, group_key)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_group_pause_cancel_status ON jobs(group_key, pause_requested, cancel_requested, status)"
+        )
+    except sqlite3.OperationalError:
+        pass
 
     # Lease lookup / stale reclaim helpers.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_expires ON jobs(status, lease_expires_at)")
@@ -2539,6 +2634,124 @@ def update_sweep_status(sweep_id: str, status: str, error_message: Optional[str]
             )
 
 
+def delete_sweep_and_runs(*, user_id: str, sweep_id: str) -> Dict[str, int]:
+    """Delete a sweep and all runs inside it.
+
+    Best-effort cleanup:
+    - `backtest_run_details` for those runs
+    - `run_shortlists` rows for those runs (scoped to the requesting user)
+    - `bot_run_map` rows for those runs (if present)
+    - `jobs` rows referencing sweep/run ids when possible
+    """
+
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    sid = str(sweep_id or "").strip()
+    if not sid:
+        raise ValueError("sweep_id is required")
+
+    with _get_conn() as conn:
+        _ensure_schema(conn)
+        if conn.row_factory is None:
+            conn.row_factory = sqlite3.Row
+
+        # Ensure the sweep exists and is in-scope for this user (legacy DBs may have NULL/empty user_id).
+        try:
+            sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
+        except Exception:
+            sweep_cols = set()
+        if "user_id" in sweep_cols:
+            row = conn.execute(
+                "SELECT id FROM sweeps WHERE id = ? AND (user_id = ? OR user_id IS NULL OR TRIM(user_id) = '')",
+                (sid, uid),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT id FROM sweeps WHERE id = ?", (sid,)).fetchone()
+        if row is None:
+            raise ValueError(f"Sweep not found (or not accessible): {sid}")
+
+        run_rows = conn.execute("SELECT id FROM backtest_runs WHERE sweep_id = ?", (sid,)).fetchall()
+        run_ids: list[str] = []
+        for r in run_rows or []:
+            try:
+                rid = str((r[0] if not isinstance(r, sqlite3.Row) else r["id"]) or "").strip()
+            except Exception:
+                rid = ""
+            if rid:
+                run_ids.append(rid)
+
+        details_deleted = 0
+        shortlist_deleted = 0
+        bot_run_map_deleted = 0
+        jobs_deleted = 0
+        runs_deleted = 0
+        sweeps_deleted = 0
+
+        with conn:
+            if run_ids:
+                placeholders = ",".join(["?"] * len(run_ids))
+
+                # backtest_run_details
+                try:
+                    cur = conn.execute(f"DELETE FROM backtest_run_details WHERE run_id IN ({placeholders})", tuple(run_ids))
+                    details_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except sqlite3.OperationalError:
+                    details_deleted = 0
+
+                # per-user run shortlist cleanup
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM run_shortlists WHERE user_id = ? AND run_id IN ({placeholders})",
+                        tuple([uid] + run_ids),
+                    )
+                    shortlist_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except sqlite3.OperationalError:
+                    shortlist_deleted = 0
+
+                # bot_run_map cleanup (best-effort)
+                try:
+                    cur = conn.execute(f"DELETE FROM bot_run_map WHERE run_id IN ({placeholders})", tuple(run_ids))
+                    bot_run_map_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except sqlite3.OperationalError:
+                    bot_run_map_deleted = 0
+
+                # jobs cleanup (best-effort)
+                try:
+                    # sweep-level jobs
+                    cur = conn.execute(
+                        "DELETE FROM jobs WHERE sweep_id = ? OR payload_json LIKE ?",
+                        (sid, f'%"sweep_id": "{sid}"%'),
+                    )
+                    jobs_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    # run-level jobs: payload_json is more reliable than the (legacy) integer run_id column.
+                    for rid in run_ids:
+                        cur = conn.execute(
+                            "DELETE FROM jobs WHERE payload_json LIKE ?",
+                            (f'%"run_id": "{rid}"%',),
+                        )
+                        jobs_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except sqlite3.OperationalError:
+                    pass
+
+            # Delete runs, then sweep.
+            cur = conn.execute("DELETE FROM backtest_runs WHERE sweep_id = ?", (sid,))
+            runs_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+
+            cur = conn.execute("DELETE FROM sweeps WHERE id = ?", (sid,))
+            sweeps_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+
+        return {
+            "sweeps_deleted": sweeps_deleted,
+            "runs_deleted": runs_deleted,
+            "details_deleted": details_deleted,
+            "shortlist_deleted": shortlist_deleted,
+            "bot_run_map_deleted": bot_run_map_deleted,
+            "jobs_deleted": jobs_deleted,
+        }
+
+
 def list_sweeps(limit: int = 100, offset: int = 0) -> List[Dict]:
     with _get_conn() as conn:
         _ensure_schema(conn)
@@ -3149,17 +3362,77 @@ def set_setting_bool(conn: sqlite3.Connection, key: str, value: bool) -> None:
     set_setting(conn, key, bool(value))
 
 
-def create_job(conn: sqlite3.Connection, job_type: str, payload: Dict[str, Any], bot_id: Optional[int] = None) -> int:
+def create_job(
+    conn: sqlite3.Connection,
+    job_type: str,
+    payload: Dict[str, Any],
+    bot_id: Optional[int] = None,
+    *,
+    sweep_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    job_key: Optional[str] = None,
+    parent_job_id: Optional[int] = None,
+    group_key: Optional[str] = None,
+) -> int:
     now = datetime.now(timezone.utc).isoformat()
     payload_json = json.dumps(payload)
+
+    # Backwards compatible: older DBs may not have newer columns.
+    try:
+        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    except Exception:
+        job_cols = set()
+
+    cols = ["job_type", "status", "payload_json", "progress", "message", "created_at", "updated_at"]
+    vals: list[Any] = [str(job_type), "queued", payload_json, 0.0, "", now, now]
+
+    if "job_key" in job_cols:
+        cols.insert(1, "job_key")
+        vals.insert(1, (str(job_key).strip() if job_key is not None else None))
+
+    if "sweep_id" in job_cols:
+        cols.insert(4 if "job_key" in job_cols else 3, "sweep_id")
+        vals.insert(4 if "job_key" in job_cols else 3, (str(sweep_id) if sweep_id is not None else None))
+    if "run_id" in job_cols:
+        cols.insert(5 if "job_key" in job_cols else 4, "run_id")
+        vals.insert(5 if "job_key" in job_cols else 4, (str(run_id) if run_id is not None else None))
+    if "bot_id" in job_cols:
+        cols.insert(6 if "job_key" in job_cols else 5, "bot_id")
+        vals.insert(6 if "job_key" in job_cols else 5, bot_id)
+
+    # Optional planner/group linkage (older DBs may not have these columns).
+    if "parent_job_id" in job_cols:
+        cols.append("parent_job_id")
+        vals.append(int(parent_job_id) if parent_job_id is not None else None)
+    if "group_key" in job_cols:
+        cols.append("group_key")
+        vals.append(str(group_key).strip() if group_key is not None else None)
+
+    cols_sql = ", ".join(cols)
+    placeholders = ", ".join(["?"] * len(cols))
+
+    insert_prefix = "INSERT"
+    # Idempotent when job_key is set and supported.
+    if job_key is not None and "job_key" in job_cols:
+        insert_prefix = "INSERT OR IGNORE"
+
     cur = conn.execute(
-        """
-        INSERT INTO jobs (job_type, status, payload_json, sweep_id, run_id, bot_id, progress, message, created_at, updated_at)
-        VALUES (?, 'queued', ?, NULL, NULL, ?, 0.0, '', ?, ?)
+        f"""
+        {insert_prefix} INTO jobs ({cols_sql})
+        VALUES ({placeholders})
         """,
-        (job_type, payload_json, bot_id, now, now),
+        tuple(vals),
     )
     conn.commit()
+
+    # If ignored due to UNIQUE(job_key), return existing id.
+    if cur.rowcount == 0 and job_key is not None and "job_key" in job_cols:
+        row = conn.execute("SELECT id FROM jobs WHERE job_key = ? LIMIT 1", (str(job_key).strip(),)).fetchone()
+        if row is not None:
+            try:
+                return int(row[0])
+            except Exception:
+                pass
     return int(cur.lastrowid)
 
 
@@ -3679,11 +3952,17 @@ def claim_job(conn: sqlite3.Connection, job_id: int, worker_id: str) -> bool:
     return cur.rowcount > 0
 
 
-def claim_job_with_lease(conn: sqlite3.Connection, *, worker_id: str, lease_s: float) -> Optional[Dict[str, Any]]:
-    """Claim the next queued live_bot job using a time-based lease.
+def claim_job_with_lease(
+    conn: sqlite3.Connection,
+    *,
+    worker_id: str,
+    lease_s: float,
+    job_types: Sequence[str] = ("live_bot",),
+) -> Optional[Dict[str, Any]]:
+    """Claim the next queued job using a time-based lease.
 
-    This is intentionally conservative and minimal:
-    - Only claims `job_type='live_bot'`
+    Conservative and minimal:
+    - Claims one job of the allowed `job_types`
     - Transitions `queued` -> `running`
     - Sets both legacy `worker_id` and lease fields (`claimed_by`, `lease_expires_at`, ...)
     """
@@ -3695,18 +3974,61 @@ def claim_job_with_lease(conn: sqlite3.Connection, *, worker_id: str, lease_s: f
     if lease_seconds <= 0:
         lease_seconds = 30.0
 
+    types = [str(t).strip() for t in (job_types or []) if str(t).strip()]
+    if not types:
+        types = ["live_bot"]
+
+    placeholders = ",".join(["?"] * len(types))
+
+    # Best-effort: if pause/cancel columns exist, avoid claiming backtest_run jobs
+    # whose parent sweep job has pause/cancel requested.
+    try:
+        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    except Exception:
+        job_cols = set()
+    has_control_plane = {"pause_requested", "cancel_requested", "parent_job_id"}.issubset(job_cols)
+
     # Best-effort retry loop to handle races between multiple workers.
     for _ in range(3):
-        row = conn.execute(
-            """
-            SELECT id
-            FROM jobs
-            WHERE job_type = 'live_bot'
-              AND status = 'queued'
-            ORDER BY COALESCE(created_at, updated_at) ASC
-            LIMIT 1
-            """,
-        ).fetchone()
+
+        if has_control_plane and "backtest_run" in set(types):
+            row = conn.execute(
+                """
+                SELECT j.id
+                FROM jobs j
+                WHERE j.job_type IN ("""
+                + placeholders
+                + """ )
+                    AND j.status = 'queued'
+                    AND (
+                        j.job_type != 'backtest_run'
+                        OR j.parent_job_id IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM jobs p
+                            WHERE p.id = j.parent_job_id
+                                AND (COALESCE(p.pause_requested, 0) = 1 OR COALESCE(p.cancel_requested, 0) = 1)
+                        )
+                    )
+                ORDER BY COALESCE(j.created_at, j.updated_at) ASC
+                LIMIT 1
+                """,
+                tuple(types),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM jobs
+                WHERE job_type IN ("""
+                + placeholders
+                + """ )
+                    AND status = 'queued'
+                ORDER BY COALESCE(created_at, updated_at) ASC
+                LIMIT 1
+                """,
+                tuple(types),
+            ).fetchone()
         if not row:
             return None
 
@@ -3747,6 +4069,977 @@ def claim_job_with_lease(conn: sqlite3.Connection, *, worker_id: str, lease_s: f
             return get_job(conn, job_id)
 
     return None
+
+
+def bulk_enqueue_backtest_run_jobs(
+    conn: sqlite3.Connection,
+    *,
+    jobs: Sequence[Tuple[str, Dict[str, Any], Optional[str]]],
+    parent_job_id: Optional[int] = None,
+    group_key: Optional[str] = None,
+) -> Dict[str, int]:
+    """Bulk enqueue `backtest_run` jobs idempotently.
+
+    Args:
+      jobs: sequence of (job_key, payload_dict, sweep_id)
+
+    Returns: {"created": int, "existing": int}
+
+    Notes:
+    - Uses a single SELECT to discover existing keys, then one executemany INSERT.
+    - Requires `jobs.job_key` (added via schema migration). If missing, falls back
+      to non-idempotent inserts.
+    """
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    try:
+        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    except Exception:
+        job_cols = set()
+
+    created = 0
+    existing = 0
+
+    rows_in = [(str(k).strip(), p, (str(s) if s is not None else None)) for (k, p, s) in (jobs or []) if str(k).strip()]
+    if not rows_in:
+        return {"created": 0, "existing": 0}
+
+    now = now_utc_iso()
+
+    # No job_key support -> non-idempotent (legacy DB); still enqueue.
+    if "job_key" not in job_cols:
+        for k, payload, sid in rows_in:
+            _ = create_job(conn, "backtest_run", payload, sweep_id=sid, job_key=None)
+            created += 1
+        return {"created": int(created), "existing": 0}
+
+    keys = [k for k, _p, _sid in rows_in]
+    existing_keys: set[str] = set()
+    chunk = 500
+    for i in range(0, len(keys), chunk):
+        part = keys[i : i + chunk]
+        placeholders = ",".join(["?"] * len(part))
+        found = conn.execute(
+            f"SELECT job_key FROM jobs WHERE job_key IN ({placeholders})",
+            tuple(part),
+        ).fetchall()
+        for r in found or []:
+            try:
+                existing_keys.add(str(r[0] if not isinstance(r, sqlite3.Row) else r["job_key"]).strip())
+            except Exception:
+                continue
+
+    to_insert = [(k, payload, sid) for (k, payload, sid) in rows_in if k not in existing_keys]
+    existing = len(rows_in) - len(to_insert)
+
+    if not to_insert:
+        return {"created": 0, "existing": int(existing)}
+
+    has_parent = "parent_job_id" in job_cols
+    has_group = "group_key" in job_cols
+
+    payload_rows: list[tuple[Any, ...]] = []
+    for k, payload, sid in to_insert:
+        # Store job_key + deterministic run_key inside the payload for traceability.
+        # (Safe to add; workers treat payload as opaque.)
+        try:
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+        payload = dict(payload)
+        payload.setdefault("job_key", str(k))
+        if sid is not None:
+            payload.setdefault("sweep_id", str(sid))
+        try:
+            payload.setdefault("run_key", compute_run_key(payload))
+        except Exception:
+            # If the payload contains non-serializable values, worker will compute.
+            pass
+        row: list[Any] = [
+            "backtest_run",
+            str(k),
+            "queued",
+            json.dumps(payload),
+            (str(sid) if sid is not None else None),
+            None,
+            None,
+            0.0,
+            "",
+            now,
+            now,
+        ]
+        if has_parent:
+            row.append(int(parent_job_id) if parent_job_id is not None else None)
+        if has_group:
+            row.append(str(group_key).strip() if group_key is not None else None)
+        payload_rows.append(tuple(row))
+
+    # Insert only missing keys.
+    cols_sql = "job_type, job_key, status, payload_json, sweep_id, run_id, bot_id, progress, message, created_at, updated_at"
+    placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+    if has_parent:
+        cols_sql += ", parent_job_id"
+        placeholders += ", ?"
+    if has_group:
+        cols_sql += ", group_key"
+        placeholders += ", ?"
+
+    conn.executemany(
+        f"""
+        INSERT INTO jobs ({cols_sql})
+        VALUES ({placeholders})
+        """,
+        payload_rows,
+    )
+    conn.commit()
+    created = len(to_insert)
+    return {"created": int(created), "existing": int(existing)}
+
+
+def get_sweep_row(conn: sqlite3.Connection, sweep_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a sweep row using an existing connection (worker-safe)."""
+
+    sid = str(sweep_id or "").strip()
+    if not sid:
+        return None
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM sweeps WHERE id = ?", (sid,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_sweep_parent_jobs_by_sweep(
+    conn: sqlite3.Connection,
+    *,
+    sweep_ids: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Return mapping sweep_id -> parent sweep_parent job info.
+
+    One query for all given sweep IDs.
+    """
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    sids = [str(s).strip() for s in (sweep_ids or []) if str(s).strip()]
+    if not sids:
+        return {}
+    placeholders = ",".join(["?"] * len(sids))
+    rows = conn.execute(
+        f"""
+                SELECT sweep_id,
+                             id AS parent_job_id,
+                             status,
+                             COALESCE(pause_requested, 0) AS pause_requested,
+                             COALESCE(cancel_requested, 0) AS cancel_requested,
+                             paused_at,
+                             cancelled_at,
+                             group_key
+        FROM jobs
+        WHERE job_type = 'sweep_parent'
+          AND sweep_id IN ({placeholders})
+        """,
+        tuple(sids),
+    ).fetchall()
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows or []:
+        try:
+            sid = str(r["sweep_id"])
+            out[sid] = {
+                "parent_job_id": int(r["parent_job_id"]),
+                "status": str(r["status"] or ""),
+                "pause_requested": int(r["pause_requested"] or 0),
+                "cancel_requested": int(r["cancel_requested"] or 0),
+                "paused_at": r["paused_at"],
+                "cancelled_at": r["cancelled_at"],
+                "group_key": r["group_key"],
+            }
+        except Exception:
+            continue
+    return out
+
+
+def get_parent_job_flags(conn: sqlite3.Connection, parent_job_id: int) -> Dict[str, Any]:
+    """Return pause/cancel flags + timestamps for a parent job id."""
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    try:
+        pid = int(parent_job_id)
+    except Exception:
+        return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
+    if pid <= 0:
+        return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
+
+    row = conn.execute(
+        """
+        SELECT COALESCE(pause_requested, 0) AS pause_requested,
+               COALESCE(cancel_requested, 0) AS cancel_requested,
+               paused_at,
+               cancelled_at,
+               status,
+               group_key
+        FROM jobs
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (pid,),
+    ).fetchone()
+    if not row:
+        return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
+
+    try:
+        return {
+            "pause_requested": int(row["pause_requested"] or 0),
+            "cancel_requested": int(row["cancel_requested"] or 0),
+            "paused_at": row["paused_at"],
+            "cancelled_at": row["cancelled_at"],
+            "status": str(row["status"] or ""),
+            "group_key": row["group_key"],
+        }
+    except Exception:
+        return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
+
+
+def set_job_pause_requested(conn: sqlite3.Connection, job_id: int, paused: bool) -> None:
+    """Request pause/resume for a job (typically sweep_parent).
+
+    - paused=True: sets pause_requested=1 and stamps paused_at if not set.
+    - paused=False (resume): sets pause_requested=0; if status=='paused' moves back to queued.
+    """
+
+    _ensure_schema(conn)
+    jid = int(job_id)
+    now = now_utc_iso()
+    if paused:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET pause_requested = 1,
+                paused_at = COALESCE(paused_at, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, jid),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET pause_requested = 0,
+                updated_at = ?,
+                status = CASE WHEN status = 'paused' THEN 'queued' ELSE status END
+            WHERE id = ?
+            """,
+            (now, jid),
+        )
+    conn.commit()
+
+
+def bulk_mark_jobs_cancelled(conn: sqlite3.Connection, group_key: str) -> int:
+    """Mark queued jobs in a group as cancelled (best-effort v1)."""
+
+    _ensure_schema(conn)
+    gk = str(group_key or "").strip()
+    if not gk:
+        return 0
+    now = now_utc_iso()
+    cur = conn.execute(
+        """
+        UPDATE jobs
+        SET status = 'cancelled',
+            cancel_requested = COALESCE(cancel_requested, 0),
+            cancelled_at = COALESCE(cancelled_at, ?),
+            updated_at = ?
+        WHERE group_key = ?
+          AND status = 'queued'
+        """,
+        (now, now, gk),
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def set_job_cancel_requested(conn: sqlite3.Connection, job_id: int, cancelled: bool) -> None:
+    """Request cancel for a job (typically sweep_parent).
+
+    cancelled=True: sets cancel_requested=1 and stamps cancelled_at.
+    cancelled=False: clears cancel_requested (not typically used).
+    """
+
+    _ensure_schema(conn)
+    jid = int(job_id)
+    now = now_utc_iso()
+    if cancelled:
+        # Ensure a group_key exists for sweep parents where possible.
+        row = conn.execute("SELECT group_key, sweep_id FROM jobs WHERE id = ?", (jid,)).fetchone()
+        gk = None
+        sid = None
+        if row is not None:
+            try:
+                gk = str(row["group_key"] or "").strip() if isinstance(row, sqlite3.Row) else str(row[0] or "").strip()
+            except Exception:
+                gk = None
+            try:
+                sid = str(row["sweep_id"] or "").strip() if isinstance(row, sqlite3.Row) else str(row[1] or "").strip()
+            except Exception:
+                sid = None
+        if not gk and sid:
+            gk = f"sweep:{sid}"
+            try:
+                conn.execute("UPDATE jobs SET group_key = COALESCE(NULLIF(group_key,''), ?) WHERE id = ?", (gk, jid))
+            except Exception:
+                pass
+
+        conn.execute(
+            """
+            UPDATE jobs
+            SET cancel_requested = 1,
+                cancelled_at = COALESCE(cancelled_at, ?),
+                pause_requested = 0,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, jid),
+        )
+        conn.commit()
+        if gk:
+            _ = bulk_mark_jobs_cancelled(conn, gk)
+    else:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET cancel_requested = 0,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, jid),
+        )
+        conn.commit()
+
+
+def count_jobs_by_status_for_group(conn: sqlite3.Connection, group_key: str) -> Dict[str, int]:
+    """Aggregate job status counts for a group_key (single query)."""
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    gk = str(group_key or "").strip()
+    if not gk:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT status, COUNT(*) AS c
+        FROM jobs
+        WHERE group_key = ?
+        GROUP BY status
+        """,
+        (gk,),
+    ).fetchall()
+    out: Dict[str, int] = {}
+    total = 0
+    for r in rows or []:
+        try:
+            st = str(r["status"])
+            c = int(r["c"])
+        except Exception:
+            continue
+        out[st] = int(c)
+        total += int(c)
+    out["total"] = int(total)
+    return out
+
+
+def get_backtest_run_job_counts_by_parent(
+    conn: sqlite3.Connection,
+    *,
+    parent_job_ids: Sequence[int],
+    job_type: str = "backtest_run",
+) -> Dict[int, Dict[str, int]]:
+    """Return per-parent job status counts.
+
+    One query (grouped by parent_job_id,status).
+    Returns mapping: parent_job_id -> {"total": n, "queued": n, "running": n, "done": n, ...}
+    """
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    pids: list[int] = []
+    for v in (parent_job_ids or []):
+        try:
+            pids.append(int(v))
+        except Exception:
+            continue
+    pids = [p for p in pids if p > 0]
+    if not pids:
+        return {}
+    placeholders = ",".join(["?"] * len(pids))
+    rows = conn.execute(
+        f"""
+        SELECT parent_job_id, status, COUNT(*) AS c
+        FROM jobs
+        WHERE job_type = ?
+          AND parent_job_id IN ({placeholders})
+        GROUP BY parent_job_id, status
+        """,
+        tuple([str(job_type)] + pids),
+    ).fetchall()
+
+    out: Dict[int, Dict[str, int]] = {}
+    for r in rows or []:
+        try:
+            pid = int(r["parent_job_id"])
+            st = str(r["status"])
+            c = int(r["c"])
+        except Exception:
+            continue
+        d = out.setdefault(pid, {})
+        d[st] = int(c)
+
+    for pid in pids:
+        d = out.setdefault(pid, {})
+        total = 0
+        for k, v in d.items():
+            if k == "total":
+                continue
+            try:
+                total += int(v or 0)
+            except Exception:
+                continue
+        d["total"] = int(total)
+    return out
+
+
+def _canonical_json_dumps(obj: Any) -> str:
+    """Canonical JSON for hashing/idempotency.
+
+    - Stable key ordering
+    - Compact separators
+    - Sanitizes dataclasses/enums/other non-JSON types via `_sanitize_for_json`
+    """
+
+    return json.dumps(_sanitize_for_json(obj), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def compute_run_key(payload: Dict[str, Any]) -> str:
+    """Compute deterministic run_key for a backtest_run job payload.
+
+    The output is a SHA256 hex digest of a canonical JSON blob built from stable fields.
+    """
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    data_settings = payload.get("data_settings") if isinstance(payload.get("data_settings"), dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+
+    user_id = payload.get("user_id")
+    if user_id is None:
+        user_id = metadata.get("user_id")
+
+    sweep_id = payload.get("sweep_id")
+    if sweep_id is None:
+        sweep_id = metadata.get("sweep_id")
+
+    exchange_id = data_settings.get("exchange_id") or metadata.get("exchange_id")
+    market_type = data_settings.get("market_type") or metadata.get("market_type") or metadata.get("market")
+    symbol = data_settings.get("symbol") or metadata.get("symbol")
+    timeframe = data_settings.get("timeframe") or metadata.get("timeframe")
+
+    strategy_name = metadata.get("strategy_name") or payload.get("strategy_name")
+    strategy_version = metadata.get("strategy_version") or payload.get("strategy_version")
+
+    # Normalize config by parsing/re-dumping with sorted keys.
+    cfg = payload.get("config")
+    if isinstance(cfg, str) and cfg.strip():
+        try:
+            cfg_obj = json.loads(cfg)
+        except Exception:
+            cfg_obj = cfg
+    else:
+        cfg_obj = cfg
+    cfg_norm = _canonical_json_dumps(cfg_obj)
+    try:
+        cfg_norm_obj = json.loads(cfg_norm)
+    except Exception:
+        cfg_norm_obj = cfg_norm
+
+    range_mode = data_settings.get("range_mode")
+    range_params = data_settings.get("range_params") if isinstance(data_settings.get("range_params"), dict) else {}
+
+    # Include data-source flags that affect results.
+    stable_blob = {
+        "user_id": (str(user_id).strip() if user_id is not None else None),
+        "sweep_id": (str(sweep_id).strip() if sweep_id is not None else None),
+        "exchange_id": (str(exchange_id).strip() if exchange_id is not None else None),
+        "market_type": (str(market_type).strip().lower() if market_type is not None else None),
+        "symbol": (str(symbol).strip() if symbol is not None else None),
+        "timeframe": (str(timeframe).strip() if timeframe is not None else None),
+        "strategy_name": (str(strategy_name).strip() if strategy_name is not None else None),
+        "strategy_version": (str(strategy_version).strip() if strategy_version is not None else None),
+        "config": cfg_norm_obj,
+        "range_mode": (str(range_mode).strip() if range_mode is not None else None),
+        "range_params": range_params,
+        "data_source": (str(data_settings.get("data_source") or "").strip() or None),
+        "initial_balance": data_settings.get("initial_balance"),
+        "fee_rate": data_settings.get("fee_rate"),
+    }
+
+    canonical = _canonical_json_dumps(stable_blob)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def get_backtest_run_id_by_run_key(conn: sqlite3.Connection, run_key: str) -> Optional[str]:
+    """Find existing backtest_runs.id by deterministic run_key stored in metadata_json."""
+
+    rk = str(run_key or "").strip()
+    if not rk:
+        return None
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id FROM backtest_runs WHERE json_extract(metadata_json, '$.run_key') = ? LIMIT 1",
+            (rk,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        return str(row[0] if not isinstance(row, sqlite3.Row) else row["id"])
+    except Exception:
+        return None
+
+
+def upsert_backtest_run_by_run_key(
+    conn: sqlite3.Connection,
+    *,
+    run_key: str,
+    run_row_fields: Dict[str, Any],
+    details_fields: Dict[str, Any],
+) -> str:
+    """Upsert backtest run summary+details exactly-once by run_key.
+
+    Important: this helper does NOT commit; call it inside your own transaction.
+    """
+
+    rk = str(run_key or "").strip()
+    if not rk:
+        raise ValueError("run_key is required")
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+
+    # Pull any existing row (for metadata merge + stable created_at).
+    existing = None
+    try:
+        existing = conn.execute(
+            """
+            SELECT id, created_at, metadata_json
+            FROM backtest_runs
+            WHERE json_extract(metadata_json, '$.run_key') = ?
+            LIMIT 1
+            """,
+            (rk,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        existing = None
+
+    incoming_meta_raw = run_row_fields.get("metadata_json")
+    incoming_meta: Dict[str, Any]
+    if isinstance(incoming_meta_raw, dict):
+        incoming_meta = dict(incoming_meta_raw)
+    elif isinstance(incoming_meta_raw, str) and incoming_meta_raw.strip():
+        try:
+            incoming_meta = json.loads(incoming_meta_raw)
+        except Exception:
+            incoming_meta = {}
+    else:
+        incoming_meta = {}
+
+    # Always include run_key (+ job_key if present).
+    incoming_meta["run_key"] = rk
+    job_key = None
+    try:
+        job_key = incoming_meta.get("job_key")
+    except Exception:
+        job_key = None
+    if not job_key:
+        try:
+            job_key = run_row_fields.get("job_key") or details_fields.get("job_key")
+        except Exception:
+            job_key = None
+    if job_key:
+        incoming_meta["job_key"] = str(job_key)
+
+    if existing:
+        run_id = str(existing[0] if not isinstance(existing, sqlite3.Row) else existing["id"])
+        created_at_existing = str(existing[1] if not isinstance(existing, sqlite3.Row) else existing["created_at"])
+        existing_meta_raw = existing[2] if not isinstance(existing, sqlite3.Row) else existing["metadata_json"]
+        try:
+            existing_meta = json.loads(existing_meta_raw) if isinstance(existing_meta_raw, str) and existing_meta_raw else {}
+        except Exception:
+            existing_meta = {}
+        if not isinstance(existing_meta, dict):
+            existing_meta = {}
+        merged_meta = {**existing_meta, **incoming_meta}
+        merged_meta["run_key"] = rk
+
+        # Update summary row (keep created_at stable).
+        # Only update known columns; ignore unknown keys.
+        conn.execute(
+            """
+            UPDATE backtest_runs
+            SET symbol = ?, timeframe = ?, strategy_name = ?, strategy_version = ?,
+                config_json = ?, metrics_json = ?, metadata_json = ?,
+                start_time = ?, end_time = ?,
+                net_profit = ?, net_return_pct = ?, roi_pct_on_margin = ?, max_drawdown_pct = ?,
+                sharpe = ?, sortino = ?, win_rate = ?, profit_factor = ?,
+                cpc_index = ?, common_sense_ratio = ?, avg_position_time_s = ?, trades_json = ?,
+                sweep_id = ?, market_type = ?
+            WHERE id = ?
+            """,
+            (
+                run_row_fields.get("symbol"),
+                run_row_fields.get("timeframe"),
+                run_row_fields.get("strategy_name"),
+                run_row_fields.get("strategy_version"),
+                run_row_fields.get("config_json"),
+                run_row_fields.get("metrics_json"),
+                json.dumps(_sanitize_for_json(merged_meta)),
+                run_row_fields.get("start_time"),
+                run_row_fields.get("end_time"),
+                run_row_fields.get("net_profit"),
+                run_row_fields.get("net_return_pct"),
+                run_row_fields.get("roi_pct_on_margin"),
+                run_row_fields.get("max_drawdown_pct"),
+                run_row_fields.get("sharpe"),
+                run_row_fields.get("sortino"),
+                run_row_fields.get("win_rate"),
+                run_row_fields.get("profit_factor"),
+                run_row_fields.get("cpc_index"),
+                run_row_fields.get("common_sense_ratio"),
+                run_row_fields.get("avg_position_time_s"),
+                run_row_fields.get("trades_json"),
+                run_row_fields.get("sweep_id"),
+                run_row_fields.get("market_type"),
+                run_id,
+            ),
+        )
+
+        # Keep details table in sync.
+        now_iso = now_utc_iso()
+        details_meta_raw = details_fields.get("metadata_json")
+        if isinstance(details_meta_raw, dict):
+            details_meta = {**existing_meta, **details_meta_raw, "run_key": rk}
+            if job_key:
+                details_meta["job_key"] = str(job_key)
+            details_meta_json = json.dumps(_sanitize_for_json(details_meta))
+        elif isinstance(details_meta_raw, str) and details_meta_raw.strip():
+            try:
+                d = json.loads(details_meta_raw)
+                if isinstance(d, dict):
+                    d = {**existing_meta, **d, "run_key": rk}
+                    if job_key:
+                        d["job_key"] = str(job_key)
+                    details_meta_json = json.dumps(_sanitize_for_json(d))
+                else:
+                    details_meta_json = details_meta_raw
+            except Exception:
+                details_meta_json = details_meta_raw
+        else:
+            details_meta_json = json.dumps(_sanitize_for_json(merged_meta))
+
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO backtest_run_details(
+                    run_id, config_json, metrics_json, metadata_json, trades_json,
+                    equity_curve_json, equity_timestamps_json, extra_series_json,
+                    candles_json, params_json, run_context_json, computed_metrics_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    details_fields.get("config_json"),
+                    details_fields.get("metrics_json"),
+                    details_meta_json,
+                    details_fields.get("trades_json"),
+                    details_fields.get("equity_curve_json"),
+                    details_fields.get("equity_timestamps_json"),
+                    details_fields.get("extra_series_json"),
+                    details_fields.get("candles_json"),
+                    details_fields.get("params_json"),
+                    details_fields.get("run_context_json"),
+                    details_fields.get("computed_metrics_json"),
+                    created_at_existing,
+                    now_iso,
+                ),
+            )
+        except sqlite3.OperationalError:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO backtest_run_details(
+                    run_id, config_json, metrics_json, metadata_json, trades_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    details_fields.get("config_json"),
+                    details_fields.get("metrics_json"),
+                    details_meta_json,
+                    details_fields.get("trades_json"),
+                    created_at_existing,
+                    now_iso,
+                ),
+            )
+
+        return run_id
+
+    # Insert new run.
+    run_id = str(uuid4())
+    created_at = str(run_row_fields.get("created_at") or now_utc_iso())
+    merged_meta = dict(incoming_meta)
+    merged_meta["run_key"] = rk
+    if job_key:
+        merged_meta["job_key"] = str(job_key)
+
+    conn.execute(
+        """
+        INSERT INTO backtest_runs (
+            id, created_at, symbol, timeframe,
+            strategy_name, strategy_version,
+            config_json, metrics_json, metadata_json,
+            market_type,
+            start_time, end_time,
+            net_profit, net_return_pct, roi_pct_on_margin, max_drawdown_pct,
+            sharpe, sortino, win_rate, profit_factor,
+            cpc_index, common_sense_ratio, avg_position_time_s, trades_json,
+            sweep_id
+        )
+        VALUES (
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?,
+            ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?
+        )
+        """,
+        (
+            run_id,
+            created_at,
+            run_row_fields.get("symbol"),
+            run_row_fields.get("timeframe"),
+            run_row_fields.get("strategy_name"),
+            run_row_fields.get("strategy_version"),
+            run_row_fields.get("config_json"),
+            run_row_fields.get("metrics_json"),
+            json.dumps(_sanitize_for_json(merged_meta)),
+            run_row_fields.get("market_type"),
+            run_row_fields.get("start_time"),
+            run_row_fields.get("end_time"),
+            run_row_fields.get("net_profit"),
+            run_row_fields.get("net_return_pct"),
+            run_row_fields.get("roi_pct_on_margin"),
+            run_row_fields.get("max_drawdown_pct"),
+            run_row_fields.get("sharpe"),
+            run_row_fields.get("sortino"),
+            run_row_fields.get("win_rate"),
+            run_row_fields.get("profit_factor"),
+            run_row_fields.get("cpc_index"),
+            run_row_fields.get("common_sense_ratio"),
+            run_row_fields.get("avg_position_time_s"),
+            run_row_fields.get("trades_json"),
+            run_row_fields.get("sweep_id"),
+        ),
+    )
+
+    now_iso = now_utc_iso()
+    details_meta_raw = details_fields.get("metadata_json")
+    if isinstance(details_meta_raw, dict):
+        details_meta = dict(details_meta_raw)
+        details_meta["run_key"] = rk
+        if job_key:
+            details_meta["job_key"] = str(job_key)
+        details_meta_json = json.dumps(_sanitize_for_json(details_meta))
+    elif isinstance(details_meta_raw, str) and details_meta_raw.strip():
+        try:
+            d = json.loads(details_meta_raw)
+            if isinstance(d, dict):
+                d["run_key"] = rk
+                if job_key:
+                    d["job_key"] = str(job_key)
+                details_meta_json = json.dumps(_sanitize_for_json(d))
+            else:
+                details_meta_json = details_meta_raw
+        except Exception:
+            details_meta_json = details_meta_raw
+    else:
+        details_meta_json = json.dumps(_sanitize_for_json(merged_meta))
+
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO backtest_run_details(
+                run_id, config_json, metrics_json, metadata_json, trades_json,
+                equity_curve_json, equity_timestamps_json, extra_series_json,
+                candles_json, params_json, run_context_json, computed_metrics_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                details_fields.get("config_json"),
+                details_fields.get("metrics_json"),
+                details_meta_json,
+                details_fields.get("trades_json"),
+                details_fields.get("equity_curve_json"),
+                details_fields.get("equity_timestamps_json"),
+                details_fields.get("extra_series_json"),
+                details_fields.get("candles_json"),
+                details_fields.get("params_json"),
+                details_fields.get("run_context_json"),
+                details_fields.get("computed_metrics_json"),
+                created_at,
+                now_iso,
+            ),
+        )
+    except sqlite3.OperationalError:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO backtest_run_details(
+                run_id, config_json, metrics_json, metadata_json, trades_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                details_fields.get("config_json"),
+                details_fields.get("metrics_json"),
+                details_meta_json,
+                details_fields.get("trades_json"),
+                created_at,
+                now_iso,
+            ),
+        )
+
+    return run_id
+
+
+def finalize_sweep_if_complete(conn: sqlite3.Connection, sweep_id: str) -> None:
+    """Mark sweep done/failed when all child backtest_run jobs are terminal.
+
+    Race-safe: updates only if the sweep is not already terminal.
+    Does not commit.
+    """
+
+    sid = str(sweep_id or "").strip()
+    if not sid:
+        return
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+
+    rows = conn.execute(
+        """
+        SELECT status, COUNT(*) AS c
+        FROM jobs
+        WHERE job_type = 'backtest_run'
+          AND sweep_id = ?
+        GROUP BY status
+        """,
+        (sid,),
+    ).fetchall()
+
+    counts: Dict[str, int] = {}
+    total = 0
+    for r in rows or []:
+        st = str(r[0] if not isinstance(r, sqlite3.Row) else r["status"])
+        c = int(r[1] if not isinstance(r, sqlite3.Row) else r["c"])
+        counts[st] = int(c)
+        total += int(c)
+
+    if total <= 0:
+        return
+
+    queued = int(counts.get("queued") or 0)
+    running = int(counts.get("running") or 0)
+    if queued > 0 or running > 0:
+        return
+
+    failed = int(counts.get("failed") or 0) + int(counts.get("error") or 0)
+    status = "failed" if failed > 0 else "done"
+    err_msg = "one_or_more_child_jobs_failed" if failed > 0 else None
+
+    conn.execute(
+        """
+        UPDATE sweeps
+        SET status = ?, error_message = COALESCE(error_message, ?)
+        WHERE id = ?
+          AND status NOT IN ('done','failed','cancelled','canceled')
+        """,
+        (status, err_msg, sid),
+    )
+
+
+def get_backtest_run_job_counts_by_sweep(
+    conn: sqlite3.Connection,
+    *,
+    sweep_ids: Sequence[str],
+    job_type: str = "backtest_run",
+) -> Dict[str, Dict[str, int]]:
+    """Return per-sweep job status counts for a set of sweep IDs.
+
+    One query (grouped by sweep_id,status).
+    Returns mapping: sweep_id -> {"total": n, "queued": n, "running": n, "done": n, "failed": n, ...}
+    """
+
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
+    sids = [str(s).strip() for s in (sweep_ids or []) if str(s).strip()]
+    if not sids:
+        return {}
+
+    placeholders = ",".join(["?"] * len(sids))
+    rows = conn.execute(
+        f"""
+        SELECT sweep_id, status, COUNT(*) AS c
+        FROM jobs
+        WHERE job_type = ?
+          AND sweep_id IN ({placeholders})
+        GROUP BY sweep_id, status
+        """,
+        tuple([str(job_type)] + sids),
+    ).fetchall()
+
+    out: Dict[str, Dict[str, int]] = {}
+    for r in rows or []:
+        sid = str(r[0] if not isinstance(r, sqlite3.Row) else r["sweep_id"])
+        st = str(r[1] if not isinstance(r, sqlite3.Row) else r["status"])
+        c = int(r[2] if not isinstance(r, sqlite3.Row) else r["c"]) if r is not None else 0
+        d = out.setdefault(sid, {})
+        d[st] = int(c)
+
+    # Add totals in-memory without additional queries.
+    for sid in sids:
+        d = out.setdefault(sid, {})
+        total = 0
+        for k, v in d.items():
+            if k == "total":
+                continue
+            try:
+                total += int(v or 0)
+            except Exception:
+                continue
+        d["total"] = int(total)
+    return out
 
 
 def renew_job_lease(
@@ -4917,14 +6210,21 @@ def _extract_initial_entry_notional_usd(config_obj: Any, metadata: Dict[str, Any
         return None
     return initial_balance * (pct / 100.0)
 
-def save_backtest_run(
+
+def build_backtest_run_rows(
     config: Any,
     metrics: Dict[str, Any],
     metadata: Dict[str, Any],
+    *,
     sweep_id: Optional[str] = None,
     result: Optional["BacktestResult"] = None,
-) -> str:
-    run_id = metadata.get("id") or str(uuid4())
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build DB-ready summary/details fields for a backtest run.
+
+    Returns (run_row_fields, details_fields). Does not write to DB.
+    `run_row_fields["metadata_json"]` is a dict (not a JSON string) to enable merge-by-run_key.
+    """
+
     created_at = metadata.get("created_at") or datetime.now(timezone.utc).isoformat()
     symbol = metadata.get("symbol", "SYNTH")
     timeframe = metadata.get("timeframe", "1m")
@@ -4951,7 +6251,6 @@ def save_backtest_run(
     end_dt = getattr(result, "end_time", None) if result is not None else metadata.get("end_time")
 
     # Best-effort: ROI% on margin for futures/perps runs.
-    # Stored as a percent value (e.g., 12.34 means +12.34%).
     roi_pct_on_margin: Optional[float] = None
     try:
         from project_dragon.metrics import compute_max_drawdown, compute_roi_pct_on_margin, get_effective_leverage
@@ -4961,11 +6260,6 @@ def save_backtest_run(
         net_pnl = _safe_float(metrics_source.get("net_profit"))
         roi_pct_on_margin = compute_roi_pct_on_margin(net_pnl=net_pnl, notional=notional, leverage=lev)
 
-        # Max drawdown: compute directly from the mark-to-market equity curve.
-        # This corresponds to unrealized PnL (uPnL) based equity:
-        # LONG:  uPnL = (Pmark - Pentry) * qty
-        # SHORT: uPnL = (Pentry - Pmark) * qty
-        # with equity[t] = initial_balance + realized_pnl[t] + sum(uPnL[t]).
         equity_curve = getattr(result, "equity_curve", None) if result is not None else None
         if isinstance(equity_curve, list) and equity_curve:
             try:
@@ -4989,13 +6283,14 @@ def save_backtest_run(
 
     config_payload = json.dumps(_sanitize_for_json(config))
     metrics_payload = json.dumps(_sanitize_for_json(metrics_source))
-    metadata_payload = json.dumps(_sanitize_for_json(metadata))
+    # Keep metadata as a dict for merge-by-run_key at write time.
+    metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
 
     trades_json: Optional[str] = None
     if result is not None and getattr(result, "trades", None) is not None:
         trades_json = json.dumps([t.to_dict() if hasattr(t, "to_dict") else _sanitize_for_json(t) for t in result.trades])
 
-    # Artifacts (enables Run-page rendering + analysis without re-running).
+    # Artifacts
     equity_curve_json: Optional[str] = None
     equity_timestamps_json: Optional[str] = None
     extra_series_json: Optional[str] = None
@@ -5011,7 +6306,6 @@ def save_backtest_run(
         except Exception:
             equity_curve_json = None
         try:
-            # Prefer explicit equity_timestamps if present; otherwise fall back to candle timestamps.
             eq_ts = getattr(result, "equity_timestamps", None)
             if isinstance(eq_ts, list) and eq_ts:
                 ts_list = []
@@ -5089,8 +6383,7 @@ def save_backtest_run(
         except Exception:
             computed_metrics_json = None
 
-    payload = {
-        "id": run_id,
+    run_row_fields: Dict[str, Any] = {
         "created_at": created_at,
         "symbol": symbol,
         "timeframe": timeframe,
@@ -5098,19 +6391,15 @@ def save_backtest_run(
         "strategy_version": strategy_version,
         "config_json": config_payload,
         "metrics_json": metrics_payload,
-        "metadata_json": metadata_payload,
+        "metadata_json": metadata_dict,
         "sweep_id": sweep_id,
         "market_type": market_type or None,
         "start_time": start_time,
         "end_time": end_time,
         "net_profit": _safe_float(metrics_source.get("net_profit")),
-        "net_return_pct": _safe_float(
-            metrics_source.get("net_return_pct", metrics_source.get("return_pct"))
-        ),
+        "net_return_pct": _safe_float(metrics_source.get("net_return_pct", metrics_source.get("return_pct"))),
         "roi_pct_on_margin": _safe_float(metrics_source.get("roi_pct_on_margin", roi_pct_on_margin)),
-        "max_drawdown_pct": _safe_float(
-            metrics_source.get("max_drawdown_pct", metrics_source.get("max_drawdown"))
-        ),
+        "max_drawdown_pct": _safe_float(metrics_source.get("max_drawdown_pct", metrics_source.get("max_drawdown"))),
         "sharpe": _safe_float(metrics_source.get("sharpe", metrics_source.get("sharpe_ratio"))),
         "sortino": _safe_float(metrics_source.get("sortino", metrics_source.get("sortino_ratio"))),
         "win_rate": _safe_float(metrics_source.get("win_rate")),
@@ -5120,6 +6409,45 @@ def save_backtest_run(
         "avg_position_time_s": _safe_float(metrics_source.get("avg_position_time_s")),
         "trades_json": trades_json,
     }
+
+    details_fields: Dict[str, Any] = {
+        "config_json": config_payload,
+        "metrics_json": metrics_payload,
+        "metadata_json": metadata_dict,
+        "trades_json": trades_json,
+        "equity_curve_json": equity_curve_json,
+        "equity_timestamps_json": equity_timestamps_json,
+        "extra_series_json": extra_series_json,
+        "candles_json": candles_json,
+        "params_json": params_json,
+        "run_context_json": run_context_json,
+        "computed_metrics_json": computed_metrics_json,
+        "created_at": created_at,
+    }
+
+    return run_row_fields, details_fields
+
+def save_backtest_run(
+    config: Any,
+    metrics: Dict[str, Any],
+    metadata: Dict[str, Any],
+    sweep_id: Optional[str] = None,
+    result: Optional["BacktestResult"] = None,
+) -> str:
+    run_id = metadata.get("id") or str(uuid4())
+    run_row_fields, details_fields = build_backtest_run_rows(
+        config,
+        metrics,
+        metadata,
+        sweep_id=sweep_id,
+        result=result,
+    )
+    created_at = str(run_row_fields.get("created_at") or datetime.now(timezone.utc).isoformat())
+
+    payload = dict(run_row_fields)
+    payload["id"] = run_id
+    payload["created_at"] = created_at
+    payload["metadata_json"] = json.dumps(_sanitize_for_json(run_row_fields.get("metadata_json") or {}))
 
     with _get_conn() as conn:
         _ensure_schema(conn)
@@ -5165,17 +6493,17 @@ def save_backtest_run(
                     """,
                     (
                         run_id,
-                        config_payload,
-                        metrics_payload,
-                        metadata_payload,
-                        trades_json,
-                        equity_curve_json,
-                        equity_timestamps_json,
-                        extra_series_json,
-                        candles_json,
-                        params_json,
-                        run_context_json,
-                        computed_metrics_json,
+                        details_fields.get("config_json"),
+                        details_fields.get("metrics_json"),
+                        json.dumps(_sanitize_for_json(details_fields.get("metadata_json") or {})),
+                        details_fields.get("trades_json"),
+                        details_fields.get("equity_curve_json"),
+                        details_fields.get("equity_timestamps_json"),
+                        details_fields.get("extra_series_json"),
+                        details_fields.get("candles_json"),
+                        details_fields.get("params_json"),
+                        details_fields.get("run_context_json"),
+                        details_fields.get("computed_metrics_json"),
                         created_at,
                         created_at,
                     ),
@@ -5191,10 +6519,10 @@ def save_backtest_run(
                     """,
                     (
                         run_id,
-                        config_payload,
-                        metrics_payload,
-                        metadata_payload,
-                        trades_json,
+                        details_fields.get("config_json"),
+                        details_fields.get("metrics_json"),
+                        json.dumps(_sanitize_for_json(details_fields.get("metadata_json") or {})),
+                        details_fields.get("trades_json"),
                         created_at,
                         created_at,
                     ),
