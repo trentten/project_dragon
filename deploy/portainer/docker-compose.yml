@@ -47,7 +47,7 @@ services:
     command: >
       bash -lc "PYTHONPATH=src python -m project_dragon.backtest_worker"
 
-    backtest_worker_2:
+  backtest_worker_2:
     image: ghcr.io/trentten/project_dragon:v0.1.5
     restart: unless-stopped
     environment:
