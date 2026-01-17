@@ -1,6 +1,6 @@
 services:
   dragon_ui:
-    image: ghcr.io/trentten/project_dragon:v0.1.4
+    image: ghcr.io/trentten/project_dragon:v0.1.5
     container_name: dragon_ui
     restart: unless-stopped
     environment:
@@ -19,7 +19,7 @@ services:
       --server.port 8501
 
   live_worker:
-    image: ghcr.io/trentten/project_dragon:v0.1.4
+    image: ghcr.io/trentten/project_dragon:v0.1.5
     container_name: live_worker
     restart: unless-stopped
     environment:
@@ -34,7 +34,7 @@ services:
       bash -lc "PYTHONPATH=src python -m project_dragon.live_worker"
 
   backtest_worker:
-    image: ghcr.io/trentten/project_dragon:v0.1.4
+    image: ghcr.io/trentten/project_dragon:v0.1.5
     restart: unless-stopped
     environment:
       TZ: Australia/Brisbane
@@ -48,7 +48,7 @@ services:
       bash -lc "PYTHONPATH=src python -m project_dragon.backtest_worker"
 
     backtest_worker_2:
-    image: ghcr.io/trentten/project_dragon:v0.1.4
+    image: ghcr.io/trentten/project_dragon:v0.1.5
     restart: unless-stopped
     environment:
       TZ: Australia/Brisbane
