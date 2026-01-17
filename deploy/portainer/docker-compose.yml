@@ -35,7 +35,20 @@ services:
 
   backtest_worker:
     image: ghcr.io/trentten/project_dragon:v0.1.4
-    container_name: backtest_worker
+    restart: unless-stopped
+    environment:
+      TZ: Australia/Brisbane
+      DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
+      DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+    volumes:
+      - /share/Container/dragon-test/data:/app/data
+      - /share/Container/dragon-test/config:/app/config
+      - /share/Container/dragon-test/logs:/app/logs
+    command: >
+      bash -lc "PYTHONPATH=src python -m project_dragon.backtest_worker"
+
+    backtest_worker_2:
+    image: ghcr.io/trentten/project_dragon:v0.1.4
     restart: unless-stopped
     environment:
       TZ: Australia/Brisbane
