@@ -1,0 +1,28 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  dragon_ui:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: project_dragon:dev
+
+  live_worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: project_dragon:dev
+
+  backtest_worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: project_dragon:dev
+
+  backtest_worker_2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: project_dragon:dev

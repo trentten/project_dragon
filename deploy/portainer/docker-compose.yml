@@ -1,62 +1,94 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dragon
+      POSTGRES_USER: dragon
+      POSTGRES_PASSWORD: ${DRAGON_POSTGRES_PASSWORD}
+    volumes:
+      - dragon_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dragon -d dragon"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   dragon_ui:
     image: ghcr.io/trentten/project_dragon:v0.1.6
-    container_name: dragon_ui
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
       DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+      DRAGON_DATABASE_URL: postgresql://dragon:${DRAGON_POSTGRES_PASSWORD}@postgres:5432/dragon
     volumes:
-      - /share/Container/dragon-test/data:/app/data
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     ports:
       - "8501:8501"
     command: >
+      bash -lc "python -m project_dragon.db_migrate &&
       streamlit run streamlit_app.py
       --server.address 0.0.0.0
-      --server.port 8501
+      --server.port 8501"
 
   live_worker:
     image: ghcr.io/trentten/project_dragon:v0.1.6
-    container_name: live_worker
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
       DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+      DRAGON_DATABASE_URL: postgresql://dragon:${DRAGON_POSTGRES_PASSWORD}@postgres:5432/dragon
     volumes:
-      - /share/Container/dragon-test/data:/app/data
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     command: >
-      bash -lc "PYTHONPATH=src python -m project_dragon.live_worker"
+      bash -lc "python -m project_dragon.db_migrate &&
+      python -m project_dragon.live_worker"
 
   backtest_worker:
     image: ghcr.io/trentten/project_dragon:v0.1.6
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
       DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+      DRAGON_DATABASE_URL: postgresql://dragon:${DRAGON_POSTGRES_PASSWORD}@postgres:5432/dragon
     volumes:
-      - /share/Container/dragon-test/data:/app/data
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     command: >
-      bash -lc "PYTHONPATH=src python -m project_dragon.backtest_worker"
+      bash -lc "python -m project_dragon.db_migrate &&
+      python -m project_dragon.backtest_worker"
 
   backtest_worker_2:
     image: ghcr.io/trentten/project_dragon:v0.1.6
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
       DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+      DRAGON_DATABASE_URL: postgresql://dragon:${DRAGON_POSTGRES_PASSWORD}@postgres:5432/dragon
     volumes:
-      - /share/Container/dragon-test/data:/app/data
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     command: >
-      bash -lc "PYTHONPATH=src python -m project_dragon.backtest_worker"
+      bash -lc "python -m project_dragon.db_migrate &&
+      python -m project_dragon.backtest_worker"
+
+volumes:
+  dragon_postgres_data:

@@ -5,6 +5,17 @@ For full design + roadmap, see [docs/project_dragon_plan.md](docs/project_dragon
 Setup:
 - Install runtime dependencies (or reinstall after updates): pip install -r requirements.txt
 
+Postgres (required):
+- Start Postgres (local dev): docker compose up -d postgres
+- Set DRAGON_DATABASE_URL (example): postgresql://dragon:dragon@localhost:5432/dragon
+- Migrations: docker compose up -d will auto-run migrations for the app containers.
+
+Tests:
+- PYTHONPATH=src pytest -q
+
+Manual migrations (if needed):
+- docker compose exec dragon_ui bash -lc 'python -m project_dragon.db_migrate'
+
 Live dry-run checklist (WooX):
 - Set WOOX_API_KEY/SECRET in your env (or accept stub mode for offline checks).
 - Open the Streamlit Live Bots tab → Live Test Tools.
@@ -22,7 +33,7 @@ Project Dragon uses vendored icon packs (no runtime icon scraping / external ico
 - Crypto asset icons: `app/assets/crypto_icons/spothq/cryptocurrency-icons` (spothq/cryptocurrency-icons, CC0)
 - UI icons: `app/assets/ui_icons/tabler/filled` (Tabler Icons Filled, MIT)
 
-### Sync crypto icons into SQLite
+### Sync crypto icons into the DB
 
 The app caches resolved icons into `symbols.icon_uri` (data URIs) for fast rendering.
 

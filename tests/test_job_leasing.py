@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import project_dragon.live_worker as live_worker
@@ -8,18 +7,14 @@ from project_dragon.storage import (
     claim_job_with_lease,
     create_job,
     get_job,
-    init_db,
     open_db_connection,
     reclaim_stale_job,
     renew_job_lease,
 )
 
 
-def test_claim_sets_lease_fields_and_increments_version(tmp_path):
-    db_path = tmp_path / "lease_claim.sqlite"
-    init_db(db_path)
-
-    with open_db_connection(db_path) as conn:
+def test_claim_sets_lease_fields_and_increments_version():
+    with open_db_connection() as conn:
         job_id = int(create_job(conn, "live_bot", {"x": 1}, bot_id=123))
         job = claim_job_with_lease(conn, worker_id="workerA", lease_s=30)
         assert job is not None
@@ -35,11 +30,8 @@ def test_claim_sets_lease_fields_and_increments_version(tmp_path):
         assert job.get("worker_id") == "workerA"
 
 
-def test_renew_requires_expected_version_and_owner(tmp_path):
-    db_path = tmp_path / "lease_renew.sqlite"
-    init_db(db_path)
-
-    with open_db_connection(db_path) as conn:
+def test_renew_requires_expected_version_and_owner():
+    with open_db_connection() as conn:
         job_id = int(create_job(conn, "live_bot", {"x": 1}, bot_id=123))
         job = claim_job_with_lease(conn, worker_id="workerA", lease_s=30)
         assert job is not None
@@ -55,11 +47,8 @@ def test_renew_requires_expected_version_and_owner(tmp_path):
         assert ok_wrong_ver is False
 
 
-def test_reclaim_only_when_expired(tmp_path):
-    db_path = tmp_path / "lease_reclaim.sqlite"
-    init_db(db_path)
-
-    with open_db_connection(db_path) as conn:
+def test_reclaim_only_when_expired():
+    with open_db_connection() as conn:
         job_id = int(create_job(conn, "live_bot", {"x": 1}, bot_id=123))
         job = claim_job_with_lease(conn, worker_id="workerA", lease_s=30)
         assert job is not None
@@ -70,7 +59,7 @@ def test_reclaim_only_when_expired(tmp_path):
 
         # Force expiry
         past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-        conn.execute("UPDATE jobs SET lease_expires_at = ? WHERE id = ?", (past, job_id))
+        conn.execute("UPDATE jobs SET lease_expires_at = %s WHERE id = %s", (past, job_id))
         conn.commit()
 
         ok = reclaim_stale_job(conn, job_id=job_id, new_worker_id="workerB", lease_s=30)
@@ -84,16 +73,13 @@ def test_reclaim_only_when_expired(tmp_path):
         assert int(after.get("lease_version") or 0) >= int(job.get("lease_version") or 0) + 1
 
 
-def test_worker_helper_stops_when_lease_renewal_fails(tmp_path):
-    db_path = tmp_path / "lease_worker_stop.sqlite"
-    init_db(db_path)
-
+def test_worker_helper_stops_when_lease_renewal_fails():
     events = []
 
     def emit(level: str, event_type: str, message: str, payload=None):
         events.append((level, event_type, message, payload or {}))
 
-    with open_db_connection(db_path) as conn:
+    with open_db_connection() as conn:
         job_id = int(create_job(conn, "live_bot", {"x": 1}, bot_id=123))
         job = claim_job_with_lease(conn, worker_id="workerA", lease_s=30)
         assert job is not None
@@ -103,7 +89,7 @@ def test_worker_helper_stops_when_lease_renewal_fails(tmp_path):
         live_worker._JOB_LAST_LEASE_RENEW_S.pop(job_id, None)
 
         # Bump lease_version to simulate another worker reclaiming it.
-        conn.execute("UPDATE jobs SET lease_version = COALESCE(lease_version, 0) + 1 WHERE id = ?", (job_id,))
+        conn.execute("UPDATE jobs SET lease_version = COALESCE(lease_version, 0) + 1 WHERE id = %s", (job_id,))
         conn.commit()
 
         ok = live_worker._maybe_renew_job_lease(

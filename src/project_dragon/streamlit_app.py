@@ -13,7 +13,6 @@ import math
 import os
 from pathlib import Path
 import random
-import sqlite3
 import threading
 import time
 import traceback
@@ -82,9 +81,12 @@ from project_dragon.storage import (
     create_credential,
     create_job,
     create_sweep,
+    count_runs_matching_filters,
+    clear_run_details_payloads,
     dedupe_sweep_runs,
     delete_credential,
     delete_category,
+    delete_runs_and_children,
     get_category_symbols,
     get_account_snapshots,
     get_app_settings,
@@ -130,6 +132,7 @@ from project_dragon.storage import (
     reconcile_inprocess_jobs_after_restart,
     sample_backtest_runs_missing_details,
     save_backtest_run,
+    save_backtest_run_details_for_existing_run,
     seed_asset_categories_if_empty,
     set_setting,
     set_assets_status,
@@ -2334,7 +2337,7 @@ def timeframe_to_minutes(tf: str) -> int:
     return 0
 
 
-def _job_conn() -> sqlite3.Connection:
+def _job_conn() -> Any:
     return open_db_connection()
 
 
@@ -3889,19 +3892,40 @@ def enqueue_sweep_parent_job(*, sweep_id: str, user_id: Optional[str] = None) ->
     payload = {"sweep_id": sid, "user_id": (str(user_id).strip() if user_id else None)}
 
     with _job_conn() as conn:
-        job_id = create_job(conn, "sweep_parent", payload, sweep_id=sid, job_key=job_key, group_key=group_key)
+        job_id = create_job(
+            conn,
+            "sweep_parent",
+            payload,
+            sweep_id=sid,
+            job_key=job_key,
+            group_key=group_key,
+            priority=200,
+            is_interactive=0,
+        )
         update_job(conn, int(job_id), status="queued", progress=0.0, message="Queued (awaiting backtest_worker)")
     return int(job_id)
 
 
-def enqueue_backtest_job(payload: Dict[str, Any], *, existing_job_id: Optional[int] = None) -> int:
+def enqueue_backtest_job(
+    payload: Dict[str, Any],
+    *,
+    existing_job_id: Optional[int] = None,
+    is_interactive: bool = True,
+) -> int:
     """Enqueue a `backtest_run` job for the dedicated backtest worker."""
 
     if existing_job_id is not None:
         return int(existing_job_id)
 
     with _job_conn() as conn:
-        job_id = create_job(conn, "backtest_run", payload, sweep_id=None)
+        job_id = create_job(
+            conn,
+            "backtest_run",
+            payload,
+            sweep_id=None,
+            is_interactive=(1 if bool(is_interactive) else 0),
+            priority=(0 if bool(is_interactive) else 100),
+        )
         update_job(conn, int(job_id), status="queued", progress=0.0, message="Queued (awaiting backtest_worker)")
     return int(job_id)
 
@@ -5588,7 +5612,7 @@ def _hydrate_run_row(run_row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def rebuild_backtest_result_from_run_row(
-    conn: sqlite3.Connection | None,
+    conn: Optional[Any],
     run_row: Dict[str, Any],
 ) -> Optional[BacktestResult]:
     raise RuntimeError(
@@ -5667,7 +5691,7 @@ def pick_rows_via_checkbox(df: pd.DataFrame, key_prefix: str, clearable: bool = 
 
 
 def render_run_detail_from_db(
-    conn: sqlite3.Connection | None,
+    conn: Optional[Any],
     run_row: dict,
     *,
     show_charts: bool = True,
@@ -5897,6 +5921,7 @@ def render_run_detail_from_db(
         run_id_for_key = str(hydrated.get("id") or "").strip() or "unknown"
         result_cache_key = f"run_details_result_cache__{run_id_for_key}"
         result: Optional[BacktestResult] = st.session_state.get(result_cache_key)
+        recomputed_result: Optional[BacktestResult] = None
         if result is None:
             artifacts: Optional[Dict[str, Any]] = None
             if run_id_for_key and conn is not None:
@@ -6017,6 +6042,69 @@ def render_run_detail_from_db(
                 )
 
             st.session_state[result_cache_key] = result
+
+        missing_trades = not bool(trades_payload)
+        missing_artifacts = result is None
+        if missing_trades or missing_artifacts:
+            st.warning("Detailed data was removed. Basics are preserved.")
+            recompute_cols = st.columns([1, 2, 2])
+            with recompute_cols[0]:
+                resave_details = st.checkbox(
+                    "Re-save details",
+                    value=False,
+                    key=f"run_recompute_resave_{run_id_for_key}",
+                    help="When checked, recomputed details will be stored back into the DB.",
+                )
+            with recompute_cols[1]:
+                if st.button(
+                    "Recompute details now",
+                    key=f"run_recompute_btn_{run_id_for_key}",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Recomputing details (this may take a while)..."):
+                        try:
+                            cfg_snapshot = _extract_config_dict(hydrated) or {}
+                            cfg_obj = _dragon_config_from_snapshot(cfg_snapshot)
+                            md = _extract_metadata(hydrated)
+                            data_settings = _build_data_settings(hydrated)
+                            if data_settings is None:
+                                raise ValueError("Unable to derive data settings for this run.")
+
+                            artifacts_out = run_single_backtest(cfg_obj, data_settings)
+                            recomputed_result = artifacts_out.result
+
+                            st.session_state[result_cache_key] = recomputed_result
+
+                            if resave_details:
+                                md_save = dict(md) if isinstance(md, dict) else {}
+                                md_save.setdefault("id", run_id_for_key)
+                                md_save.setdefault("created_at", hydrated.get("created_at") or md_save.get("created_at"))
+                                md_save.setdefault("symbol", hydrated.get("symbol") or md_save.get("symbol"))
+                                md_save.setdefault("timeframe", hydrated.get("timeframe") or md_save.get("timeframe"))
+                                md_save.setdefault("strategy_name", hydrated.get("strategy_name") or md_save.get("strategy_name"))
+                                md_save.setdefault("strategy_version", hydrated.get("strategy_version") or md_save.get("strategy_version"))
+                                md_save.setdefault("sweep_id", hydrated.get("sweep_id") or md_save.get("sweep_id"))
+
+                                save_backtest_run_details_for_existing_run(
+                                    run_id=run_id_for_key,
+                                    config=cfg_snapshot,
+                                    metrics=recomputed_result.metrics or {},
+                                    metadata=md_save,
+                                    result=recomputed_result,
+                                )
+                                st.success("Details re-saved.")
+
+                        except Exception as exc:
+                            st.error(f"Recompute failed: {exc}")
+
+            # Prefer recomputed result for display in this render pass.
+            if recomputed_result is not None:
+                result = recomputed_result
+                if not trades_payload and getattr(recomputed_result, "trades", None):
+                    trades_payload = recomputed_result.trades
+
+        if trades_payload and trades_df.empty:
+            trades_df = trades_to_dataframe(parse_trades_payload(trades_payload))
 
         # KPI tiles (compact 3x2)
         if show_stats:
@@ -11095,6 +11183,15 @@ def main() -> None:
                     if total_runs > 1000:
                         st.warning("Large sweep: consider reducing combinations.")
 
+                run_as_high_priority = True
+                if not sweep_mode_active:
+                    run_as_high_priority = st.toggle(
+                        "Run as high priority (interactive)",
+                        value=bool(st.session_state.get("bt_run_high_priority", True)),
+                        key=_wkey("bt_run_high_priority"),
+                        help="When enabled, this single backtest run will be claimed before sweep child jobs.",
+                    )
+
                 run_button_label = "Start sweep" if sweep_mode_active else "Run backtest"
                 run_clicked = st.button(run_button_label, type="primary")
 
@@ -11351,7 +11448,7 @@ def main() -> None:
                     payload["metadata"]["_futures"] = {"leverage": int(lev_bt)}
                     payload["metadata"]["leverage"] = int(lev_bt)
 
-                job_id = enqueue_backtest_job(payload)
+                job_id = enqueue_backtest_job(payload, is_interactive=bool(run_as_high_priority))
                 msg = f"Backtest job queued: #{job_id}"
                 if run_feedback is not None:
                     run_feedback.success(msg)
@@ -17799,6 +17896,8 @@ def main() -> None:
 
         st.caption("Backtest jobs run in `project_dragon.backtest_worker`; live bots run in `project_dragon.live_worker`.")
 
+        st.caption("Columns: id · type · status · interactive · priority · symbol · timeframe · sweep · progress")
+
         def _render_job_row(job: dict, sweeps: dict, allow_cancel: bool = True) -> None:
             job_id = job.get("id")
             job_type = job.get("job_type", "?")
@@ -17822,6 +17921,8 @@ def main() -> None:
                     sweep_name = sweep_row.get("name") or f"Sweep {sweep_id}"
             run_id = job.get("run_id")
             bot_id = job.get("bot_id")
+            priority = job.get("priority")
+            is_interactive = job.get("is_interactive")
             raw_prog = job.get("progress", 0.0)
             try:
                 prog = float(raw_prog or 0.0)
@@ -17830,17 +17931,19 @@ def main() -> None:
             prog = max(0.0, min(1.0, prog))
             msg = (job.get("message") or "").strip()
 
-            cols = st.columns([1, 2, 2, 2, 2, 2, 3, 1, 1, 1, 1])
+            cols = st.columns([1, 2, 2, 1, 1, 2, 2, 2, 3, 1, 1, 1, 1])
             cols[0].write(f"#{job_id}")
             cols[1].write(job_type)
             cols[2].write(status)
-            cols[3].write(symbol or "–")
-            cols[4].write(timeframe or "–")
-            cols[5].write(sweep_name or "–")
-            cols[6].progress(prog, text=msg or None)
+            cols[3].write("YES" if int(is_interactive or 0) == 1 else "")
+            cols[4].write(str(priority) if priority is not None else "")
+            cols[5].write(symbol or "–")
+            cols[6].write(timeframe or "–")
+            cols[7].write(sweep_name or "–")
+            cols[8].progress(prog, text=msg or None)
 
             if sweep_id is not None:
-                if cols[7].button("Open sweep", key=f"open_sweep_{job_id}"):
+                if cols[9].button("Open sweep", key=f"open_sweep_{job_id}"):
                     # Persist deep link + selection so Sweeps tab focuses the target row even if a prior selection exists
                     sweep_id_str = str(sweep_id).strip()
                     st.session_state["deep_link_sweep_id"] = sweep_id_str
@@ -17852,9 +17955,9 @@ def main() -> None:
                     _update_query_params(page="Sweeps", sweep_id=sweep_id_str, run_id=None, view=None, bot_id=None)
                     st.rerun()
             else:
-                cols[7].write("")
+                cols[9].write("")
             if run_id is not None:
-                if cols[8].button("Open run", key=f"open_run_{job_id}"):
+                if cols[10].button("Open run", key=f"open_run_{job_id}"):
                     # Persist deep link + selection so Results tab focuses the target row even if a prior selection exists
                     try:
                         run_id_int = int(run_id)
@@ -17869,10 +17972,10 @@ def main() -> None:
                     _update_query_params(page="Results", run_id=run_id, sweep_id=None, view=None, bot_id=None)
                     st.rerun()
             else:
-                cols[8].write("")
+                cols[10].write("")
 
             if bot_id is not None:
-                if cols[9].button("Open bot", key=f"open_bot_{job_id}"):
+                if cols[11].button("Open bot", key=f"open_bot_{job_id}"):
                     try:
                         bot_id_int = int(bot_id)
                     except (TypeError, ValueError):
@@ -17881,16 +17984,16 @@ def main() -> None:
                     _set_selected_bot(bot_id_int)
                     st.rerun()
             else:
-                cols[9].write("")
+                cols[11].write("")
 
             if allow_cancel and status in {"queued", "running", "cancel_requested"}:
-                if cols[10].button("Cancel", key=f"cancel_job_{job_id}"):
+                if cols[12].button("Cancel", key=f"cancel_job_{job_id}"):
                     with _job_conn() as conn:
                         request_cancel_job(conn, int(job_id))
                     st.info(f"Cancel requested for job #{job_id}")
                     st.rerun()
             else:
-                cols[10].write("")
+                cols[12].write("")
 
         def _render_jobs_once() -> None:
             with _job_conn() as conn:
@@ -17912,9 +18015,6 @@ def main() -> None:
                             d["run_id"] = str(d["run_id"])
                         out.append(d)
                     return out
-
-                if conn.row_factory is None:
-                    conn.row_factory = sqlite3.Row
 
                 active_statuses = ("queued", "running", "cancel_requested")
                 active_rows = conn.execute(
@@ -18198,6 +18298,192 @@ def main() -> None:
                 st.rerun()
 
             st.markdown("---")
+            st.markdown("## Data Retention")
+            st.caption("Safely reclaim DB space by clearing large artifacts or deleting low-performing runs.")
+
+            # Preload sweeps list for optional filtering (lightweight columns only)
+            sweep_rows = []
+            try:
+                sweep_rows = conn.execute(
+                    "SELECT id, name FROM sweeps ORDER BY created_at DESC LIMIT 200"
+                ).fetchall()
+                sweep_rows = [dict(r) for r in sweep_rows or []]
+            except Exception:
+                sweep_rows = []
+            sweep_options = []
+            sweep_id_by_label: Dict[str, str] = {}
+            for s in sweep_rows or []:
+                sid = str(s.get("id") or "").strip()
+                name = str(s.get("name") or "").strip()
+                if not sid:
+                    continue
+                label = f"{sid} · {name}" if name else sid
+                sweep_options.append(label)
+                sweep_id_by_label[label] = sid
+
+            with st.container(border=True):
+                st.markdown("### Delete detailed backtest data (keep basics)")
+                col_a, col_b = st.columns([1, 2])
+                with col_a:
+                    days_details = st.number_input(
+                        "Older than (days)",
+                        min_value=0,
+                        step=1,
+                        value=int(st.session_state.get("retention_details_days", 7)),
+                        key="retention_details_days",
+                    )
+                with col_b:
+                    selected_sweeps = st.multiselect(
+                        "Restrict to sweeps (optional)",
+                        options=sweep_options,
+                        key="retention_details_sweeps",
+                    )
+                selected_sweep_ids = [sweep_id_by_label.get(x) for x in selected_sweeps if sweep_id_by_label.get(x)]
+
+                preview_key = "retention_details_preview_count"
+                refresh_preview = st.button(
+                    "Refresh preview",
+                    key="retention_details_preview_btn",
+                )
+                if refresh_preview:
+                    try:
+                        st.session_state[preview_key] = count_runs_matching_filters(
+                            older_than_days=int(days_details),
+                            sweep_ids=selected_sweep_ids,
+                            conn=conn,
+                        )
+                    except Exception:
+                        st.session_state[preview_key] = 0
+                preview_count = st.session_state.get(preview_key)
+                if preview_count is None:
+                    st.caption("Runs affected: — (click Refresh preview)")
+                else:
+                    st.caption(f"Runs affected: {int(preview_count)}")
+
+                confirm_details = st.text_input(
+                    "Type DELETE DETAILS to confirm",
+                    value="",
+                    key="retention_confirm_details",
+                )
+                if st.button(
+                    "Delete detailed data",
+                    type="primary",
+                    disabled=(confirm_details.strip() != "DELETE DETAILS"),
+                    key="retention_delete_details_btn",
+                ):
+                    try:
+                        res = clear_run_details_payloads(
+                            older_than_days=int(days_details),
+                            sweep_ids=selected_sweep_ids,
+                        )
+                        st.success(
+                            f"Cleared details for {int(res.get('details_updated') or 0)} run(s)."
+                        )
+                    except Exception as exc:
+                        st.error(f"Retention failed: {exc}")
+
+            with st.container(border=True):
+                st.markdown("### Delete low-profit runs")
+                r1, r2, r3 = st.columns([1, 1, 1])
+                with r1:
+                    profit_threshold = st.number_input(
+                        "Profit threshold (USD)",
+                        value=float(st.session_state.get("retention_profit_threshold", 0.0)),
+                        step=1.0,
+                        key="retention_profit_threshold",
+                    )
+                with r2:
+                    days_low_profit = st.number_input(
+                        "Older than (days)",
+                        min_value=0,
+                        step=1,
+                        value=int(st.session_state.get("retention_lowprofit_days", 14)),
+                        key="retention_lowprofit_days",
+                    )
+                with r3:
+                    only_completed = st.toggle(
+                        "Only completed runs",
+                        value=bool(st.session_state.get("retention_only_completed", True)),
+                        key="retention_only_completed",
+                    )
+
+                roi_enabled = st.toggle(
+                    "Apply ROI threshold",
+                    value=bool(st.session_state.get("retention_roi_enabled", False)),
+                    key="retention_roi_enabled",
+                )
+                roi_threshold = None
+                if roi_enabled:
+                    roi_threshold = st.number_input(
+                        "ROI threshold (%)",
+                        value=float(st.session_state.get("retention_roi_threshold", 0.0)),
+                        step=0.5,
+                        key="retention_roi_threshold",
+                    )
+
+                selected_sweeps_low = st.multiselect(
+                    "Restrict to sweeps (optional)",
+                    options=sweep_options,
+                    key="retention_lowprofit_sweeps",
+                )
+                selected_sweep_ids_low = [
+                    sweep_id_by_label.get(x) for x in selected_sweeps_low if sweep_id_by_label.get(x)
+                ]
+
+                preview_key_low = "retention_lowprofit_preview_count"
+                refresh_preview_low = st.button(
+                    "Refresh preview",
+                    key="retention_lowprofit_preview_btn",
+                )
+                if refresh_preview_low:
+                    try:
+                        st.session_state[preview_key_low] = count_runs_matching_filters(
+                            older_than_days=int(days_low_profit),
+                            sweep_ids=selected_sweep_ids_low,
+                            max_profit=float(profit_threshold),
+                            roi_threshold_pct=(float(roi_threshold) if roi_threshold is not None else None),
+                            only_completed=bool(only_completed),
+                            conn=conn,
+                        )
+                    except Exception:
+                        st.session_state[preview_key_low] = 0
+                preview_low = st.session_state.get(preview_key_low)
+                if preview_low is None:
+                    st.caption("Runs to delete: — (click Refresh preview)")
+                else:
+                    st.caption(f"Runs to delete: {int(preview_low)}")
+
+                confirm_runs = st.text_input(
+                    "Type DELETE RUNS to confirm",
+                    value="",
+                    key="retention_confirm_runs",
+                )
+                if st.button(
+                    "Delete low-profit runs",
+                    type="primary",
+                    disabled=(confirm_runs.strip() != "DELETE RUNS"),
+                    key="retention_delete_runs_btn",
+                ):
+                    try:
+                        res = delete_runs_and_children(
+                            older_than_days=int(days_low_profit),
+                            sweep_ids=selected_sweep_ids_low,
+                            max_profit=float(profit_threshold),
+                            roi_threshold_pct=(float(roi_threshold) if roi_threshold is not None else None),
+                            only_completed=bool(only_completed),
+                            batch_size=500,
+                        )
+                        st.success(
+                            "Deleted runs. "
+                            f"runs={int(res.get('runs_deleted') or 0)}, "
+                            f"details={int(res.get('details_deleted') or 0)}, "
+                            f"shortlists={int(res.get('shortlists_deleted') or 0)}, "
+                            f"bot_map={int(res.get('bot_run_map_deleted') or 0)}"
+                        )
+                    except Exception as exc:
+                        st.error(f"Delete failed: {exc}")
+
+            st.markdown("---")
             st.markdown("## Assets")
             st.caption("Manage symbols and user-defined categories for multi-asset sweeps.")
 
@@ -18436,7 +18722,7 @@ def main() -> None:
                             st.error(f"Seed failed: {exc}")
 
     _render_perf_panel()
-    st.caption(f"Storage file: {db_path}")
+    st.caption(f"Storage: {db_path}")
 
 
 if __name__ == "__main__":

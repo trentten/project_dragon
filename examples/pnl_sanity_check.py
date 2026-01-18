@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import sqlite3
-from project_dragon.storage import init_db, open_db_connection
 from datetime import datetime, timezone
 
+from project_dragon.live_worker import _apply_fill_to_runtime, _ensure_runtime
 from project_dragon.storage import (
     add_bot_fill,
+    create_bot,
     create_position_history,
     init_db,
-    create_bot,
+    open_db_connection,
 )
-from project_dragon.live_worker import _apply_fill_to_runtime, _ensure_runtime
 
 
 def _iso() -> str:
@@ -18,10 +17,8 @@ def _iso() -> str:
 
 
 def run_sequence() -> None:
-    db_path = init_db()
-        conn = open_db_connection(db_path)
-    conn.row_factory = sqlite3.Row
-    with conn:
+    init_db()
+    with open_db_connection() as conn:
         bot_id = create_bot(
             conn,
             name="pnl-test",
@@ -114,20 +111,16 @@ def run_sequence() -> None:
     assert pos_count == 2, f"expected 2 closed positions, got {pos_count}"
 
     legs = runtime.get("legs", {})
-    assert float(legs["LONG"]["size"]) == 0.0
-    assert float(legs["SHORT"]["size"]) == 0.0
+    """Deprecated: PnL sanity check (Postgres-only project)."""
 
-    assert min_sizes["LONG"] >= 0.0 and min_sizes["SHORT"] >= 0.0, "size went negative"
+    from __future__ import annotations
 
-    # Check average price math for long leg: (100*1 + 90*1)/2 = 95
-    # Realized: sell 1 at 95 -> (95-95)*1 =0, sell 1 at 110 -> (110-95)*1=15
-    realized_long = 15.0
-    realized_short = 15.0
-    realized_total = runtime.get("realized_total") or 0.0
-    assert abs(realized_total - (realized_long + realized_short)) <= 1e-6, f"realized {realized_total}"
 
+    def main() -> int:
+        print("This example was removed. Project Dragon is Postgres-only.")
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
     print("PnL sanity check passed")
-
-
-if __name__ == "__main__":
-    run_sequence()

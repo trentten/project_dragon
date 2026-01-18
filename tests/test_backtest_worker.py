@@ -71,7 +71,7 @@ def _create_toy_sweep(*, name: str = "toy sweep") -> str:
 
 
 def test_bulk_enqueue_idempotent(tmp_path):
-    db_path = tmp_path / "idempotent.sqlite"
+    db_path = tmp_path / "idempotent.db"
     init_db(db_path)
 
     jobs = []
@@ -94,7 +94,7 @@ def test_bulk_enqueue_idempotent(tmp_path):
 
 
 def test_lease_reclaim_for_backtest_job(tmp_path):
-    db_path = tmp_path / "lease_backtest.sqlite"
+    db_path = tmp_path / "lease_backtest.db"
     init_db(db_path)
 
     with open_db_connection(db_path) as conn:
@@ -104,7 +104,7 @@ def test_lease_reclaim_for_backtest_job(tmp_path):
         job_id = int(job["id"])
 
         # Force expiry.
-        conn.execute("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        conn.execute("UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = %s", (job_id,))
         conn.commit()
 
         ok = reclaim_stale_job(conn, job_id=job_id, new_worker_id="w2", lease_s=30)
@@ -115,7 +115,7 @@ def test_lease_reclaim_for_backtest_job(tmp_path):
 
 
 def test_worker_executes_synthetic_backtest(tmp_path, monkeypatch):
-    db_path = tmp_path / "worker_run.sqlite"
+    db_path = tmp_path / "worker_run.db"
     init_db(db_path)
 
     # Point worker at temp db.
@@ -158,7 +158,7 @@ def test_worker_executes_synthetic_backtest(tmp_path, monkeypatch):
     assert int(n) == 1
 
     with open_db_connection(db_path) as conn:
-        row = conn.execute("SELECT status, run_id FROM jobs WHERE job_key = ?", (job_key,)).fetchone()
+        row = conn.execute("SELECT status, run_id FROM jobs WHERE job_key = %s", (job_key,)).fetchone()
         assert row is not None
         assert str(row[0]) == "done"
         job_run_id = str(row[1])
@@ -167,7 +167,7 @@ def test_worker_executes_synthetic_backtest(tmp_path, monkeypatch):
         # Exactly-once persistence by run_key.
         # Use details-table metadata_json for run_key lookup.
         run_row = conn.execute(
-            "SELECT run_id FROM backtest_run_details WHERE json_extract(metadata_json,'$.run_key') = ?",
+            "SELECT run_id FROM backtest_run_details WHERE metadata_json::json->>'run_key' = %s",
             (run_key,),
         ).fetchall()
         assert len(run_row) == 1
@@ -186,7 +186,7 @@ def test_worker_executes_synthetic_backtest(tmp_path, monkeypatch):
                 started_at = NULL,
                 finished_at = NULL,
                 error_text = ''
-            WHERE job_key = ?
+            WHERE job_key = %s
             """,
             (job_key,),
         )
@@ -198,14 +198,14 @@ def test_worker_executes_synthetic_backtest(tmp_path, monkeypatch):
     with open_db_connection(db_path) as conn:
         # Still only one run row for this combo.
         run_row2 = conn.execute(
-            "SELECT COUNT(*) FROM backtest_run_details WHERE json_extract(metadata_json,'$.run_key') = ?",
+            "SELECT COUNT(*) FROM backtest_run_details WHERE metadata_json::json->>'run_key' = %s",
             (run_key,),
         ).fetchone()
         assert int(run_row2[0]) == 1
 
 
 def test_sweep_parent_plans_children_idempotent(tmp_path, monkeypatch):
-    db_path = tmp_path / "sweep_parent.sqlite"
+    db_path = tmp_path / "sweep_parent.db"
     init_db(db_path)
 
     # Point worker at temp db.
@@ -274,17 +274,17 @@ def test_sweep_parent_plans_children_idempotent(tmp_path, monkeypatch):
     assert int(n) == 1
 
     with open_db_connection(db_path) as conn:
-        parent_row = conn.execute("SELECT id, status FROM jobs WHERE job_key = ?", (parent_job_key,)).fetchone()
+        parent_row = conn.execute("SELECT id, status FROM jobs WHERE job_key = %s", (parent_job_key,)).fetchone()
         assert parent_row is not None
         assert int(parent_row[0]) == int(parent_job_id)
         assert str(parent_row[1]) == "done"
 
         # Two child combos; linked to parent_job_id.
-        c = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = ?",
+        c0 = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = %s",
             (int(parent_job_id),),
         ).fetchone()
-        assert int(c[0]) == 2
+        assert int(c0[0]) == 2
 
         # Requeue the parent and rerun planning: should not duplicate children.
         conn.execute(
@@ -299,7 +299,7 @@ def test_sweep_parent_plans_children_idempotent(tmp_path, monkeypatch):
                 started_at = NULL,
                 finished_at = NULL,
                 error_text = ''
-            WHERE job_key = ?
+            WHERE job_key = %s
             """,
             (parent_job_key,),
         )
@@ -309,15 +309,15 @@ def test_sweep_parent_plans_children_idempotent(tmp_path, monkeypatch):
     assert int(n2) == 1
 
     with open_db_connection(db_path) as conn:
-        c2 = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = ?",
+        c = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = %s",
             (int(parent_job_id),),
         ).fetchone()
-        assert int(c2[0]) == 2
+        assert int(c[0]) == 2
 
 
 def test_pause_blocks_claiming_children_and_resume_unblocks(tmp_path, monkeypatch):
-    db_path = tmp_path / "sweep_pause_claim.sqlite"
+    db_path = tmp_path / "sweep_pause_claim.db"
     init_db(db_path)
 
     # Point worker at temp db.
@@ -348,7 +348,7 @@ def test_pause_blocks_claiming_children_and_resume_unblocks(tmp_path, monkeypatc
 
 
 def test_cancel_marks_queued_children_cancelled_and_blocks_claiming(tmp_path, monkeypatch):
-    db_path = tmp_path / "sweep_cancel.sqlite"
+    db_path = tmp_path / "sweep_cancel.db"
     init_db(db_path)
 
     # Point worker at temp db.
@@ -369,7 +369,7 @@ def test_cancel_marks_queued_children_cancelled_and_blocks_claiming(tmp_path, mo
         set_job_cancel_requested(conn, int(parent_job_id), True)
 
         cancelled = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = ? AND status = 'cancelled'",
+            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = %s AND status = 'cancelled'",
             (int(parent_job_id),),
         ).fetchone()
         assert int(cancelled[0]) == 2
@@ -380,7 +380,7 @@ def test_cancel_marks_queued_children_cancelled_and_blocks_claiming(tmp_path, mo
 
 
 def test_pause_then_resume_allows_planning_without_duplicates(tmp_path, monkeypatch):
-    db_path = tmp_path / "sweep_pause_resume_plan.sqlite"
+    db_path = tmp_path / "sweep_pause_resume_plan.db"
     init_db(db_path)
 
     # Point worker at temp db.
@@ -399,7 +399,7 @@ def test_pause_then_resume_allows_planning_without_duplicates(tmp_path, monkeypa
 
     with open_db_connection(db_path) as conn:
         c0 = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = ?",
+            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = %s",
             (int(parent_job_id),),
         ).fetchone()
         assert int(c0[0]) == 0
@@ -412,7 +412,7 @@ def test_pause_then_resume_allows_planning_without_duplicates(tmp_path, monkeypa
 
     with open_db_connection(db_path) as conn:
         c1 = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = ?",
+            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = %s",
             (int(parent_job_id),),
         ).fetchone()
         assert int(c1[0]) == 2
@@ -430,7 +430,7 @@ def test_pause_then_resume_allows_planning_without_duplicates(tmp_path, monkeypa
                 started_at = NULL,
                 finished_at = NULL,
                 error_text = ''
-            WHERE id = ?
+            WHERE id = %s
             """,
             (int(parent_job_id),),
         )
@@ -441,7 +441,7 @@ def test_pause_then_resume_allows_planning_without_duplicates(tmp_path, monkeypa
 
     with open_db_connection(db_path) as conn:
         c2 = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = ?",
+            "SELECT COUNT(*) FROM jobs WHERE job_type='backtest_run' AND parent_job_id = %s",
             (int(parent_job_id),),
         ).fetchone()
         assert int(c2[0]) == 2

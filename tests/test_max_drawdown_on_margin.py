@@ -15,9 +15,8 @@ class _FakeResult:
     end_time: Any = None
 
 
-def test_save_backtest_run_sets_max_drawdown_from_equity_curve(tmp_path) -> None:
-    db_path = tmp_path / "test_dd_margin.sqlite"
-    init_db(db_path)
+def test_save_backtest_run_sets_max_drawdown_from_equity_curve() -> None:
+    init_db()
 
     # Equity curve (mark-to-market account equity).
     equity_curve = [1000.0, 900.0, 1100.0, 800.0]
@@ -54,9 +53,9 @@ def test_save_backtest_run_sets_max_drawdown_from_equity_curve(tmp_path) -> None
         result=fake_result,
     )
 
-    with open_db_connection(db_path) as conn:
+    with open_db_connection() as conn:
         row = conn.execute(
-            "SELECT max_drawdown_pct FROM backtest_runs WHERE id = ?",
+            "SELECT max_drawdown_pct FROM backtest_runs WHERE id = %s",
             (run_id,),
         ).fetchone()
         assert row is not None

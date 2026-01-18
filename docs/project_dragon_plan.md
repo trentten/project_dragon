@@ -48,13 +48,13 @@ Today we’re **WooX Perps-focused**, but the design is intentionally extensible
 3) Better “Create bot from run” flow (templates + defaults).
 
 **Phase 3 — Scaling + deployment**
-1) Move from SQLite → Postgres when we have real multi-user / multi-worker needs.
+1) Harden Postgres operations for multi-user / multi-worker needs.
 2) Run Streamlit behind a reverse proxy (auth → header identity).
 3) Container deployment (worker + UI) with secrets management.
 
 ### Architecture overview
 **Components**
-- `storage.py`: SQLite schema + CRUD + migrations
+- `storage.py`: Postgres schema + CRUD + migrations
 - `streamlit_app.py`: UI (Backtest/Results/Sweeps/Live/Tools)
 - `live_worker.py`: claims jobs, runs bots, writes heartbeats/events/ledger
 - `woox_client.py` / `woox_broker.py`: exchange adapter + reconciliation
@@ -215,7 +215,7 @@ DragonAlgoConfig(
 
 ✅ Implemented in code (Streamlit UI + storage + worker):
 
-- `bots`, `bot_run_map`, `bot_events` tables (SQLite) + CRUD helpers.
+- `bots`, `bot_run_map`, `bot_events` tables (Postgres) + CRUD helpers.
 - `jobs` now has `bot_id`, `updated_at`, `worker_id` (for locking) + indexes.
 - Streamlit **Live Bots** tab:
   - Create bot from a `run_id` (loads config snapshot, allows edits, creates bot + job + links to run).
@@ -405,7 +405,7 @@ To display realized/unrealized PnL cleanly:
 
 ✅ Implemented (Streamlit + DB + worker):
 
-- **Encrypted exchange credentials** stored in SQLite per-user (Fernet).
+- **Encrypted exchange credentials** stored in Postgres per-user (Fernet).
 - **Env-only master key**: `DRAGON_MASTER_KEY` must be a valid Fernet key.
 - **Identity scoping**:
   - Reads user identity from a reverse-proxy header (default `X-Forwarded-User`, configurable via `DRAGON_AUTH_HEADER`).
@@ -605,7 +605,7 @@ To display realized/unrealized PnL cleanly:
 ### Multi-user hardening (future)
 
 - Put Streamlit behind a reverse proxy (Caddy/Nginx/Traefik) providing auth headers.
-- Move from SQLite → Postgres when multiple workers/users become real.
+- Continue hardening Postgres when multiple workers/users become real.
 
 ---
 

@@ -3,9 +3,8 @@ from __future__ import annotations
 from project_dragon.storage import dedupe_sweep_runs, init_db, open_db_connection, save_backtest_run
 
 
-def test_dedupe_sweep_runs_removes_config_duplicates(tmp_path):
-    db_path = tmp_path / "dedupe.sqlite"
-    init_db(db_path)
+def test_dedupe_sweep_runs_removes_config_duplicates():
+    init_db()
 
     sweep_id = "sweep_1"
 
@@ -42,8 +41,8 @@ def test_dedupe_sweep_runs_removes_config_duplicates(tmp_path):
     assert int(dd.get("total") or 0) == 2
     assert int(dd.get("removed") or 0) == 1
 
-    with open_db_connection(db_path) as conn:
-        row = conn.execute("SELECT COUNT(1) FROM backtest_runs WHERE sweep_id = ?", (sweep_id,)).fetchone()
+    with open_db_connection() as conn:
+        row = conn.execute("SELECT COUNT(1) FROM backtest_runs WHERE sweep_id = %s", (sweep_id,)).fetchone()
         assert int(row[0]) == 1
         row = conn.execute(
             "SELECT COUNT(1) FROM backtest_run_details WHERE run_id IN ('r1','r2')"
@@ -51,9 +50,8 @@ def test_dedupe_sweep_runs_removes_config_duplicates(tmp_path):
         assert int(row[0]) == 1
 
 
-def test_dedupe_sweep_runs_does_not_cross_symbols(tmp_path):
-    db_path = tmp_path / "dedupe_syms.sqlite"
-    init_db(db_path)
+def test_dedupe_sweep_runs_does_not_cross_symbols():
+    init_db()
 
     sweep_id = "sweep_syms"
 
@@ -77,9 +75,8 @@ def test_dedupe_sweep_runs_does_not_cross_symbols(tmp_path):
     assert int(dd.get("removed") or 0) == 0
 
 
-def test_dedupe_sweep_runs_prefers_bot_mapped_run(tmp_path):
-    db_path = tmp_path / "dedupe_botmap.sqlite"
-    init_db(db_path)
+def test_dedupe_sweep_runs_prefers_bot_mapped_run():
+    init_db()
 
     sweep_id = "sweep_botmap"
 
@@ -112,17 +109,23 @@ def test_dedupe_sweep_runs_prefers_bot_mapped_run(tmp_path):
     )
 
     # Create a bot and map it to r2, so r2 should be the survivor.
-    with open_db_connection(db_path) as conn:
+    with open_db_connection() as conn:
         conn.execute(
             """
             INSERT INTO bots(name, exchange_id, symbol, timeframe, status, desired_status, config_json, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             ("b1", "binance", "BTC/USDT", "1h", "paused", "paused", "{}", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"),
         )
         bot_id = int(conn.execute("SELECT id FROM bots ORDER BY id DESC LIMIT 1").fetchone()[0])
         conn.execute(
-            "INSERT OR REPLACE INTO bot_run_map(bot_id, run_id, created_at) VALUES(?, ?, ?)",
+            """
+            INSERT INTO bot_run_map(bot_id, run_id, created_at)
+            VALUES(%s, %s, %s)
+            ON CONFLICT (bot_id) DO UPDATE SET
+                run_id = EXCLUDED.run_id,
+                created_at = EXCLUDED.created_at
+            """,
             (bot_id, "r2", "2025-01-01T00:00:00Z"),
         )
         conn.commit()
@@ -131,9 +134,9 @@ def test_dedupe_sweep_runs_prefers_bot_mapped_run(tmp_path):
     assert int(dd.get("total") or 0) == 2
     assert int(dd.get("removed") or 0) == 1
 
-    with open_db_connection(db_path) as conn:
+    with open_db_connection() as conn:
         row = conn.execute(
-            "SELECT id FROM backtest_runs WHERE sweep_id = ? ORDER BY created_at ASC LIMIT 1",
+            "SELECT id FROM backtest_runs WHERE sweep_id = %s ORDER BY created_at ASC LIMIT 1",
             (sweep_id,),
         ).fetchone()
         assert row and str(row[0]) == "r2"

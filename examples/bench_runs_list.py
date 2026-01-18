@@ -7,7 +7,7 @@ Creates N synthetic runs with realistic JSON blob sizes, then measures:
 Usage:
   PYTHONPATH=src python examples/bench_runs_list.py --reset --n 10000
 
-By default writes to: data/bench_runs_list.sqlite
+Uses DRAGON_DATABASE_URL for Postgres.
 """
 
 from __future__ import annotations
@@ -144,8 +144,6 @@ def _timeit(fn, *, iters: int = 1) -> float:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Benchmark run list/detail performance")
-    p.add_argument("--db", default=str(ROOT / "data" / "bench_runs_list.sqlite"))
-    p.add_argument("--reset", action="store_true", help="Delete the DB file before running")
     p.add_argument("--n", type=int, default=10_000)
     p.add_argument("--config-kb", type=int, default=10)
     p.add_argument("--metrics-kb", type=int, default=5)
@@ -158,12 +156,8 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    db_path = Path(args.db)
-    if args.reset and db_path.exists():
-        db_path.unlink()
-
-    # Open via factory (applies pragmas) and ensure migrations.
-    with open_db_connection(db_path) as conn:
+    # Open via factory and ensure migrations.
+    with open_db_connection() as conn:
         apply_migrations(conn)
 
         runs_count = conn.execute("SELECT COUNT(1) FROM backtest_runs").fetchone()[0]

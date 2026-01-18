@@ -69,8 +69,7 @@ from project_dragon.storage import (
     upsert_account_snapshot,
 )
 from project_dragon.strategy_dragon import DragonDcaAtrStrategy
-from project_dragon.storage import _db_path, init_db  # type: ignore
-import sqlite3
+from project_dragon.storage import init_db  # type: ignore
 
 from project_dragon.crypto import CryptoConfigError, decrypt_str
 from project_dragon.api_resilience import CircuitOpenError, RateLimitTimeout, CircuitState, cooldown_remaining_s, get_state
@@ -134,7 +133,7 @@ def _parse_iso_utc(s: Any) -> Optional[datetime]:
 
 def _maybe_renew_job_lease(
     *,
-    conn: sqlite3.Connection,
+    conn: Any,
     job: Dict[str, Any],
     worker_id: str,
     lease_s: float,
@@ -237,7 +236,7 @@ class ExchangeDegradedBlocked(Exception):
 
 @dataclass
 class TradingGuardContext:
-    conn: sqlite3.Connection
+    conn: Any
     emit_fn: Callable[[str, str, str, Dict[str, Any]], None]
     bot_row: Dict[str, Any]
     job_row: Dict[str, Any]
@@ -1026,7 +1025,7 @@ def _park_active_dynamic_order(
 
 def _apply_dynamic_order_intents(
     *,
-    conn: sqlite3.Connection,
+    conn: Any,
     broker: WooXBroker,
     intents: List[Dict[str, Any]],
     ref_price: float,
@@ -1468,8 +1467,8 @@ def reconcile_pnl(ledger_totals: Dict[str, float], positions_norm: Dict[str, Any
     }
 
 
-def _get_conn() -> sqlite3.Connection:
-    return open_db_connection(_db_path)
+def _get_conn() -> Any:
+    return open_db_connection()
 
 
 def _safe_order_style(value: Any, default: OrderStyle = OrderStyle.MARKET) -> OrderStyle:
@@ -1973,7 +1972,7 @@ def _load_config(bot_row: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _save_bot_config(conn: sqlite3.Connection, bot_id: int, config_dict: Dict[str, Any]) -> None:
+def _save_bot_config(conn: Any, bot_id: int, config_dict: Dict[str, Any]) -> None:
     update_bot(conn, bot_id, config_json=json.dumps(config_dict))
 
 
@@ -2065,7 +2064,7 @@ def _to_ms(dt: datetime) -> int:
 
 @dataclass
 class BotTickContext:
-    conn: sqlite3.Connection
+    conn: Any
     bot: Dict[str, Any]
     job: Dict[str, Any]
     bot_id: int
@@ -2096,7 +2095,7 @@ def get_latest_closed_bar_ts_ms(exchange_id: str, symbol: str, timeframe: str) -
 
 
 def _account_entry_block_status(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     bot_row: Dict[str, Any],
     account_row: Optional[Dict[str, Any]],
@@ -2645,7 +2644,7 @@ def fast_tick(ctx: BotTickContext, broker: WooXBroker, now: datetime) -> None:
         if _should_write(_BOT_SNAPSHOT_CACHE, int(ctx.bot_id), bot_snap):
             try:
                 upsert_bot_snapshot(ctx.conn, bot_snap)
-            except sqlite3.OperationalError as exc:
+            except Exception as exc:
                 msg = str(exc).lower()
                 if "locked" in msg or "busy" in msg:
                     try:
@@ -2681,7 +2680,7 @@ def fast_tick(ctx: BotTickContext, broker: WooXBroker, now: datetime) -> None:
             if _should_write(_ACCOUNT_SNAPSHOT_CACHE, int(acct_id), acct_snap):
                 try:
                     upsert_account_snapshot(ctx.conn, acct_snap)
-                except sqlite3.OperationalError as exc:
+                except Exception as exc:
                     msg = str(exc).lower()
                     if "locked" in msg or "busy" in msg:
                         try:
@@ -2843,7 +2842,7 @@ def bar_tick(ctx: BotTickContext, broker: WooXBroker, bar: Candle) -> None:
     _GUARD_CTX.reset(token)
 
 
-def _process_job(conn: sqlite3.Connection, job: Dict[str, Any], *, dry_run: bool, worker_id: str) -> None:
+def _process_job(conn: Any, job: Dict[str, Any], *, dry_run: bool, worker_id: str) -> None:
     bot_id = job.get("bot_id")
     if bot_id is None:
         update_job(conn, job.get("id"), status="error", error_text="live_bot job missing bot_id", finished_at=_now_iso())
@@ -4208,7 +4207,7 @@ def _poll_once(worker_id: str, *, dry_run: bool) -> None:
             if live_trading_enabled:
                 try:
                     if conn.row_factory is None:
-                        conn.row_factory = sqlite3.Row
+                        pass
                     stale_row = conn.execute(
                         """
                         SELECT *
@@ -4298,7 +4297,7 @@ def _poll_once(worker_id: str, *, dry_run: bool) -> None:
 
             try:
                 if conn.row_factory is None:
-                    conn.row_factory = sqlite3.Row
+                    pass
                 owned_rows = conn.execute(
                     """
                     SELECT *
@@ -4355,7 +4354,7 @@ def main() -> None:
     args = parser.parse_args()
 
     worker_id = f"worker-{socket.gethostname()}-{os.getpid()}"
-    logger.info("Starting Dragon live worker (dry_run=%s) worker_id=%s DB=%s", args.dry_run, worker_id, _db_path)
+    logger.info("Starting Dragon live worker (dry_run=%s) worker_id=%s", args.dry_run, worker_id)
     try:
         while True:
             _poll_once(worker_id, dry_run=args.dry_run)

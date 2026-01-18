@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import time
 import json
 import math
 import mimetypes
 import os
 import re
-import sqlite3
 import threading
 import requests
 import uuid
@@ -15,20 +15,53 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Tuple, Union, Iterator
 from uuid import uuid4
 
 from project_dragon.observability import profile_span
 
+try:
+    import psycopg  # type: ignore
+except Exception:  # optional dependency
+    psycopg = None
+
+try:
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+    psycopg2_extras = psycopg2.extras
+except Exception:  # optional dependency
+    psycopg2 = None
+    psycopg2_extras = None
+
+_DB_OPERATIONAL_ERRORS: tuple[type[BaseException], ...] = tuple(
+    err
+    for err in (
+        getattr(psycopg, "OperationalError", None),
+        getattr(psycopg2, "OperationalError", None),
+    )
+    if err is not None
+ ) or (Exception,)
+_DB_INTEGRITY_ERRORS: tuple[type[BaseException], ...] = tuple(
+    err
+    for err in (
+        getattr(psycopg, "IntegrityError", None),
+        getattr(psycopg2, "IntegrityError", None),
+    )
+    if err is not None
+) or (Exception,)
+
+
+class DbErrors:
+    OperationalError = _DB_OPERATIONAL_ERRORS
+    IntegrityError = _DB_INTEGRITY_ERRORS
+
 if TYPE_CHECKING:
     from project_dragon.domain import BacktestResult, Candle
 
-_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "backtests.sqlite"
-_db_path = _DB_PATH
-
 _DB_INIT_LOCK = threading.Lock()
-_DB_INITIALIZED_FOR: Optional[Path] = None
+_DB_INITIALIZED_FOR: Optional[str] = None
 _DB_INITIALIZED_VERSION: Optional[int] = None
 
 
@@ -38,10 +71,343 @@ DEFAULT_USER_EMAIL = "admin@local"
 _UNSET: object = object()
 
 
-SQLITE_BUSY_TIMEOUT_MS = 5000
+def get_database_url() -> Optional[str]:
+    raw = (os.getenv("DRAGON_DATABASE_URL") or "").strip()
+    return raw or None
 
 
-def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
+def is_postgres_dsn(dsn: Optional[str]) -> bool:
+    if not dsn:
+        return False
+    return dsn.startswith("postgres://") or dsn.startswith("postgresql://")
+
+
+class PostgresConnectionAdapter:
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self._is_postgres = True
+
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None):
+        cur = self._conn.cursor()
+        cur.execute(sql, params or None)
+        return cur
+
+    def executemany(self, sql: str, seq_params: Sequence[Sequence[Any]]):
+        cur = self._conn.cursor()
+        cur.executemany(sql, seq_params)
+        return cur
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.rollback()
+        else:
+            try:
+                self.commit()
+            except Exception:
+                pass
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class PostgresConnectionAdapterV3:
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self._is_postgres = True
+
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None):
+        cur = self._conn.cursor()
+        cur.execute(sql, params or None)
+        return cur
+
+    def executemany(self, sql: str, seq_params: Sequence[Sequence[Any]]):
+        cur = self._conn.cursor()
+        cur.executemany(sql, seq_params)
+        return cur
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.rollback()
+        else:
+            try:
+                self.commit()
+            except Exception:
+                pass
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def is_postgres(conn: Any) -> bool:
+    if conn is None:
+        return False
+    return bool(getattr(conn, "_is_postgres", False))
+
+
+def _row_to_dict(cursor: Any, row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    if isinstance(row, Mapping):
+        return dict(row)
+    try:
+        desc = cursor.description or []
+    except Exception:
+        desc = []
+    if not desc:
+        return {"value": row}
+    keys = [d[0] for d in desc]
+    if isinstance(row, (list, tuple)):
+        return {k: row[idx] if idx < len(row) else None for idx, k in enumerate(keys)}
+    return {keys[0]: row}
+
+
+def fetchone_dict(cursor: Any) -> Optional[Dict[str, Any]]:
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return _row_to_dict(cursor, row)
+
+
+def fetchall_dicts(cursor: Any) -> List[Dict[str, Any]]:
+    rows = cursor.fetchall()
+    if not rows:
+        return []
+    return [_row_to_dict(cursor, row) for row in rows]
+
+
+def execute_fetchone(conn: Any, sql: str, params: Optional[Sequence[Any]] = None) -> Optional[Dict[str, Any]]:
+    cur = db_execute(conn, sql, params)
+    return fetchone_dict(cur)
+
+
+def execute_fetchall(conn: Any, sql: str, params: Optional[Sequence[Any]] = None) -> List[Dict[str, Any]]:
+    cur = db_execute(conn, sql, params)
+    return fetchall_dicts(cur)
+
+
+def open_postgres_connection(dsn: str) -> Any:
+    if psycopg is not None:
+        conn = psycopg.connect(str(dsn))
+        try:
+            conn.autocommit = False
+        except Exception:
+            pass
+        return conn
+    if psycopg2 is not None:
+        conn = psycopg2.connect(str(dsn))
+        try:
+            conn.autocommit = False
+        except Exception:
+            pass
+        return conn
+    raise RuntimeError(
+        "Postgres support requires 'psycopg' (recommended) or 'psycopg2'. Install one of:\n"
+        "pip install psycopg[binary]\n"
+        "pip install psycopg2-binary"
+    )
+
+
+def sql_placeholder(conn: Any) -> str:
+    return "%s"
+
+
+def sql_placeholders(conn: Any, count: int) -> str:
+    total = max(0, int(count))
+    if total <= 0:
+        return ""
+    return ",".join([sql_placeholder(conn)] * total)
+
+
+def db_execute(conn: Any, sql: str, params: Optional[Sequence[Any]] = None):
+    if params is None:
+        return conn.execute(sql)
+    return conn.execute(sql, params)
+
+
+def execute_optional(conn: Any, sql: str, params: Optional[Sequence[Any]] = None) -> None:
+    sp = f"sp_{uuid.uuid4().hex[:8]}"
+    try:
+        conn.execute(f"SAVEPOINT {sp}")
+        if params is None:
+            conn.execute(sql)
+        else:
+            conn.execute(sql, params)
+        conn.execute(f"RELEASE SAVEPOINT {sp}")
+    except Exception:
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            conn.execute(f"RELEASE SAVEPOINT {sp}")
+        except Exception:
+            pass
+
+
+def execute_optional_logged(
+    conn: Any,
+    sql: str,
+    params: Optional[Sequence[Any]] = None,
+    *,
+    label: str,
+) -> None:
+    sp = f"sp_{uuid.uuid4().hex[:8]}"
+    try:
+        conn.execute(f"SAVEPOINT {sp}")
+        if params is None:
+            conn.execute(sql)
+        else:
+            conn.execute(sql, params)
+        conn.execute(f"RELEASE SAVEPOINT {sp}")
+    except Exception as exc:
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            conn.execute(f"RELEASE SAVEPOINT {sp}")
+        except Exception:
+            pass
+        print(f"{label}: {exc}")
+
+
+def get_table_columns(conn: Any, table: str) -> set[str]:
+    table_name = str(table or "").strip()
+    if not table_name:
+        return set()
+    try:
+        rows = conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+            """,
+            (table_name,),
+        ).fetchall()
+        return {str(r[0]) for r in rows or [] if r and r[0] is not None}
+    except Exception:
+        return set()
+
+
+def _table_exists(conn: Any, table: str) -> bool:
+    name = str(table or "").strip()
+    if not name:
+        return False
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = current_schema() AND table_name = %s
+            """,
+            (name,),
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _backfill_jsonb_column(
+    conn: Any,
+    *,
+    table: str,
+    pk: str,
+    text_col: str,
+    jsonb_col: str,
+    batch_size: int = 5000,
+) -> None:
+    tbl = str(table or "").strip()
+    if not tbl:
+        return
+    while True:
+        rows = execute_fetchall(
+            conn,
+            f"""
+            SELECT {pk} AS pk, {text_col} AS txt
+            FROM {tbl}
+            WHERE {jsonb_col} IS NULL
+              AND {text_col} IS NOT NULL
+              AND TRIM({text_col}) != ''
+            LIMIT {int(batch_size)}
+            """,
+        )
+        if not rows:
+            break
+        updates: list[tuple[Any, Any]] = []
+        failures = 0
+        for r in rows:
+            raw = r.get("txt")
+            obj: Any
+            try:
+                obj = json.loads(raw) if isinstance(raw, str) else raw
+                if obj is None:
+                    obj = {}
+            except Exception:
+                obj = {}
+                failures += 1
+            updates.append((to_jsonb(obj), r.get("pk")))
+        conn.executemany(
+            f"UPDATE {tbl} SET {jsonb_col} = %s WHERE {pk} = %s",
+            updates,
+        )
+        if failures:
+            print(f"jsonb_backfill_parse_failed table={tbl} column={jsonb_col} count={failures}")
+
+
+def _auto_pk(conn: Any) -> str:
+    return "SERIAL PRIMARY KEY"
+
+
+def _run_key_expr(conn: Any) -> str:
+    return "metadata_jsonb ->> 'run_key'"
+
+
+def _get_or_create_user_insert_sql(backend: str) -> str:
+    return "INSERT INTO users(id, email, created_at) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING"
+
+
+def insert_ignore(conn: Any, table: str, columns: Sequence[str], values: Sequence[Any]) -> Any:
+    cols_sql = ", ".join(columns)
+    placeholders = sql_placeholders(conn, len(columns))
+    sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+    return conn.execute(sql, tuple(values))
+
+
+def upsert_backtest_run_details(conn: Any, columns: Sequence[str], values: Sequence[Any]) -> Any:
+    cols_sql = ", ".join(columns)
+    placeholders = sql_placeholders(conn, len(columns))
+    update_cols = [c for c in columns if c != "run_id"]
+    updates = ", ".join([f"{c} = EXCLUDED.{c}" for c in update_cols])
+    sql = (
+        f"INSERT INTO backtest_run_details ({cols_sql}) VALUES ({placeholders}) "
+        f"ON CONFLICT (run_id) DO UPDATE SET {updates}"
+    )
+    return conn.execute(sql, tuple(values))
+
+
+def _ensure_schema_migrations(conn: Any) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -53,7 +419,7 @@ def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     )
 
 
-def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
+def _migration_0001_core_schema(conn: Any) -> None:
     """Initial schema + additive upgrades.
 
     This migration is intentionally idempotent (CREATE IF NOT EXISTS + safe ALTERs).
@@ -75,7 +441,7 @@ def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
             end_time TEXT,
             net_profit REAL,
             net_return_pct REAL,
-            max_drawdown_pct REAL,
+            max_drawdown_pct DOUBLE PRECISION,
             sharpe REAL,
             sortino REAL,
             win_rate REAL,
@@ -97,15 +463,15 @@ def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             job_type TEXT NOT NULL,
             job_key TEXT,
             status TEXT NOT NULL,
             payload_json TEXT NOT NULL,
-            sweep_id INTEGER,
-            run_id INTEGER,
+            sweep_id TEXT,
+            run_id TEXT,
             bot_id INTEGER,
             progress REAL DEFAULT 0.0,
             message TEXT DEFAULT '',
@@ -118,9 +484,9 @@ def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             name TEXT,
             exchange_id TEXT,
             symbol TEXT,
@@ -146,6 +512,7 @@ def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_run_map_bot_id_unique ON bot_run_map(bot_id)")
 
     # Ensure additive columns / indices exist.
     _ensure_metadata_column(conn)
@@ -163,13 +530,10 @@ def _migration_0001_core_schema(conn: sqlite3.Connection) -> None:
 
     # Optional multi-user performance index for sweeps list.
     # (Safe even if the column doesn't exist yet; `_ensure_schema` will add it.)
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sweeps_user_created ON sweeps(user_id, created_at)")
-    except sqlite3.OperationalError:
-        pass
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_sweeps_user_created ON sweeps(user_id, created_at)")
 
 
-def _migration_0002_backtest_run_details(conn: sqlite3.Connection) -> None:
+def _migration_0002_backtest_run_details(conn: Any) -> None:
     """Create backtest_run_details table for large JSON blobs."""
 
     # Base table (older DBs may already have this with fewer columns).
@@ -185,113 +549,136 @@ def _migration_0002_backtest_run_details(conn: sqlite3.Connection) -> None:
         """
     )
 
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
-    if "metadata_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}' ")
-        except sqlite3.OperationalError:
-            pass
-    if "created_at" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN created_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "updated_at" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN updated_at TEXT")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "metadata_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}' ",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS metadata_json TEXT NOT NULL DEFAULT '{}'",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "created_at",
+        "ALTER TABLE backtest_run_details ADD COLUMN created_at TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS created_at TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "updated_at",
+        "ALTER TABLE backtest_run_details ADD COLUMN updated_at TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS updated_at TEXT",
+    )
 
     # Chart artifacts (avoid re-running backtests just to render charts)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
-    if "equity_curve_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN equity_curve_json TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "equity_timestamps_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN equity_timestamps_json TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "extra_series_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN extra_series_json TEXT")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "equity_curve_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN equity_curve_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS equity_curve_json TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "equity_timestamps_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN equity_timestamps_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS equity_timestamps_json TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "extra_series_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN extra_series_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS extra_series_json TEXT",
+    )
 
     # Candle + run-context artifacts (render + analysis without network/re-run)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
-    if "candles_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN candles_json TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "params_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN params_json TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "run_context_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN run_context_json TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "computed_metrics_json" not in cols:
-        try:
-            conn.execute("ALTER TABLE backtest_run_details ADD COLUMN computed_metrics_json TEXT")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "candles_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN candles_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS candles_json TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "params_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN params_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS params_json TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "run_context_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN run_context_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS run_context_json TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_run_details",
+        "computed_metrics_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN computed_metrics_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS computed_metrics_json TEXT",
+    )
 
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
+    cols = get_table_columns(conn, "backtest_run_details")
     if "updated_at" in cols:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_backtest_run_details_updated_at ON backtest_run_details(updated_at)"
         )
 
 
-def _migration_0003_exchange_state_snapshots(conn: sqlite3.Connection) -> None:
+def _migration_0003_exchange_state_snapshots(conn: Any) -> None:
     # bot_state_snapshots additions
     try:
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(bot_state_snapshots)").fetchall()}
+        cols = get_table_columns(conn, "bot_state_snapshots")
     except Exception:
         cols = set()
-    if "exchange_state" not in cols:
-        try:
-            conn.execute("ALTER TABLE bot_state_snapshots ADD COLUMN exchange_state TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "last_exchange_error_at" not in cols:
-        try:
-            conn.execute("ALTER TABLE bot_state_snapshots ADD COLUMN last_exchange_error_at TEXT")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "bot_state_snapshots",
+        "exchange_state",
+        "ALTER TABLE bot_state_snapshots ADD COLUMN exchange_state TEXT",
+        "ALTER TABLE bot_state_snapshots ADD COLUMN IF NOT EXISTS exchange_state TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "bot_state_snapshots",
+        "last_exchange_error_at",
+        "ALTER TABLE bot_state_snapshots ADD COLUMN last_exchange_error_at TEXT",
+        "ALTER TABLE bot_state_snapshots ADD COLUMN IF NOT EXISTS last_exchange_error_at TEXT",
+    )
 
     # account_state_snapshots additions
     try:
-        cols2 = {row[1] for row in conn.execute("PRAGMA table_info(account_state_snapshots)").fetchall()}
+        cols2 = get_table_columns(conn, "account_state_snapshots")
     except Exception:
         cols2 = set()
-    if "exchange_state" not in cols2:
-        try:
-            conn.execute("ALTER TABLE account_state_snapshots ADD COLUMN exchange_state TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "last_exchange_error_at" not in cols2:
-        try:
-            conn.execute("ALTER TABLE account_state_snapshots ADD COLUMN last_exchange_error_at TEXT")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "account_state_snapshots",
+        "exchange_state",
+        "ALTER TABLE account_state_snapshots ADD COLUMN exchange_state TEXT",
+        "ALTER TABLE account_state_snapshots ADD COLUMN IF NOT EXISTS exchange_state TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "account_state_snapshots",
+        "last_exchange_error_at",
+        "ALTER TABLE account_state_snapshots ADD COLUMN last_exchange_error_at TEXT",
+        "ALTER TABLE account_state_snapshots ADD COLUMN IF NOT EXISTS last_exchange_error_at TEXT",
+    )
 
 
-def _migration_0004_backtest_run_details_artifacts(conn: sqlite3.Connection) -> None:
+def _migration_0004_backtest_run_details_artifacts(conn: Any) -> None:
     """Ensure `backtest_run_details` has artifact columns.
 
-    Rationale:
-    - Earlier DBs may have applied migration v2 before artifact columns existed.
-    - SQLite migrations are version-gated, so adding columns inside v2 later does
-      not update already-migrated DBs.
-    - This migration is additive and idempotent.
+        Rationale:
+        - Earlier DBs may have applied migration v2 before artifact columns existed.
+        - This migration is additive and idempotent.
     """
 
     conn.execute(
@@ -306,39 +693,279 @@ def _migration_0004_backtest_run_details_artifacts(conn: sqlite3.Connection) -> 
         """
     )
 
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
+    def _add_col(name: str, ddl: str, ddl_pg: str) -> None:
+        _db_add_column_if_missing(conn, "backtest_run_details", name, ddl, ddl_pg)
 
-    def _add_col(name: str, ddl: str) -> None:
-        if name in cols:
-            return
-        try:
-            conn.execute(ddl)
-            cols.add(name)
-        except sqlite3.OperationalError:
-            return
-
-    _add_col("metadata_json", "ALTER TABLE backtest_run_details ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}' ")
-    _add_col("created_at", "ALTER TABLE backtest_run_details ADD COLUMN created_at TEXT")
-    _add_col("updated_at", "ALTER TABLE backtest_run_details ADD COLUMN updated_at TEXT")
+    _add_col(
+        "metadata_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}' ",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS metadata_json TEXT NOT NULL DEFAULT '{}'",
+    )
+    _add_col(
+        "created_at",
+        "ALTER TABLE backtest_run_details ADD COLUMN created_at TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS created_at TEXT",
+    )
+    _add_col(
+        "updated_at",
+        "ALTER TABLE backtest_run_details ADD COLUMN updated_at TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS updated_at TEXT",
+    )
 
     # Chart artifacts
-    _add_col("equity_curve_json", "ALTER TABLE backtest_run_details ADD COLUMN equity_curve_json TEXT")
-    _add_col("equity_timestamps_json", "ALTER TABLE backtest_run_details ADD COLUMN equity_timestamps_json TEXT")
-    _add_col("extra_series_json", "ALTER TABLE backtest_run_details ADD COLUMN extra_series_json TEXT")
+    _add_col(
+        "equity_curve_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN equity_curve_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS equity_curve_json TEXT",
+    )
+    _add_col(
+        "equity_timestamps_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN equity_timestamps_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS equity_timestamps_json TEXT",
+    )
+    _add_col(
+        "extra_series_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN extra_series_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS extra_series_json TEXT",
+    )
 
     # Candle + run-context artifacts
-    _add_col("candles_json", "ALTER TABLE backtest_run_details ADD COLUMN candles_json TEXT")
-    _add_col("params_json", "ALTER TABLE backtest_run_details ADD COLUMN params_json TEXT")
-    _add_col("run_context_json", "ALTER TABLE backtest_run_details ADD COLUMN run_context_json TEXT")
-    _add_col("computed_metrics_json", "ALTER TABLE backtest_run_details ADD COLUMN computed_metrics_json TEXT")
+    _add_col(
+        "candles_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN candles_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS candles_json TEXT",
+    )
+    _add_col(
+        "params_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN params_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS params_json TEXT",
+    )
+    _add_col(
+        "run_context_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN run_context_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS run_context_json TEXT",
+    )
+    _add_col(
+        "computed_metrics_json",
+        "ALTER TABLE backtest_run_details ADD COLUMN computed_metrics_json TEXT",
+        "ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS computed_metrics_json TEXT",
+    )
 
+    try:
+        cols = get_table_columns(conn, "backtest_run_details")
+    except Exception:
+        cols = set()
     if "updated_at" in cols:
-        try:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_backtest_run_details_updated_at ON backtest_run_details(updated_at)"
+        execute_optional(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_backtest_run_details_updated_at ON backtest_run_details(updated_at)",
+        )
+
+
+def _migration_0005_jsonb_columns(conn: Any) -> None:
+    """Add JSONB columns for JSON blobs and backfill from legacy TEXT columns."""
+
+    if _table_exists(conn, "backtest_runs"):
+        for name in ("config_jsonb", "metrics_jsonb", "metadata_jsonb", "trades_jsonb"):
+            _db_add_column_if_missing(
+                conn,
+                "backtest_runs",
+                name,
+                f"ALTER TABLE backtest_runs ADD COLUMN {name} JSONB",
+                f"ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS {name} JSONB",
             )
-        except sqlite3.OperationalError:
-            pass
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_runs",
+            pk="id",
+            text_col="config_json",
+            jsonb_col="config_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_runs",
+            pk="id",
+            text_col="metrics_json",
+            jsonb_col="metrics_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_runs",
+            pk="id",
+            text_col="metadata_json",
+            jsonb_col="metadata_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_runs",
+            pk="id",
+            text_col="trades_json",
+            jsonb_col="trades_jsonb",
+        )
+
+        execute_optional(conn, "DROP INDEX IF EXISTS idx_backtest_runs_run_key")
+        execute_optional_logged(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_key "
+            "ON backtest_runs ((metadata_jsonb ->> 'run_key'))",
+            label="migration_index_create_failed",
+        )
+
+    if _table_exists(conn, "backtest_run_details"):
+        for name in (
+            "config_jsonb",
+            "metrics_jsonb",
+            "metadata_jsonb",
+            "trades_jsonb",
+            "candles_jsonb",
+            "params_jsonb",
+            "run_context_jsonb",
+            "computed_metrics_jsonb",
+            "equity_curve_jsonb",
+            "equity_timestamps_jsonb",
+            "extra_series_jsonb",
+        ):
+            _db_add_column_if_missing(
+                conn,
+                "backtest_run_details",
+                name,
+                f"ALTER TABLE backtest_run_details ADD COLUMN {name} JSONB",
+                f"ALTER TABLE backtest_run_details ADD COLUMN IF NOT EXISTS {name} JSONB",
+            )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="config_json",
+            jsonb_col="config_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="metrics_json",
+            jsonb_col="metrics_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="metadata_json",
+            jsonb_col="metadata_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="trades_json",
+            jsonb_col="trades_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="candles_json",
+            jsonb_col="candles_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="params_json",
+            jsonb_col="params_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="run_context_json",
+            jsonb_col="run_context_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="computed_metrics_json",
+            jsonb_col="computed_metrics_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="equity_curve_json",
+            jsonb_col="equity_curve_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="equity_timestamps_json",
+            jsonb_col="equity_timestamps_jsonb",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="backtest_run_details",
+            pk="run_id",
+            text_col="extra_series_json",
+            jsonb_col="extra_series_jsonb",
+        )
+
+    if _table_exists(conn, "bot_events"):
+        _db_add_column_if_missing(
+            conn,
+            "bot_events",
+            "json_payload_jsonb",
+            "ALTER TABLE bot_events ADD COLUMN json_payload_jsonb JSONB",
+            "ALTER TABLE bot_events ADD COLUMN IF NOT EXISTS json_payload_jsonb JSONB",
+        )
+        _backfill_jsonb_column(
+            conn,
+            table="bot_events",
+            pk="id",
+            text_col="json_payload",
+            jsonb_col="json_payload_jsonb",
+        )
+
+    if _table_exists(conn, "bot_state_snapshots"):
+        for name, text_col in (
+            ("health_jsonb", "health_json"),
+            ("positions_summary_jsonb", "positions_summary_json"),
+            ("exchange_state_jsonb", "exchange_state"),
+        ):
+            _db_add_column_if_missing(
+                conn,
+                "bot_state_snapshots",
+                name,
+                f"ALTER TABLE bot_state_snapshots ADD COLUMN {name} JSONB",
+                f"ALTER TABLE bot_state_snapshots ADD COLUMN IF NOT EXISTS {name} JSONB",
+            )
+            _backfill_jsonb_column(
+                conn,
+                table="bot_state_snapshots",
+                pk="bot_id",
+                text_col=text_col,
+                jsonb_col=name,
+            )
+
+    if _table_exists(conn, "account_state_snapshots"):
+        for name, text_col in (
+            ("positions_summary_jsonb", "positions_summary_json"),
+            ("exchange_state_jsonb", "exchange_state"),
+        ):
+            _db_add_column_if_missing(
+                conn,
+                "account_state_snapshots",
+                name,
+                f"ALTER TABLE account_state_snapshots ADD COLUMN {name} JSONB",
+                f"ALTER TABLE account_state_snapshots ADD COLUMN IF NOT EXISTS {name} JSONB",
+            )
+            _backfill_jsonb_column(
+                conn,
+                table="account_state_snapshots",
+                pk="account_id",
+                text_col=text_col,
+                jsonb_col=name,
+            )
 
 
 _MIGRATIONS: list[tuple[int, str, Any]] = [
@@ -346,92 +973,79 @@ _MIGRATIONS: list[tuple[int, str, Any]] = [
     (2, "backtest_run_details", _migration_0002_backtest_run_details),
     (3, "exchange_state_snapshots", _migration_0003_exchange_state_snapshots),
     (4, "backtest_run_details_artifacts", _migration_0004_backtest_run_details_artifacts),
+    (5, "jsonb_columns", _migration_0005_jsonb_columns),
 ]
 
 
-def apply_migrations(conn: sqlite3.Connection) -> None:
+def apply_migrations(conn: Any) -> None:
     """Apply any pending schema migrations."""
+    def _tx_context() -> Any:
+        tx = getattr(conn, "transaction", None)
+        if callable(tx):
+            return tx()
+
+        @contextmanager
+        def _fallback() -> Iterator[None]:
+            try:
+                yield
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return _fallback()
 
     _ensure_schema_migrations(conn)
-    applied = {
-        int(r[0])
-        for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-    }
-    for version, name, fn in _MIGRATIONS:
-        if int(version) in applied:
-            continue
-        conn.execute("BEGIN")
+    conn.execute("SELECT pg_advisory_lock(hashtext(%s))", ("project_dragon_migrations",))
+    try:
+        applied = {
+            int(r[0])
+            for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        }
+        for version, name, fn in _MIGRATIONS:
+            if int(version) in applied:
+                continue
+            with _tx_context():
+                fn(conn)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (%s, %s, %s)",
+                    (int(version), str(name), now_utc_iso()),
+                )
         try:
-            fn(conn)
-            conn.execute(
-                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-                (int(version), str(name), now_utc_iso()),
+            row = conn.execute(
+                "SELECT COUNT(1) AS c, MAX(version) AS max_v FROM schema_migrations"
+            ).fetchone()
+        except Exception as exc:
+            raise RuntimeError("schema_migrations check failed") from exc
+        if not row:
+            raise RuntimeError("schema_migrations check failed: no rows")
+        try:
+            count = int(row[0] or 0)
+            max_v = int(row[1] or 0)
+        except Exception as exc:
+            raise RuntimeError("schema_migrations check failed: unreadable rows") from exc
+        expected_max = max(v for v, _name, _fn in _MIGRATIONS)
+        if count < len(_MIGRATIONS) or max_v < expected_max:
+            raise RuntimeError(
+                f"schema_migrations check failed: count={count} max={max_v} expected_max={expected_max}"
             )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+    finally:
+        conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("project_dragon_migrations",))
 
 
-def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
-    """Apply per-connection SQLite pragmas for better multi-process behavior.
+def open_db_connection(*_args: Any, **_kwargs: Any) -> Any:
+    """Open a configured Postgres connection for Project Dragon."""
 
-    WAL is persisted per-DB, but setting it here is safe and idempotent.
-    busy_timeout is per-connection and prevents transient 'database is locked' failures.
-    """
-
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-    except Exception:
-        pass
-    try:
-        # Needed for ON DELETE CASCADE and general FK integrity.
-        conn.execute("PRAGMA foreign_keys=ON;")
-    except Exception:
-        pass
-    try:
-        # Good tradeoff for SQLite durability vs throughput in this workload.
-        conn.execute("PRAGMA synchronous=NORMAL;")
-    except Exception:
-        pass
-    try:
-        conn.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_MS)};")
-    except Exception:
-        pass
-
-
-def get_sqlite_pragmas(conn: sqlite3.Connection) -> Dict[str, Any]:
-    """Return key pragma values for debugging/verification."""
-
-    out: Dict[str, Any] = {}
-    try:
-        out["journal_mode"] = conn.execute("PRAGMA journal_mode;").fetchone()[0]
-    except Exception:
-        out["journal_mode"] = None
-    try:
-        out["busy_timeout"] = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
-    except Exception:
-        out["busy_timeout"] = None
-    try:
-        out["foreign_keys"] = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
-    except Exception:
-        out["foreign_keys"] = None
-    try:
-        out["synchronous"] = conn.execute("PRAGMA synchronous;").fetchone()[0]
-    except Exception:
-        out["synchronous"] = None
-    return out
-
-
-def open_db_connection(path: Optional[Path] = None) -> sqlite3.Connection:
-    """Open a configured SQLite connection to the Project Dragon DB."""
-
-    db_path = init_db(path)
-    # timeout is another guardrail; busy_timeout is still set explicitly.
-    conn = sqlite3.connect(db_path, timeout=max(1.0, SQLITE_BUSY_TIMEOUT_MS / 1000.0))
-    conn.row_factory = sqlite3.Row
-    _apply_sqlite_pragmas(conn)
-    return conn
+    dsn = get_database_url()
+    if not is_postgres_dsn(dsn):
+        raise RuntimeError(
+            "DRAGON_DATABASE_URL must be set to a postgres:// or postgresql:// URL."
+        )
+    _init_postgres_db(str(dsn))
+    raw_conn = open_postgres_connection(str(dsn))
+    if psycopg is not None and isinstance(raw_conn, getattr(psycopg, "Connection", object)):
+        return PostgresConnectionAdapterV3(raw_conn)
+    return PostgresConnectionAdapter(raw_conn)
 
 
 def now_utc_iso() -> str:
@@ -478,7 +1092,7 @@ def _parse_exchange_symbol_assets(exchange_symbol: str) -> Tuple[Optional[str], 
 
 
 def upsert_symbol(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     exchange_symbol: str,
     base_asset: Optional[str] = None,
@@ -503,12 +1117,13 @@ def upsert_symbol(
     elif market_type_norm is not None and not market_type_norm:
         market_type_norm = None
 
+    updated_at = now_utc_iso()
     conn.execute(
         """
         INSERT INTO symbols (
             exchange_symbol, base_asset, quote_asset, market_type, icon_uri, updated_at
         ) VALUES (
-            :exchange_symbol, :base_asset, :quote_asset, :market_type, :icon_uri, :updated_at
+            %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT(exchange_symbol) DO UPDATE SET
             base_asset = COALESCE(excluded.base_asset, symbols.base_asset),
@@ -517,18 +1132,18 @@ def upsert_symbol(
             icon_uri = COALESCE(excluded.icon_uri, symbols.icon_uri),
             updated_at = excluded.updated_at
         """,
-        {
-            "exchange_symbol": exchange_symbol,
-            "base_asset": (base_asset.strip().upper() if isinstance(base_asset, str) and base_asset.strip() else None),
-            "quote_asset": (quote_asset.strip().upper() if isinstance(quote_asset, str) and quote_asset.strip() else None),
-            "market_type": market_type_norm,
-            "icon_uri": icon_uri,
-            "updated_at": now_utc_iso(),
-        },
+        (
+            exchange_symbol,
+            (base_asset.strip().upper() if isinstance(base_asset, str) and base_asset.strip() else None),
+            (quote_asset.strip().upper() if isinstance(quote_asset, str) and quote_asset.strip() else None),
+            market_type_norm,
+            icon_uri,
+            updated_at,
+        ),
     )
 
 
-def ensure_symbols_for_exchange_symbols(conn: sqlite3.Connection, exchange_symbols: Iterable[str]) -> int:
+def ensure_symbols_for_exchange_symbols(conn: Any, exchange_symbols: Iterable[str]) -> int:
     """Ensure a `symbols` row exists for each exchange_symbol (best-effort).
 
     Performance note:
@@ -556,16 +1171,16 @@ def ensure_symbols_for_exchange_symbols(conn: sqlite3.Connection, exchange_symbo
     try:
         for i in range(0, len(normalized), chunk_size):
             chunk = normalized[i : i + chunk_size]
-            placeholders = ",".join(["?"] * len(chunk))
-            rows = conn.execute(
-                f"SELECT exchange_symbol FROM symbols WHERE exchange_symbol IN ({placeholders})",
-                chunk,
-            ).fetchall()
+            placeholders = ",".join(["%s"] * len(chunk))
+            rows = fetchall_dicts(
+                conn.execute(
+                    f"SELECT exchange_symbol FROM symbols WHERE exchange_symbol IN ({placeholders})",
+                    chunk,
+                )
+            )
             for r in rows:
-                try:
-                    existing.add(str(r[0]))
-                except Exception:
-                    continue
+                if r.get("exchange_symbol") is not None:
+                    existing.add(str(r.get("exchange_symbol")))
     except Exception:
         # If the symbols table doesn't exist yet, fall back to best-effort upserts.
         existing = set()
@@ -585,7 +1200,7 @@ def ensure_symbols_for_exchange_symbols(conn: sqlite3.Connection, exchange_symbo
 
 
 def sync_symbol_icons_from_manifest(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     manifest_path: str,
     icons_root: str,
@@ -623,10 +1238,11 @@ def sync_symbol_icons_from_manifest(
 
         # Skip if already set (unless force)
         if not force:
-            row = conn.execute(
-                "SELECT 1 FROM symbols WHERE base_asset = ? AND icon_uri IS NOT NULL AND TRIM(icon_uri) != '' LIMIT 1",
+            row = execute_fetchone(
+                conn,
+                "SELECT 1 FROM symbols WHERE base_asset = %s AND icon_uri IS NOT NULL AND TRIM(icon_uri) != '' LIMIT 1",
                 (asset,),
-            ).fetchone()
+            )
             if row:
                 continue
 
@@ -635,7 +1251,7 @@ def sync_symbol_icons_from_manifest(
         icon_uri = _file_bytes_to_data_uri(icon_bytes, filename=os.path.basename(full_path))
 
         cur = conn.execute(
-            "UPDATE symbols SET icon_uri = ?, updated_at = ? WHERE base_asset = ?",
+            "UPDATE symbols SET icon_uri = %s, updated_at = %s WHERE base_asset = %s",
             (icon_uri, now_utc_iso(), asset),
         )
         if cur.rowcount:
@@ -645,7 +1261,7 @@ def sync_symbol_icons_from_manifest(
 
 
 def sync_symbol_icons_from_spothq_pack(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     icons_root: str,
     base_assets: Optional[Iterable[str]] = None,
@@ -683,10 +1299,11 @@ def sync_symbol_icons_from_spothq_pack(
                 assets.append(s)
     else:
         try:
-            rows = conn.execute(
-                "SELECT DISTINCT base_asset FROM symbols WHERE base_asset IS NOT NULL AND TRIM(base_asset) != '' ORDER BY base_asset"
-            ).fetchall()
-            assets = [str(r[0]).strip().upper() for r in rows or [] if str(r[0] or "").strip()]
+            rows = execute_fetchall(
+                conn,
+                "SELECT DISTINCT base_asset FROM symbols WHERE base_asset IS NOT NULL AND TRIM(base_asset) != '' ORDER BY base_asset",
+            )
+            assets = [str(r.get("base_asset")).strip().upper() for r in rows or [] if str(r.get("base_asset") or "").strip()]
         except Exception:
             assets = []
 
@@ -697,10 +1314,11 @@ def sync_symbol_icons_from_spothq_pack(
 
         # Skip if already set (unless force)
         if not force:
-            row = conn.execute(
-                "SELECT 1 FROM symbols WHERE base_asset = ? AND icon_uri IS NOT NULL AND TRIM(icon_uri) != '' LIMIT 1",
+            row = execute_fetchone(
+                conn,
+                "SELECT 1 FROM symbols WHERE base_asset = %s AND icon_uri IS NOT NULL AND TRIM(icon_uri) != '' LIMIT 1",
                 (asset,),
-            ).fetchone()
+            )
             if row:
                 continue
 
@@ -711,7 +1329,7 @@ def sync_symbol_icons_from_spothq_pack(
         icon_uri = icon_bytes_to_data_uri(mime, b)
 
         cur = conn.execute(
-            "UPDATE symbols SET icon_uri = ?, updated_at = ? WHERE base_asset = ?",
+            "UPDATE symbols SET icon_uri = %s, updated_at = %s WHERE base_asset = %s",
             (icon_uri, now_utc_iso(), asset),
         )
         if cur.rowcount:
@@ -781,7 +1399,7 @@ def get_current_user_email() -> str:
     return email or DEFAULT_USER_EMAIL
 
 
-def get_or_create_user_id(email: str, conn: Optional[sqlite3.Connection] = None) -> str:
+def get_or_create_user_id(email: str, conn: Optional[Any] = None) -> str:
     """Ensure a user row exists and return a stable user_id.
 
     v0 uses the email itself as the user_id (TEXT) for migration safety.
@@ -795,85 +1413,128 @@ def get_or_create_user_id(email: str, conn: Optional[sqlite3.Connection] = None)
         return get_or_create_user(c, resolved)
 
 
-def get_or_create_user(conn: sqlite3.Connection, email: str) -> str:
+def get_or_create_user(conn: Any, email: str) -> str:
     """Ensure a user row exists and return user_id.
 
     For v0 we use email itself as the stable user_id.
     """
 
     user_id = (email or "").strip() or DEFAULT_USER_EMAIL
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     try:
         conn.execute(
-            """
-            INSERT OR IGNORE INTO users(id, email, created_at)
-            VALUES (?, ?, ?)
-            """,
+            _get_or_create_user_insert_sql("postgres"),
             (user_id, user_id, now_utc_iso()),
         )
         conn.commit()
-    except sqlite3.OperationalError:
+    except Exception:
         # Schema may not be migrated yet; caller is expected to run init_db().
         pass
     return user_id
 
 
-def init_db(path: Optional[Path] = None) -> Path:
-    global _db_path
+def init_db(*_args: Any, **_kwargs: Any) -> str:
+    dsn = get_database_url()
+    if not is_postgres_dsn(dsn):
+        raise RuntimeError(
+            "DRAGON_DATABASE_URL must be set to a postgres:// or postgresql:// URL."
+        )
+    return _init_postgres_db(str(dsn))
+
+
+def _init_postgres_db(dsn: str) -> str:
     global _DB_INITIALIZED_FOR
     global _DB_INITIALIZED_VERSION
-    if path is not None:
-        _db_path = path
-
-    resolved = Path(_db_path).resolve()
-    # Avoid running migrations/DDL on every connection open. Streamlit reruns
-    # frequently and this function is called by open_db_connection().
-    # However, when code updates add new migrations, a long-running Streamlit
-    # process must still be able to apply them without requiring a restart.
+    key = f"postgres:{dsn}"
     latest_version = 0
     try:
         latest_version = max(int(v) for (v, _name, _fn) in _MIGRATIONS)
     except Exception:
         latest_version = 0
+
     if (
         _DB_INITIALIZED_FOR is not None
-        and _DB_INITIALIZED_FOR == resolved
+        and _DB_INITIALIZED_FOR == key
         and _DB_INITIALIZED_VERSION is not None
         and int(_DB_INITIALIZED_VERSION) >= int(latest_version)
     ):
-        return resolved
+        return dsn
 
     with _DB_INIT_LOCK:
         if (
             _DB_INITIALIZED_FOR is not None
-            and _DB_INITIALIZED_FOR == resolved
+            and _DB_INITIALIZED_FOR == key
             and _DB_INITIALIZED_VERSION is not None
             and int(_DB_INITIALIZED_VERSION) >= int(latest_version)
         ):
-            return resolved
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(resolved) as conn:
-            _apply_sqlite_pragmas(conn)
+            return dsn
+
+        raw_conn = open_postgres_connection(str(dsn))
+        if psycopg is not None and isinstance(raw_conn, getattr(psycopg, "Connection", object)):
+            conn = PostgresConnectionAdapterV3(raw_conn)
+        else:
+            conn = PostgresConnectionAdapter(raw_conn)
+        try:
             apply_migrations(conn)
-            # Record current max migration version present in DB.
             try:
                 row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
                 _DB_INITIALIZED_VERSION = int(row[0] or 0) if row else 0
             except Exception:
                 _DB_INITIALIZED_VERSION = latest_version
-        _DB_INITIALIZED_FOR = resolved
-        return resolved
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _DB_INITIALIZED_FOR = key
+        return dsn
 
 
-def _ensure_metadata_column(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("PRAGMA table_info(backtest_runs)").fetchall()
-    column_names = {row[1] for row in rows}
-    if "metadata_json" not in column_names:
-        conn.execute("ALTER TABLE backtest_runs ADD COLUMN metadata_json TEXT DEFAULT '{}'")
+def _ensure_metadata_column(conn: Any) -> None:
+    _db_add_column_if_missing(
+        conn,
+        "backtest_runs",
+        "metadata_json",
+        "ALTER TABLE backtest_runs ADD COLUMN metadata_json TEXT DEFAULT '{}' ",
+        "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS metadata_json TEXT DEFAULT '{}'",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "backtest_runs",
+        "metadata_jsonb",
+        "ALTER TABLE backtest_runs ADD COLUMN metadata_jsonb JSONB",
+        "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS metadata_jsonb JSONB",
+    )
 
 
-def _ensure_schema(conn: sqlite3.Connection) -> None:
+def _db_add_column_if_missing(
+    conn: Any,
+    table: str,
+    col: str,
+    ddl_base: str,
+    ddl_postgres: str,
+) -> None:
+    try:
+        conn.execute(ddl_postgres)
+    except Exception as exc:
+        try:
+            if psycopg is not None:
+                dup = getattr(psycopg.errors, "DuplicateColumn", None)
+                if dup is not None and isinstance(exc, dup):
+                    return
+        except Exception:
+            pass
+        try:
+            if psycopg2 is not None:
+                dup2 = getattr(psycopg2.errors, "DuplicateColumn", None)
+                if dup2 is not None and isinstance(exc, dup2):
+                    return
+        except Exception:
+            pass
+        raise
+
+
+def _ensure_schema(conn: Any) -> None:
+    ph = sql_placeholder(conn)
     # Core identity + credentials tables.
     conn.execute(
         """
@@ -900,9 +1561,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_user ON user_settings(user_id)")
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS exchange_credentials (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             user_id TEXT NOT NULL,
             exchange_id TEXT NOT NULL,
             label TEXT,
@@ -981,43 +1642,43 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
     # Older DBs may have sweeps without user_id; add it safely.
-    try:
-        sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
-    except Exception:
-        sweep_cols = set()
-    if "user_id" not in sweep_cols:
-        try:
-            conn.execute("ALTER TABLE sweeps ADD COLUMN user_id TEXT")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "sweeps",
+        "user_id",
+        "ALTER TABLE sweeps ADD COLUMN user_id TEXT",
+        "ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS user_id TEXT",
+    )
 
     # Multi-asset sweep support (additive columns).
-    try:
-        sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
-    except Exception:
-        sweep_cols = set()
-    if "sweep_scope" not in sweep_cols:
-        try:
-            conn.execute("ALTER TABLE sweeps ADD COLUMN sweep_scope TEXT NOT NULL DEFAULT 'single_asset'")
-        except sqlite3.OperationalError:
-            pass
-    if "sweep_assets_json" not in sweep_cols:
-        try:
-            conn.execute("ALTER TABLE sweeps ADD COLUMN sweep_assets_json TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "sweep_category_id" not in sweep_cols:
-        try:
-            conn.execute("ALTER TABLE sweeps ADD COLUMN sweep_category_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
+    _db_add_column_if_missing(
+        conn,
+        "sweeps",
+        "sweep_scope",
+        "ALTER TABLE sweeps ADD COLUMN sweep_scope TEXT NOT NULL DEFAULT 'single_asset'",
+        "ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS sweep_scope TEXT NOT NULL DEFAULT 'single_asset'",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "sweeps",
+        "sweep_assets_json",
+        "ALTER TABLE sweeps ADD COLUMN sweep_assets_json TEXT",
+        "ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS sweep_assets_json TEXT",
+    )
+    _db_add_column_if_missing(
+        conn,
+        "sweeps",
+        "sweep_category_id",
+        "ALTER TABLE sweeps ADD COLUMN sweep_category_id INTEGER",
+        "ALTER TABLE sweeps ADD COLUMN IF NOT EXISTS sweep_category_id INTEGER",
+    )
 
     # Index for per-user sweeps list (safe even if column missing).
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_sweeps_user_created ON sweeps(user_id, created_at)")
     try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sweeps_user_created ON sweeps(user_id, created_at)")
-    except sqlite3.OperationalError:
-        pass
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(backtest_runs)").fetchall()}
+        columns = get_table_columns(conn, "backtest_runs")
+    except Exception:
+        columns = set()
     added_avg_position_time_s = False
     desired_columns = {
         "sweep_id": "ALTER TABLE backtest_runs ADD COLUMN sweep_id TEXT",
@@ -1027,7 +1688,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "net_profit": "ALTER TABLE backtest_runs ADD COLUMN net_profit REAL",
         "net_return_pct": "ALTER TABLE backtest_runs ADD COLUMN net_return_pct REAL",
         "roi_pct_on_margin": "ALTER TABLE backtest_runs ADD COLUMN roi_pct_on_margin REAL",
-        "max_drawdown_pct": "ALTER TABLE backtest_runs ADD COLUMN max_drawdown_pct REAL",
+        "max_drawdown_pct": "ALTER TABLE backtest_runs ADD COLUMN max_drawdown_pct DOUBLE PRECISION",
         "sharpe": "ALTER TABLE backtest_runs ADD COLUMN sharpe REAL",
         "sortino": "ALTER TABLE backtest_runs ADD COLUMN sortino REAL",
         "win_rate": "ALTER TABLE backtest_runs ADD COLUMN win_rate REAL",
@@ -1039,12 +1700,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     }
     for name, ddl in desired_columns.items():
         if name not in columns:
-            try:
-                conn.execute(ddl)
-                if name == "avg_position_time_s":
-                    added_avg_position_time_s = True
-            except sqlite3.OperationalError:
-                pass
+            ddl_pg = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+            _db_add_column_if_missing(conn, "backtest_runs", name, ddl, ddl_pg)
+            if name == "avg_position_time_s":
+                added_avg_position_time_s = True
 
     # One-time best-effort backfill for avg_position_time_s from stored trades_json.
     # Runs only when the column is first added in this DB.
@@ -1123,8 +1782,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                     avg_s = _compute_avg_pos_time_s_from_trades(trades_obj)
                     if avg_s is None:
                         continue
-                    conn.execute(
-                        "UPDATE backtest_runs SET avg_position_time_s = ? WHERE id = ?",
+                    execute_optional(
+                        conn,
+                        f"UPDATE backtest_runs SET avg_position_time_s = {ph} WHERE id = {ph}",
                         (float(avg_s), run_id),
                     )
                 except Exception:
@@ -1136,7 +1796,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Backfill market_type from existing stored config/metadata for older rows.
     # (Best-effort; no JSON1 dependency.)
     try:
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_runs)").fetchall()}
+        cols = get_table_columns(conn, "backtest_runs")
         if "market_type" in cols:
             rows = conn.execute(
                 "SELECT id, market_type, metadata_json, config_json FROM backtest_runs WHERE market_type IS NULL OR TRIM(market_type) = ''"
@@ -1168,19 +1828,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 elif mkt_norm in {"spot"}:
                     mkt_norm = "spot"
                 if mkt_norm:
-                    try:
-                        conn.execute("UPDATE backtest_runs SET market_type = ? WHERE id = ?", (mkt_norm, str(run_id)))
-                    except Exception:
-                        pass
+                    execute_optional(
+                        conn,
+                        f"UPDATE backtest_runs SET market_type = {ph} WHERE id = {ph}",
+                        (mkt_norm, str(run_id)),
+                    )
             conn.commit()
     except Exception:
         pass
 
     # Index (safe even if column missing on very old DBs)
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_roi_pct_on_margin ON backtest_runs(roi_pct_on_margin)")
-    except sqlite3.OperationalError:
-        pass
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_runs_roi_pct_on_margin ON backtest_runs(roi_pct_on_margin)")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep_id ON backtest_runs(sweep_id)")
     conn.execute(
@@ -1188,14 +1846,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_net_return_pct ON backtest_runs(net_return_pct)")
 
-    # Deterministic backtest run idempotency key. Requires SQLite JSON1.
-    try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_key ON backtest_runs(json_extract(metadata_json,'$.run_key'))"
-        )
-    except sqlite3.OperationalError:
-        # Older/stripped SQLite builds may not support JSON1.
-        pass
+    # Deterministic backtest run idempotency key.
+    execute_optional_logged(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_key "
+        "ON backtest_runs ((metadata_jsonb ->> 'run_key'))",
+        label="migration_index_create_failed",
+    )
+
+    execute_optional(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_run_map_bot_id_unique ON bot_run_map(bot_id)",
+    )
 
     # Symbols metadata + cached icons (local icon pack, stored as data URIs)
     conn.execute(
@@ -1215,9 +1877,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
     # --- Assets + categories (per-user grouping) -----------------------
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS assets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             exchange_id TEXT NOT NULL,
             symbol TEXT NOT NULL,
             base_asset TEXT,
@@ -1234,9 +1896,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_assets_exchange_base ON assets(exchange_id, base_asset)")
 
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS asset_categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             user_id TEXT NOT NULL,
             exchange_id TEXT NOT NULL,
             name TEXT NOT NULL,
@@ -1270,8 +1932,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
     # Best-effort backfill: seed assets from existing symbols table (or runs/bots) once.
     try:
-        row = conn.execute("SELECT COUNT(*) FROM assets").fetchone()
-        assets_count = int(row[0] if row is not None else 0)
+        row = execute_fetchone(conn, "SELECT COUNT(*) AS c FROM assets")
+        assets_count = int(row.get("c") if row is not None else 0)
     except Exception:
         assets_count = 0
     if assets_count <= 0:
@@ -1298,9 +1960,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_bot_id ON jobs(bot_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at)")
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             name TEXT,
             exchange_id TEXT,
             symbol TEXT,
@@ -1316,7 +1978,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    bot_columns = {row[1] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
+    try:
+        bot_columns = get_table_columns(conn, "bots")
+    except Exception:
+        bot_columns = set()
     bot_new_columns = {
         "user_id": "ALTER TABLE bots ADD COLUMN user_id TEXT",
         "credentials_id": "ALTER TABLE bots ADD COLUMN credentials_id INTEGER",
@@ -1337,10 +2002,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     }
     for name, ddl in bot_new_columns.items():
         if name not in bot_columns:
-            try:
-                conn.execute(ddl)
-            except sqlite3.OperationalError:
-                pass
+            ddl_pg = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+            _db_add_column_if_missing(conn, "bots", name, ddl, ddl_pg)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bots_user_id ON bots(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bots_credentials_id ON bots(credentials_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bots_user_account_id ON bots(user_id, account_id)")
@@ -1350,14 +2013,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bots_blocked_actions_count ON bots(blocked_actions_count)")
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bots_roi_pct_on_margin ON bots(roi_pct_on_margin)")
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Multi-account model (trading_accounts)
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS trading_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             user_id TEXT NOT NULL,
             exchange_id TEXT NOT NULL,
             label TEXT NOT NULL,
@@ -1374,7 +2037,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     # Additive account-risk columns for older DBs (idempotent)
     try:
-        acct_cols = {row[1] for row in conn.execute("PRAGMA table_info(trading_accounts)").fetchall()}
+        try:
+            acct_cols = get_table_columns(conn, "trading_accounts")
+        except Exception:
+            acct_cols = set()
         acct_new_columns = {
             "risk_block_new_entries": "ALTER TABLE trading_accounts ADD COLUMN risk_block_new_entries INTEGER DEFAULT 1",
             "risk_max_daily_loss_usd": "ALTER TABLE trading_accounts ADD COLUMN risk_max_daily_loss_usd REAL",
@@ -1382,11 +2048,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         }
         for name, ddl in acct_new_columns.items():
             if name not in acct_cols:
-                try:
-                    conn.execute(ddl)
-                except sqlite3.OperationalError:
-                    pass
-    except sqlite3.OperationalError:
+                ddl_pg = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+                _db_add_column_if_missing(conn, "trading_accounts", name, ddl, ddl_pg)
+    except Exception:
         pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trading_accounts_user_exchange ON trading_accounts(user_id, exchange_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trading_accounts_credential_id ON trading_accounts(credential_id)")
@@ -1395,14 +2059,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Backfill bots.account_id for legacy bots that used bots.credentials_id.
     try:
         # Ensure bots.user_id is non-empty before backfill.
-        conn.execute(
-            "UPDATE bots SET user_id = COALESCE(user_id, ?) WHERE user_id IS NULL OR TRIM(user_id) = ''",
+        db_execute(
+            conn,
+            "UPDATE bots SET user_id = COALESCE(user_id, %s) WHERE user_id IS NULL OR TRIM(user_id) = ''",
             (DEFAULT_USER_EMAIL,),
         )
-        legacy_rows = conn.execute(
+        legacy_rows = db_execute(
+            conn,
             """
             SELECT id,
-                   COALESCE(NULLIF(TRIM(user_id), ''), ?) AS user_id,
+                   COALESCE(NULLIF(TRIM(user_id), ''), %s) AS user_id,
                    COALESCE(NULLIF(TRIM(exchange_id), ''), 'woox') AS exchange_id,
                    credentials_id
             FROM bots
@@ -1423,10 +2089,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ex = str(ex_raw or "woox").strip().lower() or "woox"
             # Prefer reusing any existing account for (user, exchange, credential).
             row = conn.execute(
-                """
+                f"""
                 SELECT id
                 FROM trading_accounts
-                WHERE user_id = ? AND exchange_id = ? AND credential_id = ?
+                WHERE user_id = {ph} AND exchange_id = {ph} AND credential_id = {ph}
                 ORDER BY id ASC
                 LIMIT 1
                 """,
@@ -1436,19 +2102,25 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 account_id = int(row[0])
             else:
                 label = f"Legacy {ex.upper()} (cred #{cred_id})"
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO trading_accounts(
-                        user_id, exchange_id, label, credential_id, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'active', ?, ?)
-                    """,
-                    (uid, ex, label, int(cred_id), now, now),
+                insert_ignore(
+                    conn,
+                    "trading_accounts",
+                    [
+                        "user_id",
+                        "exchange_id",
+                        "label",
+                        "credential_id",
+                        "status",
+                        "created_at",
+                        "updated_at",
+                    ],
+                    (uid, ex, label, int(cred_id), "active", now, now),
                 )
                 row2 = conn.execute(
-                    """
+                    f"""
                     SELECT id
                     FROM trading_accounts
-                    WHERE user_id = ? AND exchange_id = ? AND credential_id = ?
+                    WHERE user_id = {ph} AND exchange_id = {ph} AND credential_id = {ph}
                     ORDER BY id ASC
                     LIMIT 1
                     """,
@@ -1459,11 +2131,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 account_id = int(row2[0])
 
             conn.execute(
-                "UPDATE bots SET account_id = ? WHERE id = ? AND (account_id IS NULL OR account_id = 0)",
+                f"UPDATE bots SET account_id = {ph} WHERE id = {ph} AND (account_id IS NULL OR account_id = 0)",
                 (int(account_id), int(bot_id_val)),
             )
         conn.commit()
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         # Older DBs may not have the columns yet; keep schema init idempotent.
         pass
 
@@ -1472,16 +2144,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE bots SET blocked_actions_count = COALESCE(blocked_actions_count, 0) WHERE blocked_actions_count IS NULL"
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Backfill user_id for legacy bots.
     try:
         conn.execute(
-            "UPDATE bots SET user_id = COALESCE(user_id, ?) WHERE user_id IS NULL OR TRIM(user_id) = ''",
+            f"UPDATE bots SET user_id = COALESCE(user_id, {ph}) WHERE user_id IS NULL OR TRIM(user_id) = ''",
             (DEFAULT_USER_EMAIL,),
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Ensure default user exists.
@@ -1489,108 +2161,46 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         get_or_create_user(conn, DEFAULT_USER_EMAIL)
     except Exception:
         pass
-    job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-    if "job_key" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN job_key TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "sweep_id" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN sweep_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
-    if "run_id" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN run_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
-    if "bot_id" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN bot_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
-    if "worker_id" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN worker_id TEXT")
-        except sqlite3.OperationalError:
-            pass
+    try:
+        job_columns = get_table_columns(conn, "jobs")
+    except Exception:
+        job_columns = set()
+    for name, ddl in {
+        "job_key": "ALTER TABLE jobs ADD COLUMN job_key TEXT",
+        "sweep_id": "ALTER TABLE jobs ADD COLUMN sweep_id TEXT",
+        "run_id": "ALTER TABLE jobs ADD COLUMN run_id TEXT",
+        "bot_id": "ALTER TABLE jobs ADD COLUMN bot_id INTEGER",
+        "worker_id": "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
+    }.items():
+        if name not in job_columns:
+            ddl_pg = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+            _db_add_column_if_missing(conn, "jobs", name, ddl, ddl_pg)
 
     # Parent/group linkage for sweep planning (additive / ALTER-only).
-    if "parent_job_id" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN parent_job_id INTEGER")
-        except sqlite3.OperationalError:
-            pass
-    if "group_key" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN group_key TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-    # Sweep/job control plane (pause/cancel) (additive / ALTER-only).
-    if "pause_requested" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-    if "cancel_requested" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-    if "paused_at" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN paused_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "cancelled_at" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN cancelled_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-    # Lease-based multi-worker correctness (additive / ALTER-only).
-    # These columns intentionally coexist with legacy jobs.worker_id.
-    if "claimed_by" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN claimed_by TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "claimed_at" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN claimed_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "lease_expires_at" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "last_lease_renew_at" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN last_lease_renew_at TEXT")
-        except sqlite3.OperationalError:
-            pass
-    if "lease_version" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN lease_version INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-    if "stale_reclaims" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN stale_reclaims INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-    if "updated_at" not in job_columns:
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN updated_at TEXT")
-        except sqlite3.OperationalError:
-            pass
+    for name, ddl in {
+        "parent_job_id": "ALTER TABLE jobs ADD COLUMN parent_job_id INTEGER",
+        "group_key": "ALTER TABLE jobs ADD COLUMN group_key TEXT",
+        "priority": "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 100",
+        "is_interactive": "ALTER TABLE jobs ADD COLUMN is_interactive INTEGER NOT NULL DEFAULT 0",
+        "pause_requested": "ALTER TABLE jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0",
+        "cancel_requested": "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+        "paused_at": "ALTER TABLE jobs ADD COLUMN paused_at TEXT",
+        "cancelled_at": "ALTER TABLE jobs ADD COLUMN cancelled_at TEXT",
+        "claimed_by": "ALTER TABLE jobs ADD COLUMN claimed_by TEXT",
+        "claimed_at": "ALTER TABLE jobs ADD COLUMN claimed_at TEXT",
+        "lease_expires_at": "ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT",
+        "last_lease_renew_at": "ALTER TABLE jobs ADD COLUMN last_lease_renew_at TEXT",
+        "lease_version": "ALTER TABLE jobs ADD COLUMN lease_version INTEGER DEFAULT 0",
+        "stale_reclaims": "ALTER TABLE jobs ADD COLUMN stale_reclaims INTEGER DEFAULT 0",
+        "updated_at": "ALTER TABLE jobs ADD COLUMN updated_at TEXT",
+    }.items():
+        if name not in job_columns:
+            ddl_pg = ddl.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+            _db_add_column_if_missing(conn, "jobs", name, ddl, ddl_pg)
     # Backfill updated_at where missing
     try:
         conn.execute("UPDATE jobs SET updated_at = COALESCE(updated_at, created_at) WHERE updated_at IS NULL OR updated_at = ''")
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Backfill lease_version/stale_reclaims NULLs for legacy rows.
@@ -1598,13 +2208,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE jobs SET lease_version = COALESCE(lease_version, 0) WHERE lease_version IS NULL"
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
     try:
         conn.execute(
             "UPDATE jobs SET stale_reclaims = COALESCE(stale_reclaims, 0) WHERE stale_reclaims IS NULL"
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Backfill pause/cancel flags NULLs for legacy rows.
@@ -1612,13 +2222,23 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE jobs SET pause_requested = COALESCE(pause_requested, 0) WHERE pause_requested IS NULL"
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
     try:
         conn.execute(
             "UPDATE jobs SET cancel_requested = COALESCE(cancel_requested, 0) WHERE cancel_requested IS NULL"
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
+        pass
+
+    # Backfill scheduling fields NULLs for legacy rows.
+    try:
+        conn.execute("UPDATE jobs SET priority = COALESCE(priority, 100) WHERE priority IS NULL")
+    except DbErrors.OperationalError:
+        pass
+    try:
+        conn.execute("UPDATE jobs SET is_interactive = COALESCE(is_interactive, 0) WHERE is_interactive IS NULL")
+    except DbErrors.OperationalError:
         pass
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_worker_id ON jobs(worker_id)")
@@ -1626,7 +2246,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Idempotent enqueue for planner/UIs (NULLs are allowed; duplicates are prevented when job_key is set).
     try:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_job_key_unique ON jobs(job_key)")
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Fast sweep progress / dashboards.
@@ -1635,28 +2255,42 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Fast parent/group progress aggregation.
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_parent_type_status ON jobs(parent_job_id, job_type, status)")
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_group_type_status ON jobs(group_key, job_type, status)")
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Control plane + dashboards.
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_type_status_group ON jobs(job_type, status, group_key)")
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_group_pause_cancel_status ON jobs(group_key, pause_requested, cancel_requested, status)"
         )
-    except sqlite3.OperationalError:
+    except DbErrors.OperationalError:
         pass
 
     # Lease lookup / stale reclaim helpers.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_expires ON jobs(status, lease_expires_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by_status ON jobs(claimed_by, status)")
+
+    # Claim ordering for backtest workers.
+    # Prefer interactive single runs over sweep children via is_interactive/priority.
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_claim_backtest ON jobs(job_type, status, is_interactive, priority, created_at)"
+        )
+    except DbErrors.OperationalError:
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_claim_backtest ON jobs(job_type, status, priority, created_at)"
+            )
+        except DbErrors.OperationalError:
+            pass
 
     # bot_run_map for traceability
     conn.execute(
@@ -1673,9 +2307,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_run_map_bot_id ON bot_run_map(bot_id)")
 
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bot_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             bot_id INTEGER NOT NULL,
             ts TEXT NOT NULL,
             level TEXT NOT NULL,
@@ -1688,9 +2322,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_events_bot_id_ts ON bot_events(bot_id, ts DESC)")
 
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bot_fills (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             bot_id INTEGER NOT NULL,
             run_id TEXT,
             symbol TEXT NOT NULL,
@@ -1717,9 +2351,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
     # Unified ledger for fills/fees/funding adjustments
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bot_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             bot_id INTEGER NOT NULL,
             event_ts TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -1732,7 +2366,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             funding REAL,
             pnl REAL,
             ref_id TEXT,
-            meta_json TEXT DEFAULT '{}'
+            meta_json TEXT DEFAULT '{{}}'
         )
         """
     )
@@ -1747,9 +2381,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_ledger_bot_ts ON bot_ledger(bot_id, event_ts DESC)")
 
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bot_positions_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             bot_id INTEGER NOT NULL,
             run_id TEXT,
             symbol TEXT NOT NULL,
@@ -1764,7 +2398,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             fees_paid REAL,
             num_fills INTEGER,
             num_dca_fills INTEGER,
-            metadata_json TEXT DEFAULT '{}',
+            metadata_json TEXT DEFAULT '{{}}',
             created_at TEXT NOT NULL
         )
         """
@@ -1774,9 +2408,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
     # Bot order intents (restart-safe dynamic order tracking)
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS bot_order_intents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_auto_pk(conn)},
             bot_id INTEGER NOT NULL,
             intent_key TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -1877,7 +2511,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _get_conn() -> sqlite3.Connection:
+def _get_conn() -> Any:
     return open_db_connection()
 
 
@@ -1913,13 +2547,13 @@ def create_sweep(meta: SweepMeta) -> str:
 
         # Backwards-compatible: older DBs may not have sweeps.user_id.
         try:
-            sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
+            sweep_cols = get_table_columns(conn, "sweeps")
         except Exception:
             sweep_cols = set()
 
         # Refresh sweeps columns after any ALTERs.
         try:
-            sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
+            sweep_cols = get_table_columns(conn, "sweeps")
         except Exception:
             sweep_cols = set()
 
@@ -1957,15 +2591,16 @@ def create_sweep(meta: SweepMeta) -> str:
         if has_cat:
             cols.append("sweep_category_id")
 
-        placeholders = ", ".join([f":{c}" for c in cols])
+        placeholders = sql_placeholders(conn, len(cols))
         cols_sql = ", ".join(cols)
+        values = tuple(payload.get(c) for c in cols)
 
         conn.execute(
             f"""
             INSERT INTO sweeps ({cols_sql})
             VALUES ({placeholders})
             """,
-            payload,
+            values,
         )
     return sweep_id
 
@@ -1978,7 +2613,7 @@ def _infer_exchange_id_for_symbol_seed(exchange_symbol: str) -> str:
     return "woo"
 
 
-def _seed_assets_from_existing_tables(conn: sqlite3.Connection) -> int:
+def _seed_assets_from_existing_tables(conn: Any) -> int:
     """Seed `assets` once from existing tables (best-effort).
 
     Priority:
@@ -1987,32 +2622,32 @@ def _seed_assets_from_existing_tables(conn: sqlite3.Connection) -> int:
     3) backtest_runs metadata_json (best-effort, limited scan)
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     now = now_utc_iso()
     rows: list[tuple[str, str, Optional[str], Optional[str], str, str]] = []
 
     try:
-        sym_rows = conn.execute(
-            "SELECT exchange_symbol, base_asset, quote_asset FROM symbols WHERE exchange_symbol IS NOT NULL AND TRIM(exchange_symbol) != ''"
-        ).fetchall()
+        sym_rows = execute_fetchall(
+            conn,
+            "SELECT exchange_symbol, base_asset, quote_asset FROM symbols WHERE exchange_symbol IS NOT NULL AND TRIM(exchange_symbol) != ''",
+        )
     except Exception:
         sym_rows = []
 
     for r in sym_rows or []:
-        ex_sym = str(r[0] or "").strip()
+        ex_sym = str(r.get("exchange_symbol") or "").strip()
         if not ex_sym:
             continue
         ex_id = _infer_exchange_id_for_symbol_seed(ex_sym)
-        base = (str(r[1]).strip().upper() if r[1] is not None else None)
-        quote = (str(r[2]).strip().upper() if r[2] is not None else None)
+        base = (str(r.get("base_asset")).strip().upper() if r.get("base_asset") is not None else None)
+        quote = (str(r.get("quote_asset")).strip().upper() if r.get("quote_asset") is not None else None)
         rows.append((ex_id, ex_sym, base, quote, now, now))
 
     if not rows:
         try:
-            sw = conn.execute(
-                "SELECT DISTINCT exchange_id, symbol FROM sweeps WHERE exchange_id IS NOT NULL AND TRIM(exchange_id) != '' AND symbol IS NOT NULL AND TRIM(symbol) != ''"
-            ).fetchall()
+            sw = execute_fetchall(
+                conn,
+                "SELECT DISTINCT exchange_id, symbol FROM sweeps WHERE exchange_id IS NOT NULL AND TRIM(exchange_id) != '' AND symbol IS NOT NULL AND TRIM(symbol) != ''",
+            )
         except Exception:
             sw = []
         for r in sw or []:
@@ -2073,9 +2708,10 @@ def _seed_assets_from_existing_tables(conn: sqlite3.Connection) -> int:
             dedup[key] = (str(ex_id), str(sym), base, quote, ca, ua)
 
     cur = conn.executemany(
-        """
-        INSERT OR IGNORE INTO assets(exchange_id, symbol, base_asset, quote_asset, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        f"""
+        INSERT INTO assets(exchange_id, symbol, base_asset, quote_asset, created_at, updated_at)
+        VALUES ({sql_placeholders(conn, 6)})
+        ON CONFLICT (exchange_id, symbol) DO NOTHING
         """,
         list(dedup.values()),
     )
@@ -2086,7 +2722,7 @@ def _seed_assets_from_existing_tables(conn: sqlite3.Connection) -> int:
 
 
 def _upsert_asset(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     exchange_id: str,
     symbol: str,
@@ -2108,25 +2744,27 @@ def _upsert_asset(
     if status_norm is not None and status_norm not in {"active", "disabled"}:
         status_norm = None
 
+    created_at = now_utc_iso()
+    updated_at = created_at
     conn.execute(
         """
         INSERT INTO assets(exchange_id, symbol, base_asset, quote_asset, status, created_at, updated_at)
-        VALUES (:exchange_id, :symbol, :base_asset, :quote_asset, COALESCE(:status, 'active'), :created_at, :updated_at)
+        VALUES (%s, %s, %s, %s, COALESCE(%s, 'active'), %s, %s)
         ON CONFLICT(exchange_id, symbol) DO UPDATE SET
             base_asset = COALESCE(excluded.base_asset, assets.base_asset),
             quote_asset = COALESCE(excluded.quote_asset, assets.quote_asset),
             status = COALESCE(excluded.status, assets.status),
             updated_at = excluded.updated_at
         """,
-        {
-            "exchange_id": ex_id,
-            "symbol": sym,
-            "base_asset": base_norm,
-            "quote_asset": quote_norm,
-            "status": status_norm,
-            "created_at": now_utc_iso(),
-            "updated_at": now_utc_iso(),
-        },
+        (
+            ex_id,
+            sym,
+            base_norm,
+            quote_norm,
+            status_norm,
+            created_at,
+            updated_at,
+        ),
     )
 
 
@@ -2172,7 +2810,7 @@ def upsert_assets_bulk(exchange_id: str, rows: Iterable[tuple[str, Optional[str]
     if not payload:
         return 0
 
-    # Deduplicate before insert (SQLite executemany does not dedupe automatically).
+    # Deduplicate before insert (executemany does not dedupe automatically).
     dedup: dict[tuple[str, str], tuple[str, str, Optional[str], Optional[str], str, str]] = {}
     for ex, sym, b, q, ca, ua in payload:
         key = (ex, sym)
@@ -2185,7 +2823,7 @@ def upsert_assets_bulk(exchange_id: str, rows: Iterable[tuple[str, Optional[str]
             conn.executemany(
                 """
                 INSERT INTO assets(exchange_id, symbol, base_asset, quote_asset, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'active', ?, ?)
+                VALUES (%s, %s, %s, %s, 'active', %s, %s)
                 ON CONFLICT(exchange_id, symbol) DO UPDATE SET
                     base_asset = COALESCE(excluded.base_asset, assets.base_asset),
                     quote_asset = COALESCE(excluded.quote_asset, assets.quote_asset),
@@ -2210,17 +2848,10 @@ def list_assets(
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-
-        where = ""
-        params: list[Any] = [ex_id, uid, ex_id]
-        if st_norm != "all":
-            where = "WHERE a.status = ?"
-            params.insert(1, st_norm)
 
         # One query: assets + a comma-separated list of category names for this user.
-        rows = conn.execute(
+        rows = execute_fetchall(
+            conn,
             f"""
             SELECT
                 a.id,
@@ -2231,23 +2862,23 @@ def list_assets(
                 a.status,
                 a.created_at,
                 a.updated_at,
-                COALESCE(GROUP_CONCAT(DISTINCT c.name), '') AS categories_csv
+                COALESCE(STRING_AGG(DISTINCT c.name, ','), '') AS categories_csv
             FROM assets a
             LEFT JOIN asset_category_membership m
                 ON m.exchange_id = a.exchange_id
                 AND m.symbol = a.symbol
-                AND m.user_id = ?
+                AND m.user_id = %s
             LEFT JOIN asset_categories c
                 ON c.id = m.category_id
                 AND c.user_id = m.user_id
                 AND c.exchange_id = m.exchange_id
-            WHERE a.exchange_id = ?
-            {('AND a.status = ?' if st_norm != 'all' else '')}
+            WHERE a.exchange_id = %s
+            {('AND a.status = %s' if st_norm != 'all' else '')}
             GROUP BY a.id
             ORDER BY a.base_asset ASC, a.symbol ASC
             """,
             tuple([uid, ex_id] + ([st_norm] if st_norm != "all" else [])),
-        ).fetchall()
+        )
 
     out: list[Dict[str, Any]] = []
     for r in rows or []:
@@ -2263,9 +2894,8 @@ def list_categories(user_id: str, exchange_id: str) -> List[Dict[str, Any]]:
     ex_id = (exchange_id or "").strip()
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-        rows = conn.execute(
+        rows = execute_fetchall(
+            conn,
             """
             SELECT
                 c.*, 
@@ -2279,11 +2909,11 @@ def list_categories(user_id: str, exchange_id: str) -> List[Dict[str, Any]]:
                 ON mc.user_id = c.user_id
                 AND mc.exchange_id = c.exchange_id
                 AND mc.category_id = c.id
-            WHERE c.user_id = ? AND c.exchange_id = ?
+            WHERE c.user_id = %s AND c.exchange_id = %s
             ORDER BY c.name ASC
             """,
             (uid, ex_id),
-        ).fetchall()
+        )
     return [dict(r) for r in rows or []]
 
 
@@ -2308,9 +2938,9 @@ def set_assets_status(exchange_id: str, symbols: Iterable[str], status: str) -> 
             chunk = 300
             for i in range(0, len(syms), chunk):
                 part = syms[i : i + chunk]
-                placeholders = ",".join(["?"] * len(part))
+                placeholders = ",".join(["%s"] * len(part))
                 cur = conn.execute(
-                    f"UPDATE assets SET status = ?, updated_at = ? WHERE exchange_id = ? AND symbol IN ({placeholders})",
+                    f"UPDATE assets SET status = %s, updated_at = %s WHERE exchange_id = %s AND symbol IN ({placeholders})",
                     tuple([st_norm, now, ex_id] + part),
                 )
                 try:
@@ -2333,23 +2963,22 @@ def create_category(user_id: str, exchange_id: str, name: str, source: str = "us
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
         with conn:
             conn.execute(
                 """
                 INSERT INTO asset_categories(user_id, exchange_id, name, source, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT(user_id, exchange_id, name) DO UPDATE SET
                     updated_at = excluded.updated_at
                 """,
                 (uid, ex_id, nm, src, now, now),
             )
-            row = conn.execute(
-                "SELECT id FROM asset_categories WHERE user_id = ? AND exchange_id = ? AND name = ?",
+            row = execute_fetchone(
+                conn,
+                "SELECT id FROM asset_categories WHERE user_id = %s AND exchange_id = %s AND name = %s",
                 (uid, ex_id, nm),
-            ).fetchone()
-            return int(row[0]) if row else 0
+            )
+            return int(row.get("id")) if row else 0
 
 
 def get_category_symbols(user_id: str, exchange_id: str, category_id: int) -> List[str]:
@@ -2358,16 +2987,17 @@ def get_category_symbols(user_id: str, exchange_id: str, category_id: int) -> Li
     cid = int(category_id)
     with _get_conn() as conn:
         _ensure_schema(conn)
-        rows = conn.execute(
+        rows = execute_fetchall(
+            conn,
             """
             SELECT symbol
             FROM asset_category_membership
-            WHERE user_id = ? AND exchange_id = ? AND category_id = ?
+            WHERE user_id = %s AND exchange_id = %s AND category_id = %s
             ORDER BY symbol ASC
             """,
             (uid, ex_id, cid),
-        ).fetchall()
-    return [str(r[0]) for r in rows or [] if r and str(r[0] or "").strip()]
+        )
+        return [str(r.get("symbol")) for r in rows or [] if r and str(r.get("symbol") or "").strip()]
 
 
 def set_category_membership(
@@ -2402,23 +3032,24 @@ def set_category_membership(
             if add_rows:
                 conn.executemany(
                     """
-                    INSERT OR IGNORE INTO asset_category_membership(user_id, exchange_id, category_id, symbol, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO asset_category_membership(user_id, exchange_id, category_id, symbol, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
                     """,
                     add_rows,
                 )
             if rem_rows:
-                # Chunk to stay under SQLite parameter limits.
+                # Chunk to stay under parameter limits.
                 chunk = 300
                 for i in range(0, len(rem_rows), chunk):
                     part = rem_rows[i : i + chunk]
-                    placeholders = ",".join(["?"] * len(part))
+                    placeholders = ",".join(["%s"] * len(part))
                     conn.execute(
-                        f"DELETE FROM asset_category_membership WHERE user_id = ? AND exchange_id = ? AND category_id = ? AND symbol IN ({placeholders})",
+                        f"DELETE FROM asset_category_membership WHERE user_id = %s AND exchange_id = %s AND category_id = %s AND symbol IN ({placeholders})",
                         tuple([uid, ex_id, cid] + part),
                     )
             conn.execute(
-                "UPDATE asset_categories SET updated_at = ? WHERE user_id = ? AND exchange_id = ? AND id = ?",
+                "UPDATE asset_categories SET updated_at = %s WHERE user_id = %s AND exchange_id = %s AND id = %s",
                 (now, uid, ex_id, cid),
             )
 
@@ -2436,11 +3067,11 @@ def delete_category(user_id: str, exchange_id: str, category_id: int) -> int:
         _ensure_schema(conn)
         with conn:
             conn.execute(
-                "DELETE FROM asset_category_membership WHERE user_id = ? AND exchange_id = ? AND category_id = ?",
+                "DELETE FROM asset_category_membership WHERE user_id = %s AND exchange_id = %s AND category_id = %s",
                 (uid, ex_id, cid),
             )
             cur = conn.execute(
-                "DELETE FROM asset_categories WHERE user_id = ? AND exchange_id = ? AND id = ?",
+                "DELETE FROM asset_categories WHERE user_id = %s AND exchange_id = %s AND id = %s",
                 (uid, ex_id, cid),
             )
             return int(cur.rowcount or 0)
@@ -2450,7 +3081,7 @@ def seed_asset_categories_if_empty(user_id: str, exchange_id: str, *, force: boo
     """One-time best-effort category seeding.
 
     Never overwrites user edits: when categories exist, default is a no-op.
-    If `force=True`, this runs in merge mode (adds missing auto categories/memberships via INSERT OR IGNORE).
+    If `force=True`, this runs in merge mode (adds missing auto categories/memberships via ON CONFLICT DO NOTHING).
     """
 
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
@@ -2460,11 +3091,12 @@ def seed_asset_categories_if_empty(user_id: str, exchange_id: str, *, force: boo
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        row = conn.execute(
-            "SELECT COUNT(*) FROM asset_categories WHERE user_id = ? AND exchange_id = ?",
+        row = execute_fetchone(
+            conn,
+            "SELECT COUNT(*) AS c FROM asset_categories WHERE user_id = %s AND exchange_id = %s",
             (uid, ex_id),
-        ).fetchone()
-        existing = int(row[0] if row is not None else 0)
+        )
+        existing = int(row.get("c") if row is not None else 0)
         if existing > 0 and not bool(force):
             return {"status": "skipped", "reason": "categories_exist", "created_categories": 0, "created_memberships": 0}
 
@@ -2525,9 +3157,6 @@ def seed_asset_categories_if_empty(user_id: str, exchange_id: str, *, force: boo
     # Map tickers -> exchange symbols using assets.base_asset.
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-
         for cat_name, tickers in ticker_map.items():
             cid = cat_name_to_id.get(cat_name)
             if not cid or not tickers:
@@ -2537,37 +3166,41 @@ def seed_asset_categories_if_empty(user_id: str, exchange_id: str, *, force: boo
             symbols: list[str] = []
             for i in range(0, len(tick_list), chunk):
                 part = tick_list[i : i + chunk]
-                placeholders = ",".join(["?"] * len(part))
-                rows = conn.execute(
-                    f"SELECT symbol FROM assets WHERE exchange_id = ? AND base_asset IN ({placeholders}) AND status = 'active'",
+                placeholders = ",".join([sql_placeholder(conn)] * len(part))
+                rows = execute_fetchall(
+                    conn,
+                    f"SELECT symbol FROM assets WHERE exchange_id = {sql_placeholder(conn)} AND base_asset IN ({placeholders}) AND status = 'active'",
                     tuple([ex_id] + part),
-                ).fetchall()
+                )
                 for r in rows or []:
-                    s = str(r[0] or "").strip()
+                    s = str(r.get("symbol") or "").strip()
                     if s:
                         symbols.append(s)
             if symbols:
-                before = conn.execute(
-                    "SELECT COUNT(*) FROM asset_category_membership WHERE user_id = ? AND exchange_id = ? AND category_id = ?",
+                before = execute_fetchone(
+                    conn,
+                    f"SELECT COUNT(*) AS c FROM asset_category_membership WHERE user_id = {sql_placeholder(conn)} AND exchange_id = {sql_placeholder(conn)} AND category_id = {sql_placeholder(conn)}",
                     (uid, ex_id, int(cid)),
-                ).fetchone()
-                before_n = int(before[0] if before is not None else 0)
+                )
+                before_n = int(before.get("c") if before is not None else 0)
 
                 # Insert (ignore duplicates).
                 now = now_utc_iso()
                 conn.executemany(
-                    """
-                    INSERT OR IGNORE INTO asset_category_membership(user_id, exchange_id, category_id, symbol, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    f"""
+                    INSERT INTO asset_category_membership(user_id, exchange_id, category_id, symbol, created_at)
+                    VALUES ({sql_placeholders(conn, 5)})
+                    ON CONFLICT DO NOTHING
                     """,
                     [(uid, ex_id, int(cid), s, now) for s in sorted(set(symbols))],
                 )
 
-                after = conn.execute(
-                    "SELECT COUNT(*) FROM asset_category_membership WHERE user_id = ? AND exchange_id = ? AND category_id = ?",
+                after = execute_fetchone(
+                    conn,
+                    f"SELECT COUNT(*) AS c FROM asset_category_membership WHERE user_id = {sql_placeholder(conn)} AND exchange_id = {sql_placeholder(conn)} AND category_id = {sql_placeholder(conn)}",
                     (uid, ex_id, int(cid)),
-                ).fetchone()
-                after_n = int(after[0] if after is not None else 0)
+                )
+                after_n = int(after.get("c") if after is not None else 0)
                 created_memberships += max(0, after_n - before_n)
 
         conn.commit()
@@ -2580,7 +3213,7 @@ def seed_asset_categories_if_empty(user_id: str, exchange_id: str, *, force: boo
 
 
 def get_symbols_primary_category_map(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     user_id: str,
     exchange_id: str,
@@ -2595,15 +3228,13 @@ def get_symbols_primary_category_map(
     syms = [str(s or "").strip() for s in (symbols or []) if str(s or "").strip()]
     if not ex_id or not syms:
         return {}
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-
     out: Dict[str, str] = {}
     chunk = 300
     for i in range(0, len(syms), chunk):
         part = syms[i : i + chunk]
-        placeholders = ",".join(["?"] * len(part))
-        rows = conn.execute(
+        placeholders = ",".join(["%s"] * len(part))
+        rows = execute_fetchall(
+            conn,
             f"""
             SELECT m.symbol, MIN(c.name) AS cat
             FROM asset_category_membership m
@@ -2611,14 +3242,14 @@ def get_symbols_primary_category_map(
                 ON c.id = m.category_id
                 AND c.user_id = m.user_id
                 AND c.exchange_id = m.exchange_id
-            WHERE m.user_id = ? AND m.exchange_id = ? AND m.symbol IN ({placeholders})
+            WHERE m.user_id = %s AND m.exchange_id = %s AND m.symbol IN ({placeholders})
             GROUP BY m.symbol
             """,
             tuple([uid, ex_id] + part),
-        ).fetchall()
+        )
         for r in rows or []:
-            sym = str(r[0] or "").strip()
-            cat = str(r[1] or "").strip()
+            sym = str(r.get("symbol") or "").strip()
+            cat = str(r.get("cat") or "").strip()
             if sym and cat:
                 out[sym] = cat
     return out
@@ -2629,7 +3260,7 @@ def update_sweep_status(sweep_id: str, status: str, error_message: Optional[str]
         _ensure_schema(conn)
         with conn:
             conn.execute(
-                "UPDATE sweeps SET status = ?, error_message = ? WHERE id = ?",
+                "UPDATE sweeps SET status = %s, error_message = %s WHERE id = %s",
                 (status, error_message, sweep_id),
             )
 
@@ -2651,33 +3282,24 @@ def delete_sweep_and_runs(*, user_id: str, sweep_id: str) -> Dict[str, int]:
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-
         # Ensure the sweep exists and is in-scope for this user (legacy DBs may have NULL/empty user_id).
         try:
-            sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
+            sweep_cols = get_table_columns(conn, "sweeps")
         except Exception:
             sweep_cols = set()
         if "user_id" in sweep_cols:
-            row = conn.execute(
-                "SELECT id FROM sweeps WHERE id = ? AND (user_id = ? OR user_id IS NULL OR TRIM(user_id) = '')",
+            row = execute_fetchone(
+                conn,
+                "SELECT id FROM sweeps WHERE id = %s AND (user_id = %s OR user_id IS NULL OR TRIM(user_id) = '')",
                 (sid, uid),
-            ).fetchone()
+            )
         else:
-            row = conn.execute("SELECT id FROM sweeps WHERE id = ?", (sid,)).fetchone()
+            row = execute_fetchone(conn, "SELECT id FROM sweeps WHERE id = %s", (sid,))
         if row is None:
             raise ValueError(f"Sweep not found (or not accessible): {sid}")
 
-        run_rows = conn.execute("SELECT id FROM backtest_runs WHERE sweep_id = ?", (sid,)).fetchall()
-        run_ids: list[str] = []
-        for r in run_rows or []:
-            try:
-                rid = str((r[0] if not isinstance(r, sqlite3.Row) else r["id"]) or "").strip()
-            except Exception:
-                rid = ""
-            if rid:
-                run_ids.append(rid)
+        run_rows = execute_fetchall(conn, "SELECT id FROM backtest_runs WHERE sweep_id = %s", (sid,))
+        run_ids = [str(r.get("id") or "").strip() for r in run_rows or [] if r and str(r.get("id") or "").strip()]
 
         details_deleted = 0
         shortlist_deleted = 0
@@ -2688,58 +3310,58 @@ def delete_sweep_and_runs(*, user_id: str, sweep_id: str) -> Dict[str, int]:
 
         with conn:
             if run_ids:
-                placeholders = ",".join(["?"] * len(run_ids))
+                placeholders = ",".join(["%s"] * len(run_ids))
 
                 # backtest_run_details
                 try:
                     cur = conn.execute(f"DELETE FROM backtest_run_details WHERE run_id IN ({placeholders})", tuple(run_ids))
                     details_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
-                except sqlite3.OperationalError:
+                except DbErrors.OperationalError:
                     details_deleted = 0
 
                 # per-user run shortlist cleanup
                 try:
                     cur = conn.execute(
-                        f"DELETE FROM run_shortlists WHERE user_id = ? AND run_id IN ({placeholders})",
+                        f"DELETE FROM run_shortlists WHERE user_id = %s AND run_id IN ({placeholders})",
                         tuple([uid] + run_ids),
                     )
                     shortlist_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
-                except sqlite3.OperationalError:
+                except DbErrors.OperationalError:
                     shortlist_deleted = 0
 
                 # bot_run_map cleanup (best-effort)
                 try:
                     cur = conn.execute(f"DELETE FROM bot_run_map WHERE run_id IN ({placeholders})", tuple(run_ids))
                     bot_run_map_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
-                except sqlite3.OperationalError:
+                except DbErrors.OperationalError:
                     bot_run_map_deleted = 0
 
                 # jobs cleanup (best-effort)
                 try:
                     # sweep-level jobs
                     cur = conn.execute(
-                        "DELETE FROM jobs WHERE sweep_id = ? OR payload_json LIKE ?",
+                        "DELETE FROM jobs WHERE sweep_id = %s OR payload_json LIKE %s",
                         (sid, f'%"sweep_id": "{sid}"%'),
                     )
                     jobs_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
-                except sqlite3.OperationalError:
+                except DbErrors.OperationalError:
                     pass
                 try:
                     # run-level jobs: payload_json is more reliable than the (legacy) integer run_id column.
                     for rid in run_ids:
                         cur = conn.execute(
-                            "DELETE FROM jobs WHERE payload_json LIKE ?",
+                            "DELETE FROM jobs WHERE payload_json LIKE %s",
                             (f'%"run_id": "{rid}"%',),
                         )
                         jobs_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
-                except sqlite3.OperationalError:
+                except DbErrors.OperationalError:
                     pass
 
             # Delete runs, then sweep.
-            cur = conn.execute("DELETE FROM backtest_runs WHERE sweep_id = ?", (sid,))
+            cur = conn.execute("DELETE FROM backtest_runs WHERE sweep_id = %s", (sid,))
             runs_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
 
-            cur = conn.execute("DELETE FROM sweeps WHERE id = ?", (sid,))
+            cur = conn.execute("DELETE FROM sweeps WHERE id = %s", (sid,))
             sweeps_deleted = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
 
         return {
@@ -2752,18 +3374,305 @@ def delete_sweep_and_runs(*, user_id: str, sweep_id: str) -> Dict[str, int]:
         }
 
 
+def _is_db_locked_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return "database is locked" in msg or "database table is locked" in msg or "locked" in msg
+
+
+def _run_write_with_retry(fn, *, retries: int = 3, base_sleep_s: float = 0.4) -> Any:
+    """Run a DB write with brief retry/backoff for transient locks."""
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            return fn()
+        except DbErrors.OperationalError as exc:
+            last_exc = exc
+            if not _is_db_locked_error(exc):
+                raise
+            sleep_s = float(base_sleep_s) * (2 ** attempt)
+            time.sleep(sleep_s)
+        except Exception as exc:
+            last_exc = exc
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
+def _build_runs_filter_sql(
+    *,
+    older_than_days: Optional[int] = None,
+    sweep_ids: Optional[Sequence[str]] = None,
+    max_profit: Optional[float] = None,
+    roi_threshold_pct: Optional[float] = None,
+    only_completed: bool = False,
+) -> tuple[str, list[Any]]:
+    """Return WHERE SQL + params for backtest_runs filters."""
+
+    where_parts: list[str] = []
+    params: list[Any] = []
+
+    if older_than_days is not None and int(older_than_days) > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+        where_parts.append("created_at < %s")
+        params.append(cutoff.isoformat())
+
+    if sweep_ids:
+        sweep_ids_clean = [str(s).strip() for s in sweep_ids if str(s).strip()]
+        if sweep_ids_clean:
+            placeholders = ",".join(["%s"] * len(sweep_ids_clean))
+            where_parts.append(f"sweep_id IN ({placeholders})")
+            params.extend(sweep_ids_clean)
+
+    if max_profit is not None:
+        where_parts.append("net_profit IS NOT NULL AND net_profit <= %s")
+        params.append(float(max_profit))
+
+    if roi_threshold_pct is not None:
+        roi_expr = (
+            "COALESCE(roi_pct_on_margin, "
+            "CASE WHEN net_return_pct BETWEEN -1 AND 1 THEN net_return_pct * 100.0 ELSE net_return_pct END)"
+        )
+        where_parts.append(f"{roi_expr} IS NOT NULL AND {roi_expr} <= %s")
+        params.append(float(roi_threshold_pct))
+
+    if only_completed:
+        where_parts.append("end_time IS NOT NULL AND TRIM(COALESCE(end_time, '')) <> ''")
+
+    where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    return where_sql, params
+
+
+def count_runs_matching_filters(
+    *,
+    older_than_days: Optional[int] = None,
+    sweep_ids: Optional[Sequence[str]] = None,
+    max_profit: Optional[float] = None,
+    roi_threshold_pct: Optional[float] = None,
+    only_completed: bool = False,
+    conn: Optional[Any] = None,
+) -> int:
+    """Count backtest_runs matching filter criteria."""
+
+    where_sql, params = _build_runs_filter_sql(
+        older_than_days=older_than_days,
+        sweep_ids=sweep_ids,
+        max_profit=max_profit,
+        roi_threshold_pct=roi_threshold_pct,
+        only_completed=only_completed,
+    )
+
+    connection = conn or open_db_connection()
+    try:
+        _ensure_schema(connection)
+        row = execute_fetchone(
+            connection,
+            f"SELECT COUNT(*) AS c FROM backtest_runs{where_sql}",
+            tuple(params),
+        )
+        return int(row.get("c") if row is not None else 0)
+    finally:
+        if conn is None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
+def clear_run_details_payloads(
+    *,
+    older_than_days: Optional[int] = None,
+    sweep_ids: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
+    """Clear large payload columns while preserving run basics + metrics/config."""
+
+    where_sql, params = _build_runs_filter_sql(older_than_days=older_than_days, sweep_ids=sweep_ids)
+    if not where_sql:
+        where_sql = " WHERE 1=1"
+
+    details_updated = 0
+    runs_updated = 0
+
+    with open_db_connection() as conn:
+        _ensure_schema(conn)
+
+        try:
+            detail_cols = get_table_columns(conn, "backtest_run_details")
+        except Exception:
+            detail_cols = set()
+
+        clear_cols = [
+            c
+            for c in (
+                "trades_json",
+                "equity_curve_json",
+                "equity_timestamps_json",
+                "extra_series_json",
+                "candles_json",
+                "params_json",
+                "run_context_json",
+                "computed_metrics_json",
+            )
+            if c in detail_cols
+        ]
+
+        def _do_update() -> None:
+            nonlocal details_updated, runs_updated
+            now = now_utc_iso()
+            if clear_cols:
+                set_bits = [f"{c}=NULL" for c in clear_cols]
+                params_update: list[Any] = []
+                if "updated_at" in detail_cols:
+                    set_bits.append("updated_at = %s")
+                    params_update.append(now)
+
+                sql = (
+                    "UPDATE backtest_run_details SET "
+                    + ", ".join(set_bits)
+                    + f" WHERE run_id IN (SELECT id FROM backtest_runs{where_sql})"
+                )
+                cur = conn.execute(sql, tuple(params_update + params))
+                details_updated = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+
+            # Legacy: clear trades_json on backtest_runs (if present)
+            try:
+                run_cols = get_table_columns(conn, "backtest_runs")
+            except Exception:
+                run_cols = set()
+            if "trades_json" in run_cols:
+                cur2 = conn.execute(
+                    f"UPDATE backtest_runs SET trades_json = NULL WHERE id IN (SELECT id FROM backtest_runs{where_sql})",
+                    tuple(params),
+                )
+                runs_updated = int(cur2.rowcount if cur2.rowcount is not None and cur2.rowcount >= 0 else 0)
+
+            conn.commit()
+
+        try:
+            _run_write_with_retry(_do_update)
+        except Exception as exc:
+            if _is_db_locked_error(exc):
+                raise RuntimeError("Database is locked. Please retry in a moment.") from exc
+            raise
+
+    return {"details_updated": int(details_updated), "runs_updated": int(runs_updated)}
+
+
+def delete_runs_and_children(
+    *,
+    older_than_days: Optional[int] = None,
+    sweep_ids: Optional[Sequence[str]] = None,
+    max_profit: Optional[float] = None,
+    roi_threshold_pct: Optional[float] = None,
+    only_completed: bool = False,
+    batch_size: int = 500,
+) -> Dict[str, int]:
+    """Delete runs and child tables in batches for safety."""
+
+    where_sql, params = _build_runs_filter_sql(
+        older_than_days=older_than_days,
+        sweep_ids=sweep_ids,
+        max_profit=max_profit,
+        roi_threshold_pct=roi_threshold_pct,
+        only_completed=only_completed,
+    )
+
+    total_deleted = 0
+    details_deleted = 0
+    shortlists_deleted = 0
+    bot_run_map_deleted = 0
+
+    with open_db_connection() as conn:
+        _ensure_schema(conn)
+
+        batch_size_i = max(1, int(batch_size or 500))
+
+        while True:
+            rows = execute_fetchall(
+                conn,
+                f"SELECT id FROM backtest_runs{where_sql} ORDER BY created_at ASC LIMIT %s",
+                tuple(params + [batch_size_i]),
+            )
+            if not rows:
+                break
+
+            run_ids = [str(r.get("id") or "").strip() for r in rows if r and str(r.get("id") or "").strip()]
+            if not run_ids:
+                break
+
+            placeholders = ",".join(["%s"] * len(run_ids))
+
+            def _delete_batch() -> None:
+                nonlocal total_deleted, details_deleted, shortlists_deleted, bot_run_map_deleted
+
+                # backtest_run_details
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM backtest_run_details WHERE run_id IN ({placeholders})",
+                        tuple(run_ids),
+                    )
+                    details_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except DbErrors.OperationalError:
+                    pass
+
+                # run_shortlists
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM run_shortlists WHERE run_id IN ({placeholders})",
+                        tuple(run_ids),
+                    )
+                    shortlists_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except DbErrors.OperationalError:
+                    pass
+
+                # bot_run_map
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM bot_run_map WHERE run_id IN ({placeholders})",
+                        tuple(run_ids),
+                    )
+                    bot_run_map_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+                except DbErrors.OperationalError:
+                    pass
+
+                # backtest_runs
+                cur = conn.execute(
+                    f"DELETE FROM backtest_runs WHERE id IN ({placeholders})",
+                    tuple(run_ids),
+                )
+                total_deleted += int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+
+                conn.commit()
+
+            try:
+                _run_write_with_retry(_delete_batch)
+            except Exception as exc:
+                if _is_db_locked_error(exc):
+                    raise RuntimeError("Database is locked. Please retry in a moment.") from exc
+                raise
+
+    return {
+        "runs_deleted": int(total_deleted),
+        "details_deleted": int(details_deleted),
+        "shortlists_deleted": int(shortlists_deleted),
+        "bot_run_map_deleted": int(bot_run_map_deleted),
+    }
+
+
 def list_sweeps(limit: int = 100, offset: int = 0) -> List[Dict]:
     with _get_conn() as conn:
         _ensure_schema(conn)
         with profile_span("db.list_sweeps", meta={"limit": int(limit), "offset": int(offset)}):
-            rows = conn.execute(
-            """
-            SELECT * FROM sweeps
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            (limit, offset),
-            ).fetchall()
+            rows = execute_fetchall(
+                conn,
+                """
+                SELECT * FROM sweeps
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
     return [dict(r) for r in rows]
 
 
@@ -2785,14 +3694,14 @@ def list_sweeps_with_run_counts(
     with _get_conn() as conn:
         _ensure_schema(conn)
         try:
-            sweep_cols = {row[1] for row in conn.execute("PRAGMA table_info(sweeps)").fetchall()}
+            sweep_cols = get_table_columns(conn, "sweeps")
         except Exception:
             sweep_cols = set()
 
         where_clause = ""
         params: list[Any] = []
         if "user_id" in sweep_cols:
-            where_clause = "WHERE (s.user_id = ? OR s.user_id IS NULL OR TRIM(s.user_id) = '')"
+            where_clause = "WHERE (s.user_id = %s OR s.user_id IS NULL OR TRIM(s.user_id) = '')"
             params.append(uid)
 
         params.extend([int(limit), int(offset)])
@@ -2801,7 +3710,7 @@ def list_sweeps_with_run_counts(
             "db.list_sweeps_with_run_counts",
             meta={"limit": int(limit), "offset": int(offset), "user_scoped": bool(where_clause)},
         ):
-            rows = conn.execute(
+            rows = execute_fetchall(
                 f"""
                 SELECT
                     s.*,
@@ -2816,10 +3725,10 @@ def list_sweeps_with_run_counts(
                     ON rc.sweep_id = s.id
                 {where_clause}
                 ORDER BY s.created_at DESC
-                LIMIT ? OFFSET ?
+                LIMIT %s OFFSET %s
                 """,
                 tuple(params),
-            ).fetchall()
+            )
 
     return [dict(r) for r in rows]
 
@@ -2842,7 +3751,7 @@ def list_sweep_best_metrics(*, user_id: str) -> List[Dict[str, Any]]:
         _ensure_schema(conn)
 
         try:
-            run_cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_runs)").fetchall()}
+            run_cols = get_table_columns(conn, "backtest_runs")
         except Exception:
             run_cols = set()
 
@@ -2864,7 +3773,7 @@ def list_sweep_best_metrics(*, user_id: str) -> List[Dict[str, Any]]:
         where_bits: list[str] = ["sweep_id IS NOT NULL", "TRIM(COALESCE(sweep_id,'')) <> ''"]
         params: list[Any] = []
         if "user_id" in run_cols:
-            where_bits.append("(user_id = ? OR user_id IS NULL OR TRIM(user_id) = '')")
+            where_bits.append("(user_id = %s OR user_id IS NULL OR TRIM(user_id) = '')")
             params.append(uid)
 
         sql = (
@@ -2876,7 +3785,7 @@ def list_sweep_best_metrics(*, user_id: str) -> List[Dict[str, Any]]:
         )
 
         with profile_span("db.list_sweep_best_metrics", meta={"user_id": uid}):
-            rows = conn.execute(sql, params).fetchall()
+            rows = execute_fetchall(conn, sql, params)
         return [dict(r) for r in rows]
 
 
@@ -2893,12 +3802,13 @@ def get_sweep_run_count(*, user_id: str, sweep_id: str) -> int:
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM backtest_runs WHERE sweep_id = ?",
+        row = execute_fetchone(
+            conn,
+            "SELECT COUNT(*) AS c FROM backtest_runs WHERE sweep_id = %s",
             (sid,),
-        ).fetchone()
+        )
     try:
-        return int(row[0] if row is not None else 0)
+        return int(row.get("c") if row is not None else 0)
     except Exception:
         return 0
 
@@ -2906,7 +3816,7 @@ def get_sweep_run_count(*, user_id: str, sweep_id: str) -> int:
 def get_sweep(sweep_id: str) -> Optional[Dict]:
     with _get_conn() as conn:
         _ensure_schema(conn)
-        row = conn.execute("SELECT * FROM sweeps WHERE id = ?", (sweep_id,)).fetchone()
+        row = execute_fetchone(conn, "SELECT * FROM sweeps WHERE id = %s", (sweep_id,))
     return dict(row) if row else None
 
 
@@ -2914,14 +3824,15 @@ def list_runs_for_sweep(sweep_id: str) -> List[Dict]:
     with _get_conn() as conn:
         _ensure_schema(conn)
         with profile_span("db.list_runs_for_sweep", meta={"sweep_id": str(sweep_id)}):
-            rows = conn.execute(
-            """
-            SELECT * FROM backtest_runs
-            WHERE sweep_id = ?
-            ORDER BY created_at ASC
-            """,
-            (sweep_id,),
-            ).fetchall()
+            rows = execute_fetchall(
+                conn,
+                """
+                SELECT * FROM backtest_runs
+                WHERE sweep_id = %s
+                ORDER BY created_at ASC
+                """,
+                (sweep_id,),
+            )
     return [dict(r) for r in rows]
 
 
@@ -2935,7 +3846,6 @@ def _canonicalize_json_for_hash(raw: Any) -> str:
     if raw is None:
         return "null"
 
-    # Most callers store JSON strings in SQLite.
     if isinstance(raw, str):
         s = raw.strip()
         if not s:
@@ -2973,25 +3883,23 @@ def dedupe_sweep_runs(sweep_id: str) -> Dict[str, Any]:
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-
         with profile_span("db.dedupe_sweep_runs", meta={"sweep_id": sid}):
-            rows = conn.execute(
+            rows = execute_fetchall(
+                conn,
                 """
                 SELECT id, created_at, symbol, timeframe, strategy_name, strategy_version, config_json
                 FROM backtest_runs
-                WHERE sweep_id = ?
+                WHERE sweep_id = %s
                 ORDER BY created_at ASC
                 """,
                 (sid,),
-            ).fetchall()
+            )
 
             total = len(rows or [])
             if total <= 1:
                 return {"sweep_id": sid, "total": total, "deduped_groups": 0, "removed": 0}
 
-            groups: Dict[str, List[sqlite3.Row]] = {}
+            groups: Dict[str, List[Dict[str, Any]]] = {}
             for r in rows:
                 cfg_canon = _canonicalize_json_for_hash(r["config_json"])
                 cfg_hash = hashlib.sha256(cfg_canon.encode("utf-8", errors="ignore")).hexdigest()
@@ -3018,14 +3926,15 @@ def dedupe_sweep_runs(sweep_id: str) -> Dict[str, Any]:
                 # Prefer keeping a run that is already referenced by a live bot.
                 keep_id: Optional[str] = None
                 try:
-                    placeholders = ",".join(["?"] * len(bucket_ids))
-                    ref = conn.execute(
+                    placeholders = ",".join(["%s"] * len(bucket_ids))
+                    ref = execute_fetchone(
+                        conn,
                         f"SELECT run_id FROM bot_run_map WHERE run_id IN ({placeholders}) LIMIT 1",
                         tuple(bucket_ids),
-                    ).fetchone()
+                    )
                     if ref:
-                        keep_id = str(ref[0])
-                except sqlite3.OperationalError:
+                        keep_id = str(ref.get("run_id") or "")
+                except DbErrors.OperationalError:
                     keep_id = None
 
                 if not keep_id:
@@ -3037,15 +3946,14 @@ def dedupe_sweep_runs(sweep_id: str) -> Dict[str, Any]:
 
             removed = 0
             if to_remove:
-                placeholders = ",".join(["?"] * len(to_remove))
+                placeholders = ",".join(["%s"] * len(to_remove))
                 with conn:
                     try:
                         conn.execute(
                             f"DELETE FROM backtest_run_details WHERE run_id IN ({placeholders})",
                             tuple(to_remove),
                         )
-                    except sqlite3.OperationalError:
-                        # Legacy DB without details table.
+                    except Exception:
                         pass
                     cur = conn.execute(
                         f"DELETE FROM backtest_runs WHERE id IN ({placeholders})",
@@ -3061,10 +3969,8 @@ def dedupe_sweep_runs(sweep_id: str) -> Dict[str, Any]:
             }
 
 
-def get_setting(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT value_json FROM app_settings WHERE key = ?", (key,)).fetchone()
+def get_setting(conn: Any, key: str, default: Any = None) -> Any:
+    row = execute_fetchone(conn, "SELECT value_json FROM app_settings WHERE key = %s", (key,))
     if not row:
         return default
     try:
@@ -3073,15 +3979,14 @@ def get_setting(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
         return default
 
 
-def get_user_setting(conn: sqlite3.Connection, user_id: str, key: str, default: Any = None) -> Any:
+def get_user_setting(conn: Any, user_id: str, key: str, default: Any = None) -> Any:
     _ensure_schema(conn)
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    row = conn.execute(
-        "SELECT value_json FROM user_settings WHERE user_id = ? AND key = ?",
+    row = execute_fetchone(
+        conn,
+        "SELECT value_json FROM user_settings WHERE user_id = %s AND key = %s",
         (uid, str(key)),
-    ).fetchone()
+    )
     if not row:
         return default
     try:
@@ -3090,7 +3995,7 @@ def get_user_setting(conn: sqlite3.Connection, user_id: str, key: str, default: 
         return default
 
 
-def set_user_setting(conn: sqlite3.Connection, user_id: str, key: str, value: Any) -> None:
+def set_user_setting(conn: Any, user_id: str, key: str, value: Any) -> None:
     _ensure_schema(conn)
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     payload = json.dumps(value)
@@ -3098,7 +4003,7 @@ def set_user_setting(conn: sqlite3.Connection, user_id: str, key: str, value: An
     conn.execute(
         """
         INSERT INTO user_settings(user_id, key, value_json, updated_at)
-        VALUES (?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT(user_id, key) DO UPDATE
         SET value_json = excluded.value_json, updated_at = excluded.updated_at
         """,
@@ -3107,13 +4012,13 @@ def set_user_setting(conn: sqlite3.Connection, user_id: str, key: str, value: An
     conn.commit()
 
 
-def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
+def set_setting(conn: Any, key: str, value: Any) -> None:
     payload = json.dumps(value)
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO app_settings(key, value_json, updated_at)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
         """,
         (key, payload, now),
@@ -3121,10 +4026,8 @@ def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
     conn.commit()
 
 
-def get_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT key, value_json FROM app_settings").fetchall()
+def get_settings(conn: Any) -> Dict[str, Any]:
+    rows = execute_fetchall(conn, "SELECT key, value_json FROM app_settings")
     out: Dict[str, Any] = {}
     for row in rows:
         try:
@@ -3134,7 +4037,7 @@ def get_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
     return out
 
 
-def get_app_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
+def get_app_settings(conn: Any) -> Dict[str, Any]:
     defaults = {
         "initial_balance_default": 1000.0,
         "fee_spot_pct": 0.10,
@@ -3189,7 +4092,7 @@ def get_app_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
 def get_backtest_run_chart_artifacts(
     run_id: str,
     *,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Load stored chart artifacts for a run (if present).
 
@@ -3199,12 +4102,10 @@ def get_backtest_run_chart_artifacts(
 
     rid = str(run_id)
     connection = conn or _get_conn()
-    if connection.row_factory is None:
-        connection.row_factory = sqlite3.Row
 
     # Guard for legacy DBs that don't have the columns yet.
     try:
-        cols = {row[1] for row in connection.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
+        cols = get_table_columns(connection, "backtest_run_details")
     except Exception:
         cols = set()
     required = {"equity_curve_json", "equity_timestamps_json", "extra_series_json"}
@@ -3219,11 +4120,12 @@ def get_backtest_run_chart_artifacts(
         for opt in ("candles_json", "params_json", "run_context_json", "computed_metrics_json"):
             if opt in cols:
                 select_cols.append(opt)
-        row = connection.execute(
-            f"SELECT {', '.join(select_cols)} FROM backtest_run_details WHERE run_id = ?",
+        row = execute_fetchone(
+            connection,
+            f"SELECT {', '.join(select_cols)} FROM backtest_run_details WHERE run_id = %s",
             (rid,),
-        ).fetchone()
-    except sqlite3.OperationalError:
+        )
+    except DbErrors.OperationalError:
         row = None
 
     if conn is None:
@@ -3302,7 +4204,7 @@ def get_backtest_run_chart_artifacts(
 
 
 def set_backtest_run_chart_artifacts(
-    conn: sqlite3.Connection,
+    conn: Any,
     run_id: str,
     *,
     equity_curve: Optional[list],
@@ -3315,7 +4217,7 @@ def set_backtest_run_chart_artifacts(
     rid = str(run_id)
 
     try:
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_run_details)").fetchall()}
+        cols = get_table_columns(conn, "backtest_run_details")
     except Exception:
         cols = set()
     required = {"equity_curve_json", "equity_timestamps_json", "extra_series_json", "updated_at"}
@@ -3330,18 +4232,18 @@ def set_backtest_run_chart_artifacts(
     conn.execute(
         """
         UPDATE backtest_run_details
-        SET equity_curve_json = COALESCE(?, equity_curve_json),
-            equity_timestamps_json = COALESCE(?, equity_timestamps_json),
-            extra_series_json = COALESCE(?, extra_series_json),
-            updated_at = ?
-        WHERE run_id = ?
+        SET equity_curve_json = COALESCE(%s, equity_curve_json),
+            equity_timestamps_json = COALESCE(%s, equity_timestamps_json),
+            extra_series_json = COALESCE(%s, extra_series_json),
+            updated_at = %s
+        WHERE run_id = %s
         """,
         (eq_payload, ts_payload, extra_payload, now, rid),
     )
     conn.commit()
 
 
-def get_setting_bool(conn: sqlite3.Connection, key: str, default: bool = False) -> bool:
+def get_setting_bool(conn: Any, key: str, default: bool = False) -> bool:
     val = get_setting(conn, key, default)
     if isinstance(val, bool):
         return val
@@ -3358,12 +4260,12 @@ def get_setting_bool(conn: sqlite3.Connection, key: str, default: bool = False) 
     return bool(default)
 
 
-def set_setting_bool(conn: sqlite3.Connection, key: str, value: bool) -> None:
+def set_setting_bool(conn: Any, key: str, value: bool) -> None:
     set_setting(conn, key, bool(value))
 
 
 def create_job(
-    conn: sqlite3.Connection,
+    conn: Any,
     job_type: str,
     payload: Dict[str, Any],
     bot_id: Optional[int] = None,
@@ -3373,13 +4275,15 @@ def create_job(
     job_key: Optional[str] = None,
     parent_job_id: Optional[int] = None,
     group_key: Optional[str] = None,
+    priority: Optional[int] = None,
+    is_interactive: Optional[int] = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     payload_json = json.dumps(payload)
 
     # Backwards compatible: older DBs may not have newer columns.
     try:
-        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        job_cols = get_table_columns(conn, "jobs")
     except Exception:
         job_cols = set()
 
@@ -3408,36 +4312,62 @@ def create_job(
         cols.append("group_key")
         vals.append(str(group_key).strip() if group_key is not None else None)
 
+    # Optional job scheduling fields.
+    if priority is not None and "priority" in job_cols:
+        cols.append("priority")
+        vals.append(int(priority))
+    if is_interactive is not None and "is_interactive" in job_cols:
+        cols.append("is_interactive")
+        vals.append(1 if int(is_interactive) else 0)
+
     cols_sql = ", ".join(cols)
-    placeholders = ", ".join(["?"] * len(cols))
+    placeholders = sql_placeholders(conn, len(cols))
 
-    insert_prefix = "INSERT"
-    # Idempotent when job_key is set and supported.
-    if job_key is not None and "job_key" in job_cols:
-        insert_prefix = "INSERT OR IGNORE"
-
-    cur = conn.execute(
-        f"""
-        {insert_prefix} INTO jobs ({cols_sql})
-        VALUES ({placeholders})
-        """,
-        tuple(vals),
-    )
-    conn.commit()
-
+    if is_postgres(conn):
+        if job_key is not None and "job_key" in job_cols:
+            cur = conn.execute(
+                f"""
+                INSERT INTO jobs ({cols_sql})
+                VALUES ({placeholders})
+                ON CONFLICT (job_key) DO NOTHING
+                RETURNING id
+                """,
+                tuple(vals),
+            )
+        else:
+            cur = conn.execute(
+                f"""
+                INSERT INTO jobs ({cols_sql})
+                VALUES ({placeholders})
+                RETURNING id
+                """,
+                tuple(vals),
+            )
+        row = cur.fetchone()
+        conn.commit()
+        if row is not None:
+            return int(row[0])
     # If ignored due to UNIQUE(job_key), return existing id.
     if cur.rowcount == 0 and job_key is not None and "job_key" in job_cols:
-        row = conn.execute("SELECT id FROM jobs WHERE job_key = ? LIMIT 1", (str(job_key).strip(),)).fetchone()
+        row = conn.execute(
+            f"SELECT id FROM jobs WHERE job_key = {sql_placeholder(conn)} LIMIT 1",
+            (str(job_key).strip(),),
+        ).fetchone()
         if row is not None:
             try:
                 return int(row[0])
             except Exception:
                 pass
-    return int(cur.lastrowid)
+    if cur is not None:
+        try:
+            return int(cur.lastrowid)
+        except Exception:
+            pass
+    raise ValueError("Failed to create job")
 
 
 def create_bot(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     name: Optional[str],
     exchange_id: Optional[str],
@@ -3475,75 +4405,68 @@ def create_bot(
         "credentials_id": credentials_id,
         "account_id": account_id,
     }
-    bot_cols = {row[1] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
+    bot_cols = get_table_columns(conn, "bots")
+    cols = [
+        "name",
+        "exchange_id",
+        "symbol",
+        "timeframe",
+        "status",
+        "desired_status",
+        "config_json",
+        "heartbeat_at",
+        "heartbeat_msg",
+        "last_error",
+        "created_at",
+        "updated_at",
+        "user_id",
+        "credentials_id",
+    ]
     if "account_id" in bot_cols:
-        cur = conn.execute(
-            """
-            INSERT INTO bots (
-                name, exchange_id, symbol, timeframe,
-                status, desired_status, config_json,
-                heartbeat_at, heartbeat_msg, last_error,
-                created_at, updated_at,
-                user_id, credentials_id, account_id
-            ) VALUES (
-                :name, :exchange_id, :symbol, :timeframe,
-                :status, :desired_status, :config_json,
-                :heartbeat_at, :heartbeat_msg, :last_error,
-                :created_at, :updated_at,
-                :user_id, :credentials_id, :account_id
-            )
-            """,
-            payload,
-        )
-    else:
-        cur = conn.execute(
-            """
-            INSERT INTO bots (
-                name, exchange_id, symbol, timeframe,
-                status, desired_status, config_json,
-                heartbeat_at, heartbeat_msg, last_error,
-                created_at, updated_at,
-                user_id, credentials_id
-            ) VALUES (
-                :name, :exchange_id, :symbol, :timeframe,
-                :status, :desired_status, :config_json,
-                :heartbeat_at, :heartbeat_msg, :last_error,
-                :created_at, :updated_at,
-                :user_id, :credentials_id
-            )
-            """,
-            payload,
-        )
+        cols.append("account_id")
+
+    values = [payload.get(c) for c in cols]
+    placeholders = sql_placeholders(conn, len(cols))
+    sql = f"INSERT INTO bots ({', '.join(cols)}) VALUES ({placeholders})"
+    if is_postgres(conn):
+        sql += " RETURNING id"
+        cur = conn.execute(sql, tuple(values))
+        row = cur.fetchone()
+        conn.commit()
+        if row is not None:
+            return int(row[0])
+        raise ValueError("Failed to create bot")
+
+    cur = conn.execute(sql, tuple(values))
     conn.commit()
     return int(cur.lastrowid)
 
 
 def list_trading_accounts(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     exchange_id: Optional[str] = None,
     *,
     include_deleted: bool = False,
 ) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    where = ["user_id = ?"]
+    where = ["user_id = %s"]
     params: list[Any] = [uid]
     if exchange_id is not None:
-        where.append("exchange_id = ?")
+        where.append("exchange_id = %s")
         params.append(str(exchange_id).strip().lower())
     if not include_deleted:
         where.append("status != 'deleted'")
-    rows = conn.execute(
+    rows = execute_fetchall(
+        conn,
         f"SELECT * FROM trading_accounts WHERE {' AND '.join(where)} ORDER BY updated_at DESC, id DESC",
         tuple(params),
-    ).fetchall()
+    )
     return [dict(r) for r in rows]
 
 
 def create_trading_account(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     user_id: str,
     exchange_id: str,
@@ -3560,84 +4483,79 @@ def create_trading_account(
     if not lbl:
         raise ValueError("label is required")
     cred_id = int(credential_id)
-    try:
-        cur = conn.execute(
-            """
-            INSERT INTO trading_accounts(
-                user_id, exchange_id, label, credential_id, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', ?, ?)
-            """,
-            (uid, ex, lbl, cred_id, now, now),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
-    except sqlite3.IntegrityError:
-        # Likely UNIQUE(user_id, exchange_id, label)
-        row = conn.execute(
-            "SELECT id FROM trading_accounts WHERE user_id = ? AND exchange_id = ? AND label = ?",
-            (uid, ex, lbl),
-        ).fetchone()
-        if not row:
-            raise
-        return int(row[0])
+    cur = conn.execute(
+        f"""
+        INSERT INTO trading_accounts(
+            user_id, exchange_id, label, credential_id, status, created_at, updated_at
+        ) VALUES ({sql_placeholders(conn, 7)})
+        ON CONFLICT (user_id, exchange_id, label)
+        DO UPDATE SET updated_at = EXCLUDED.updated_at
+        RETURNING id
+        """,
+        (uid, ex, lbl, cred_id, "active", now, now),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    if row is None:
+        raise ValueError("Failed to create trading account")
+    return int(row[0])
 
 
-def get_trading_account(conn: sqlite3.Connection, user_id: str, account_id: int) -> Optional[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+def get_trading_account(conn: Any, user_id: str, account_id: int) -> Optional[Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    row = conn.execute(
-        "SELECT * FROM trading_accounts WHERE user_id = ? AND id = ?",
+    row = execute_fetchone(
+        conn,
+        "SELECT * FROM trading_accounts WHERE user_id = %s AND id = %s",
         (uid, int(account_id)),
-    ).fetchone()
+    )
     return dict(row) if row else None
 
 
-def set_trading_account_status(conn: sqlite3.Connection, user_id: str, account_id: int, status: str) -> None:
+def set_trading_account_status(conn: Any, user_id: str, account_id: int, status: str) -> None:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     st = str(status or "").strip().lower()
     if st not in {"active", "disabled", "deleted"}:
         raise ValueError("Invalid status")
     now = now_utc_iso()
     conn.execute(
-        "UPDATE trading_accounts SET status = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+        "UPDATE trading_accounts SET status = %s, updated_at = %s WHERE user_id = %s AND id = %s",
         (st, now, uid, int(account_id)),
     )
     conn.commit()
 
 
-def set_trading_account_credential(conn: sqlite3.Connection, user_id: str, account_id: int, credential_id: int) -> None:
+def set_trading_account_credential(conn: Any, user_id: str, account_id: int, credential_id: int) -> None:
     """Rotate/update which credential a trading account points to."""
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     now = now_utc_iso()
     conn.execute(
-        "UPDATE trading_accounts SET credential_id = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+        "UPDATE trading_accounts SET credential_id = %s, updated_at = %s WHERE user_id = %s AND id = %s",
         (int(credential_id), now, uid, int(account_id)),
     )
     conn.commit()
 
 
-def count_bots_for_account(conn: sqlite3.Connection, user_id: str, account_id: int) -> int:
+def count_bots_for_account(conn: Any, user_id: str, account_id: int) -> int:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    row = conn.execute(
-        "SELECT COUNT(1) FROM bots WHERE user_id = ? AND account_id = ?",
+    row = execute_fetchone(
+        conn,
+        "SELECT COUNT(1) AS c FROM bots WHERE user_id = %s AND account_id = %s",
         (uid, int(account_id)),
-    ).fetchone()
+    )
     try:
-        return int(row[0]) if row else 0
+        return int(row.get("c") if row else 0)
     except Exception:
         return 0
 
 
-def get_bot_context(conn: sqlite3.Connection, user_id: str, bot_id: int) -> Dict[str, Any]:
+def get_bot_context(conn: Any, user_id: str, bot_id: int) -> Dict[str, Any]:
     """Fetch bot + its trading account (new source of truth).
 
     Returns {"bot": {...}, "account": {...}|None}.
     """
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    row = conn.execute(
+    row = execute_fetchone(
+        conn,
         """
         SELECT
             b.*, 
@@ -3654,10 +4572,10 @@ def get_bot_context(conn: sqlite3.Connection, user_id: str, bot_id: int) -> Dict
             a.updated_at AS a_updated_at
         FROM bots b
         LEFT JOIN trading_accounts a ON a.id = b.account_id
-        WHERE b.id = ? AND b.user_id = ?
+        WHERE b.id = %s AND b.user_id = %s
         """,
         (int(bot_id), uid),
-    ).fetchone()
+    )
     if not row:
         return {"bot": None, "account": None}
 
@@ -3697,7 +4615,7 @@ def get_bot_context(conn: sqlite3.Connection, user_id: str, bot_id: int) -> Dict
 
 
 def create_credential(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     user_id: str,
     exchange_id: str,
@@ -3716,16 +4634,20 @@ def create_credential(
         INSERT INTO exchange_credentials(
             user_id, exchange_id, label, api_key, api_secret_enc,
             created_at, updated_at, last_used_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)
+        RETURNING id
         """,
         (uid, (exchange_id or "").strip(), (label or "").strip(), (api_key or "").strip(), secret_enc, now, now),
     )
+    row = cur.fetchone()
     conn.commit()
-    return int(cur.lastrowid)
+    if row is None:
+        raise ValueError("Failed to create credential")
+    return int(row[0])
 
 
 def update_trading_account_risk(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     account_id: int,
     *,
@@ -3759,17 +4681,17 @@ def update_trading_account_risk(
     if not fields:
         return
     fields["updated_at"] = now_utc_iso()
-    sets = ", ".join([f"{k} = ?" for k in fields.keys()])
+    sets = ", ".join([f"{k} = %s" for k in fields.keys()])
     params = list(fields.values()) + [uid, int(account_id)]
     conn.execute(
-        f"UPDATE trading_accounts SET {sets} WHERE user_id = ? AND id = ?",
+        f"UPDATE trading_accounts SET {sets} WHERE user_id = %s AND id = %s",
         params,
     )
     conn.commit()
 
 
 def sum_account_net_pnl(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     account_id: int,
     *,
@@ -3781,12 +4703,13 @@ def sum_account_net_pnl(
     """
 
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    where = ["b.user_id = ?", "b.account_id = ?"]
+    where = ["b.user_id = %s", "b.account_id = %s"]
     params: List[Any] = [uid, int(account_id)]
     if since_ts:
-        where.append("l.event_ts >= ?")
+        where.append("l.event_ts >= %s")
         params.append(str(since_ts))
-    row = conn.execute(
+    row = execute_fetchone(
+        conn,
         f"""
         SELECT
             COALESCE(SUM(l.pnl), 0) + COALESCE(SUM(l.funding), 0) - COALESCE(SUM(l.fee), 0) AS net
@@ -3795,15 +4718,15 @@ def sum_account_net_pnl(
         WHERE {' AND '.join(where)}
         """,
         tuple(params),
-    ).fetchone()
+    )
     try:
-        return float(row[0]) if row and row[0] is not None else 0.0
+        return float(row.get("net") if row and row.get("net") is not None else 0.0)
     except Exception:
         return 0.0
 
 
 def request_flatten_all_bots_in_account(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     account_id: int,
     *,
@@ -3816,12 +4739,12 @@ def request_flatten_all_bots_in_account(
 
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     now = now_utc_iso()
-    where = "user_id = ? AND account_id = ?"
+    where = "user_id = %s AND account_id = %s"
     params: List[Any] = [uid, int(account_id)]
     if not include_stopped:
         where += " AND COALESCE(desired_status, 'running') != 'stopped'"
     cur = conn.execute(
-        f"UPDATE bots SET desired_action = 'flatten_now', updated_at = ? WHERE {where}",
+        f"UPDATE bots SET desired_action = 'flatten_now', updated_at = %s WHERE {where}",
         tuple([now] + params),
     )
     conn.commit()
@@ -3831,91 +4754,89 @@ def request_flatten_all_bots_in_account(
         return 0
 
 
-def list_credentials(conn: sqlite3.Connection, user_id: str) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+def list_credentials(conn: Any, user_id: str) -> List[Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    rows = conn.execute(
+    rows = execute_fetchall(
+        conn,
         """
         SELECT id, user_id, exchange_id, label, api_key, created_at, updated_at, last_used_at
         FROM exchange_credentials
-        WHERE user_id = ?
+        WHERE user_id = %s
         ORDER BY updated_at DESC
         """,
         (uid,),
-    ).fetchall()
+    )
     return [dict(r) for r in rows]
 
 
-def get_credential(conn: sqlite3.Connection, user_id: str, cred_id: int) -> Optional[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+def get_credential(conn: Any, user_id: str, cred_id: int) -> Optional[Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    row = conn.execute(
+    row = execute_fetchone(
+        conn,
         """
         SELECT * FROM exchange_credentials
-        WHERE user_id = ? AND id = ?
+        WHERE user_id = %s AND id = %s
         """,
         (uid, int(cred_id)),
-    ).fetchone()
+    )
     return dict(row) if row else None
 
 
-def delete_credential(conn: sqlite3.Connection, user_id: str, cred_id: int) -> None:
+def delete_credential(conn: Any, user_id: str, cred_id: int) -> None:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     conn.execute(
-        "DELETE FROM exchange_credentials WHERE user_id = ? AND id = ?",
+        "DELETE FROM exchange_credentials WHERE user_id = %s AND id = %s",
         (uid, int(cred_id)),
     )
     conn.commit()
 
 
-def touch_credential_last_used(conn: sqlite3.Connection, user_id: str, cred_id: int) -> None:
+def touch_credential_last_used(conn: Any, user_id: str, cred_id: int) -> None:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     now = now_utc_iso()
     conn.execute(
         """
         UPDATE exchange_credentials
-        SET last_used_at = ?, updated_at = ?
-        WHERE user_id = ? AND id = ?
+        SET last_used_at = %s, updated_at = %s
+        WHERE user_id = %s AND id = %s
         """,
         (now, now, uid, int(cred_id)),
     )
     conn.commit()
 
 
-def set_bot_credentials(conn: sqlite3.Connection, bot_id: int, *, user_id: str, credentials_id: Optional[int]) -> None:
+def set_bot_credentials(conn: Any, bot_id: int, *, user_id: str, credentials_id: Optional[int]) -> None:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     # Ensure bots.user_id is set for legacy rows.
     update_bot(conn, int(bot_id), user_id=uid, credentials_id=credentials_id)
 
 
-def update_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
+def update_job(conn: Any, job_id: int, **fields: Any) -> None:
     if not fields:
         fields = {}
     now = datetime.now(timezone.utc).isoformat()
     fields = {**fields, "updated_at": now}
     columns = []
     params: list[Any] = []
+    ph = sql_placeholder(conn)
     for key, value in fields.items():
-        columns.append(f"{key} = ?")
+        columns.append(f"{key} = {ph}")
         params.append(value)
     params.append(job_id)
-    conn.execute(f"UPDATE jobs SET {', '.join(columns)} WHERE id = ?", tuple(params))
+    conn.execute(f"UPDATE jobs SET {', '.join(columns)} WHERE id = {ph}", tuple(params))
     conn.commit()
 
 
-def list_jobs(conn: sqlite3.Connection, limit: int = 200) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
+def list_jobs(conn: Any, limit: int = 200) -> List[Dict[str, Any]]:
+    rows = execute_fetchall(
+        conn,
+        f"""
         SELECT * FROM jobs
         ORDER BY COALESCE(updated_at, created_at) DESC
-        LIMIT ?
+        LIMIT {sql_placeholder(conn)}
         """,
         (limit,),
-    ).fetchall()
+    )
     jobs: List[Dict[str, Any]] = []
     for r in rows:
         data = dict(r)
@@ -3925,10 +4846,8 @@ def list_jobs(conn: sqlite3.Connection, limit: int = 200) -> List[Dict[str, Any]
     return jobs
 
 
-def get_job(conn: sqlite3.Connection, job_id: int) -> Optional[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+def get_job(conn: Any, job_id: int) -> Optional[Dict[str, Any]]:
+    row = execute_fetchone(conn, f"SELECT * FROM jobs WHERE id = {sql_placeholder(conn)}", (job_id,))
     if not row:
         return None
     data = dict(row)
@@ -3937,14 +4856,15 @@ def get_job(conn: sqlite3.Connection, job_id: int) -> Optional[Dict[str, Any]]:
     return data
 
 
-def claim_job(conn: sqlite3.Connection, job_id: int, worker_id: str) -> bool:
+def claim_job(conn: Any, job_id: int, worker_id: str) -> bool:
     now = datetime.now(timezone.utc).isoformat()
     # Atomic claim: only one worker can transition queued -> running.
+    ph = sql_placeholder(conn)
     cur = conn.execute(
-        """
+        f"""
         UPDATE jobs
-        SET status='running', worker_id=?, started_at=COALESCE(started_at, ?), updated_at=?
-        WHERE id = ? AND status = 'queued' AND (worker_id IS NULL OR worker_id = '')
+        SET status='running', worker_id={ph}, started_at=COALESCE(started_at, {ph}), updated_at={ph}
+        WHERE id = {ph} AND status = 'queued' AND (worker_id IS NULL OR worker_id = '')
         """,
         (worker_id, now, now, job_id),
     )
@@ -3953,7 +4873,7 @@ def claim_job(conn: sqlite3.Connection, job_id: int, worker_id: str) -> bool:
 
 
 def claim_job_with_lease(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     worker_id: str,
     lease_s: float,
@@ -3967,9 +4887,6 @@ def claim_job_with_lease(
     - Sets both legacy `worker_id` and lease fields (`claimed_by`, `lease_expires_at`, ...)
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-
     lease_seconds = float(lease_s or 0.0)
     if lease_seconds <= 0:
         lease_seconds = 30.0
@@ -3978,79 +4895,141 @@ def claim_job_with_lease(
     if not types:
         types = ["live_bot"]
 
-    placeholders = ",".join(["?"] * len(types))
+    placeholders = ",".join([sql_placeholder(conn)] * len(types))
 
     # Best-effort: if pause/cancel columns exist, avoid claiming backtest_run jobs
     # whose parent sweep job has pause/cancel requested.
     try:
-        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        job_cols = get_table_columns(conn, "jobs")
     except Exception:
         job_cols = set()
     has_control_plane = {"pause_requested", "cancel_requested", "parent_job_id"}.issubset(job_cols)
 
+    has_priority = "priority" in job_cols
+    has_interactive = "is_interactive" in job_cols
+
+    # Prefer interactive jobs (single runs) first, then lower priority, then oldest.
+    order_parts: list[str] = []
+    if has_interactive:
+        order_parts.append("COALESCE(j.is_interactive, 0) DESC")
+    if has_priority:
+        order_parts.append("COALESCE(j.priority, 100) ASC")
+    order_parts.append("COALESCE(j.created_at, j.updated_at) ASC")
+    order_parts.append("j.id ASC")
+    order_sql = ", ".join(order_parts)
+
     # Best-effort retry loop to handle races between multiple workers.
     for _ in range(3):
 
-        if has_control_plane and "backtest_run" in set(types):
-            row = conn.execute(
-                """
-                SELECT j.id
-                FROM jobs j
-                WHERE j.job_type IN ("""
-                + placeholders
-                + """ )
-                    AND j.status = 'queued'
-                    AND (
-                        j.job_type != 'backtest_run'
-                        OR j.parent_job_id IS NULL
-                        OR NOT EXISTS (
-                            SELECT 1
-                            FROM jobs p
-                            WHERE p.id = j.parent_job_id
-                                AND (COALESCE(p.pause_requested, 0) = 1 OR COALESCE(p.cancel_requested, 0) = 1)
-                        )
-                    )
-                ORDER BY COALESCE(j.created_at, j.updated_at) ASC
-                LIMIT 1
-                """,
-                tuple(types),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                """
-                SELECT id
-                FROM jobs
-                WHERE job_type IN ("""
-                + placeholders
-                + """ )
-                    AND status = 'queued'
-                ORDER BY COALESCE(created_at, updated_at) ASC
-                LIMIT 1
-                """,
-                tuple(types),
-            ).fetchone()
-        if not row:
-            return None
-
-        job_id = int(row[0])
         now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat()
         lease_expires_iso = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
 
-        cur = conn.execute(
+        if has_control_plane and "backtest_run" in set(types):
+            select_sql = (
+                "SELECT j.id "
+                "FROM jobs j "
+                "WHERE j.job_type IN ("
+                + placeholders
+                + ") "
+                "  AND j.status = 'queued' "
+                "  AND ( "
+                "    j.job_type != 'backtest_run' "
+                "    OR j.parent_job_id IS NULL "
+                "    OR NOT EXISTS ( "
+                "      SELECT 1 FROM jobs p "
+                "      WHERE p.id = j.parent_job_id "
+                "        AND (COALESCE(p.pause_requested, 0) = 1 OR COALESCE(p.cancel_requested, 0) = 1) "
+                "    ) "
+                "  ) "
+                "ORDER BY "
+                + order_sql
+                + " LIMIT 1"
+            )
+        else:
+            select_sql = (
+                "SELECT j.id "
+                "FROM jobs j "
+                "WHERE j.job_type IN ("
+                + placeholders
+                + ") "
+                "  AND j.status = 'queued' "
+                "ORDER BY "
+                + order_sql
+                + " LIMIT 1"
+            )
+
+        try:
+            ph = sql_placeholder(conn)
+            update_sql = f"""
+                UPDATE jobs
+                SET
+                  status = 'running',
+                  worker_id = {ph},
+                  claimed_by = {ph},
+                  claimed_at = {ph},
+                  lease_expires_at = {ph},
+                  last_lease_renew_at = {ph},
+                  lease_version = COALESCE(lease_version, 0) + 1,
+                  started_at = COALESCE(started_at, {ph}),
+                  updated_at = {ph}
+                WHERE id = ({select_sql})
+                  AND status = 'queued'
+                RETURNING id
             """
+            cur = conn.execute(
+                update_sql,
+                (
+                    str(worker_id),
+                    str(worker_id),
+                    now_iso,
+                    lease_expires_iso,
+                    now_iso,
+                    now_iso,
+                    now_iso,
+                    *tuple(types),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if row is not None:
+                try:
+                    return get_job(conn, int(row[0]))
+                except Exception:
+                    return None
+        except DbErrors.OperationalError:
+            # If RETURNING is not supported, fall back to non-RETURNING approach.
+            pass
+        except Exception:
+            pass
+
+        # Fallback (no RETURNING): select then update.
+        try:
+            row2 = conn.execute(select_sql, tuple(types)).fetchone()
+        except Exception:
+            row2 = None
+        if not row2:
+            return None
+        try:
+            job_id = int(row2[0])
+        except Exception:
+            return None
+
+        ph = sql_placeholder(conn)
+        cur2 = conn.execute(
+            f"""
             UPDATE jobs
             SET
               status = 'running',
-              worker_id = ?,
-              claimed_by = ?,
-              claimed_at = ?,
-              lease_expires_at = ?,
-              last_lease_renew_at = ?,
+              worker_id = {ph},
+              claimed_by = {ph},
+              claimed_at = {ph},
+              lease_expires_at = {ph},
+              last_lease_renew_at = {ph},
               lease_version = COALESCE(lease_version, 0) + 1,
-              started_at = COALESCE(started_at, ?),
-              updated_at = ?
-            WHERE id = ?
+              started_at = COALESCE(started_at, {ph}),
+              updated_at = {ph}
+            WHERE id = {ph}
               AND status = 'queued'
             """,
             (
@@ -4065,14 +5044,14 @@ def claim_job_with_lease(
             ),
         )
         conn.commit()
-        if cur.rowcount > 0:
+        if cur2.rowcount > 0:
             return get_job(conn, job_id)
 
     return None
 
 
 def bulk_enqueue_backtest_run_jobs(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     jobs: Sequence[Tuple[str, Dict[str, Any], Optional[str]]],
     parent_job_id: Optional[int] = None,
@@ -4091,10 +5070,8 @@ def bulk_enqueue_backtest_run_jobs(
       to non-idempotent inserts.
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     try:
-        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        job_cols = get_table_columns(conn, "jobs")
     except Exception:
         job_cols = set()
 
@@ -4110,7 +5087,15 @@ def bulk_enqueue_backtest_run_jobs(
     # No job_key support -> non-idempotent (legacy DB); still enqueue.
     if "job_key" not in job_cols:
         for k, payload, sid in rows_in:
-            _ = create_job(conn, "backtest_run", payload, sweep_id=sid, job_key=None)
+            _ = create_job(
+                conn,
+                "backtest_run",
+                payload,
+                sweep_id=sid,
+                job_key=None,
+                priority=100,
+                is_interactive=0,
+            )
             created += 1
         return {"created": int(created), "existing": 0}
 
@@ -4119,14 +5104,15 @@ def bulk_enqueue_backtest_run_jobs(
     chunk = 500
     for i in range(0, len(keys), chunk):
         part = keys[i : i + chunk]
-        placeholders = ",".join(["?"] * len(part))
-        found = conn.execute(
+        placeholders = ",".join(["%s"] * len(part))
+        found = execute_fetchall(
+            conn,
             f"SELECT job_key FROM jobs WHERE job_key IN ({placeholders})",
             tuple(part),
-        ).fetchall()
+        )
         for r in found or []:
             try:
-                existing_keys.add(str(r[0] if not isinstance(r, sqlite3.Row) else r["job_key"]).strip())
+                existing_keys.add(str(r.get("job_key") or "").strip())
             except Exception:
                 continue
 
@@ -4138,6 +5124,8 @@ def bulk_enqueue_backtest_run_jobs(
 
     has_parent = "parent_job_id" in job_cols
     has_group = "group_key" in job_cols
+    has_priority = "priority" in job_cols
+    has_interactive = "is_interactive" in job_cols
 
     payload_rows: list[tuple[Any, ...]] = []
     for k, payload, sid in to_insert:
@@ -4174,17 +5162,27 @@ def bulk_enqueue_backtest_run_jobs(
             row.append(int(parent_job_id) if parent_job_id is not None else None)
         if has_group:
             row.append(str(group_key).strip() if group_key is not None else None)
+        if has_interactive:
+            row.append(0)
+        if has_priority:
+            row.append(100)
         payload_rows.append(tuple(row))
 
     # Insert only missing keys.
     cols_sql = "job_type, job_key, status, payload_json, sweep_id, run_id, bot_id, progress, message, created_at, updated_at"
-    placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+    placeholders = ", ".join(["%s"] * 11)
     if has_parent:
         cols_sql += ", parent_job_id"
-        placeholders += ", ?"
+        placeholders += ", %s"
     if has_group:
         cols_sql += ", group_key"
-        placeholders += ", ?"
+        placeholders += ", %s"
+    if has_interactive:
+        cols_sql += ", is_interactive"
+        placeholders += ", %s"
+    if has_priority:
+        cols_sql += ", priority"
+        placeholders += ", %s"
 
     conn.executemany(
         f"""
@@ -4198,20 +5196,18 @@ def bulk_enqueue_backtest_run_jobs(
     return {"created": int(created), "existing": int(existing)}
 
 
-def get_sweep_row(conn: sqlite3.Connection, sweep_id: str) -> Optional[Dict[str, Any]]:
+def get_sweep_row(conn: Any, sweep_id: str) -> Optional[Dict[str, Any]]:
     """Fetch a sweep row using an existing connection (worker-safe)."""
 
     sid = str(sweep_id or "").strip()
     if not sid:
         return None
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM sweeps WHERE id = ?", (sid,)).fetchone()
+    row = execute_fetchone(conn, "SELECT * FROM sweeps WHERE id = %s", (sid,))
     return dict(row) if row else None
 
 
 def get_sweep_parent_jobs_by_sweep(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     sweep_ids: Sequence[str],
 ) -> Dict[str, Dict[str, Any]]:
@@ -4220,13 +5216,12 @@ def get_sweep_parent_jobs_by_sweep(
     One query for all given sweep IDs.
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     sids = [str(s).strip() for s in (sweep_ids or []) if str(s).strip()]
     if not sids:
         return {}
-    placeholders = ",".join(["?"] * len(sids))
-    rows = conn.execute(
+    placeholders = ",".join(["%s"] * len(sids))
+    rows = execute_fetchall(
+        conn,
         f"""
                 SELECT sweep_id,
                              id AS parent_job_id,
@@ -4241,7 +5236,7 @@ def get_sweep_parent_jobs_by_sweep(
           AND sweep_id IN ({placeholders})
         """,
         tuple(sids),
-    ).fetchall()
+        )
 
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows or []:
@@ -4261,11 +5256,10 @@ def get_sweep_parent_jobs_by_sweep(
     return out
 
 
-def get_parent_job_flags(conn: sqlite3.Connection, parent_job_id: int) -> Dict[str, Any]:
+def get_parent_job_flags(conn: Any, parent_job_id: int) -> Dict[str, Any]:
     """Return pause/cancel flags + timestamps for a parent job id."""
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+    
     try:
         pid = int(parent_job_id)
     except Exception:
@@ -4273,7 +5267,8 @@ def get_parent_job_flags(conn: sqlite3.Connection, parent_job_id: int) -> Dict[s
     if pid <= 0:
         return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
 
-    row = conn.execute(
+    row = execute_fetchone(
+        conn,
         """
         SELECT COALESCE(pause_requested, 0) AS pause_requested,
                COALESCE(cancel_requested, 0) AS cancel_requested,
@@ -4282,11 +5277,11 @@ def get_parent_job_flags(conn: sqlite3.Connection, parent_job_id: int) -> Dict[s
                status,
                group_key
         FROM jobs
-        WHERE id = ?
+        WHERE id = %s
         LIMIT 1
         """,
         (pid,),
-    ).fetchone()
+    )
     if not row:
         return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
 
@@ -4303,7 +5298,7 @@ def get_parent_job_flags(conn: sqlite3.Connection, parent_job_id: int) -> Dict[s
         return {"pause_requested": 0, "cancel_requested": 0, "paused_at": None, "cancelled_at": None}
 
 
-def set_job_pause_requested(conn: sqlite3.Connection, job_id: int, paused: bool) -> None:
+def set_job_pause_requested(conn: Any, job_id: int, paused: bool) -> None:
     """Request pause/resume for a job (typically sweep_parent).
 
     - paused=True: sets pause_requested=1 and stamps paused_at if not set.
@@ -4318,9 +5313,9 @@ def set_job_pause_requested(conn: sqlite3.Connection, job_id: int, paused: bool)
             """
             UPDATE jobs
             SET pause_requested = 1,
-                paused_at = COALESCE(paused_at, ?),
-                updated_at = ?
-            WHERE id = ?
+                paused_at = COALESCE(paused_at, %s),
+                updated_at = %s
+            WHERE id = %s
             """,
             (now, now, jid),
         )
@@ -4329,16 +5324,16 @@ def set_job_pause_requested(conn: sqlite3.Connection, job_id: int, paused: bool)
             """
             UPDATE jobs
             SET pause_requested = 0,
-                updated_at = ?,
+                updated_at = %s,
                 status = CASE WHEN status = 'paused' THEN 'queued' ELSE status END
-            WHERE id = ?
+            WHERE id = %s
             """,
             (now, jid),
         )
     conn.commit()
 
 
-def bulk_mark_jobs_cancelled(conn: sqlite3.Connection, group_key: str) -> int:
+def bulk_mark_jobs_cancelled(conn: Any, group_key: str) -> int:
     """Mark queued jobs in a group as cancelled (best-effort v1)."""
 
     _ensure_schema(conn)
@@ -4351,9 +5346,9 @@ def bulk_mark_jobs_cancelled(conn: sqlite3.Connection, group_key: str) -> int:
         UPDATE jobs
         SET status = 'cancelled',
             cancel_requested = COALESCE(cancel_requested, 0),
-            cancelled_at = COALESCE(cancelled_at, ?),
-            updated_at = ?
-        WHERE group_key = ?
+            cancelled_at = COALESCE(cancelled_at, %s),
+            updated_at = %s
+        WHERE group_key = %s
           AND status = 'queued'
         """,
         (now, now, gk),
@@ -4362,7 +5357,7 @@ def bulk_mark_jobs_cancelled(conn: sqlite3.Connection, group_key: str) -> int:
     return int(cur.rowcount or 0)
 
 
-def set_job_cancel_requested(conn: sqlite3.Connection, job_id: int, cancelled: bool) -> None:
+def set_job_cancel_requested(conn: Any, job_id: int, cancelled: bool) -> None:
     """Request cancel for a job (typically sweep_parent).
 
     cancelled=True: sets cancel_requested=1 and stamps cancelled_at.
@@ -4374,22 +5369,25 @@ def set_job_cancel_requested(conn: sqlite3.Connection, job_id: int, cancelled: b
     now = now_utc_iso()
     if cancelled:
         # Ensure a group_key exists for sweep parents where possible.
-        row = conn.execute("SELECT group_key, sweep_id FROM jobs WHERE id = ?", (jid,)).fetchone()
+        row = execute_fetchone(conn, "SELECT group_key, sweep_id FROM jobs WHERE id = %s", (jid,))
         gk = None
         sid = None
         if row is not None:
             try:
-                gk = str(row["group_key"] or "").strip() if isinstance(row, sqlite3.Row) else str(row[0] or "").strip()
+                gk = str(row.get("group_key") or "").strip()
             except Exception:
                 gk = None
             try:
-                sid = str(row["sweep_id"] or "").strip() if isinstance(row, sqlite3.Row) else str(row[1] or "").strip()
+                sid = str(row.get("sweep_id") or "").strip()
             except Exception:
                 sid = None
         if not gk and sid:
             gk = f"sweep:{sid}"
             try:
-                conn.execute("UPDATE jobs SET group_key = COALESCE(NULLIF(group_key,''), ?) WHERE id = ?", (gk, jid))
+                conn.execute(
+                    "UPDATE jobs SET group_key = COALESCE(NULLIF(group_key,''), %s) WHERE id = %s",
+                    (gk, jid),
+                )
             except Exception:
                 pass
 
@@ -4397,10 +5395,10 @@ def set_job_cancel_requested(conn: sqlite3.Connection, job_id: int, cancelled: b
             """
             UPDATE jobs
             SET cancel_requested = 1,
-                cancelled_at = COALESCE(cancelled_at, ?),
+                cancelled_at = COALESCE(cancelled_at, %s),
                 pause_requested = 0,
-                updated_at = ?
-            WHERE id = ?
+                updated_at = %s
+            WHERE id = %s
             """,
             (now, now, jid),
         )
@@ -4412,31 +5410,30 @@ def set_job_cancel_requested(conn: sqlite3.Connection, job_id: int, cancelled: b
             """
             UPDATE jobs
             SET cancel_requested = 0,
-                updated_at = ?
-            WHERE id = ?
+                updated_at = %s
+            WHERE id = %s
             """,
             (now, jid),
         )
         conn.commit()
 
 
-def count_jobs_by_status_for_group(conn: sqlite3.Connection, group_key: str) -> Dict[str, int]:
+def count_jobs_by_status_for_group(conn: Any, group_key: str) -> Dict[str, int]:
     """Aggregate job status counts for a group_key (single query)."""
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     gk = str(group_key or "").strip()
     if not gk:
         return {}
-    rows = conn.execute(
+    rows = execute_fetchall(
+        conn,
         """
         SELECT status, COUNT(*) AS c
         FROM jobs
-        WHERE group_key = ?
+        WHERE group_key = %s
         GROUP BY status
         """,
         (gk,),
-    ).fetchall()
+    )
     out: Dict[str, int] = {}
     total = 0
     for r in rows or []:
@@ -4452,7 +5449,7 @@ def count_jobs_by_status_for_group(conn: sqlite3.Connection, group_key: str) -> 
 
 
 def get_backtest_run_job_counts_by_parent(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     parent_job_ids: Sequence[int],
     job_type: str = "backtest_run",
@@ -4463,8 +5460,6 @@ def get_backtest_run_job_counts_by_parent(
     Returns mapping: parent_job_id -> {"total": n, "queued": n, "running": n, "done": n, ...}
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     pids: list[int] = []
     for v in (parent_job_ids or []):
         try:
@@ -4474,24 +5469,25 @@ def get_backtest_run_job_counts_by_parent(
     pids = [p for p in pids if p > 0]
     if not pids:
         return {}
-    placeholders = ",".join(["?"] * len(pids))
-    rows = conn.execute(
+    placeholders = ",".join(["%s"] * len(pids))
+    rows = execute_fetchall(
+        conn,
         f"""
         SELECT parent_job_id, status, COUNT(*) AS c
         FROM jobs
-        WHERE job_type = ?
+        WHERE job_type = %s
           AND parent_job_id IN ({placeholders})
         GROUP BY parent_job_id, status
         """,
         tuple([str(job_type)] + pids),
-    ).fetchall()
+    )
 
     out: Dict[int, Dict[str, int]] = {}
     for r in rows or []:
         try:
-            pid = int(r["parent_job_id"])
-            st = str(r["status"])
-            c = int(r["c"])
+            pid = int(r.get("parent_job_id"))
+            st = str(r.get("status"))
+            c = int(r.get("c"))
         except Exception:
             continue
         d = out.setdefault(pid, {})
@@ -4590,31 +5586,30 @@ def compute_run_key(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def get_backtest_run_id_by_run_key(conn: sqlite3.Connection, run_key: str) -> Optional[str]:
-    """Find existing backtest_runs.id by deterministic run_key stored in metadata_json."""
+def get_backtest_run_id_by_run_key(conn: Any, run_key: str) -> Optional[str]:
+    """Find existing backtest_runs.id by deterministic run_key stored in metadata_jsonb."""
 
     rk = str(run_key or "").strip()
     if not rk:
         return None
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute(
-            "SELECT id FROM backtest_runs WHERE json_extract(metadata_json, '$.run_key') = ? LIMIT 1",
+        row = execute_fetchone(
+            conn,
+            f"SELECT id FROM backtest_runs WHERE {_run_key_expr(conn)} = {sql_placeholder(conn)} LIMIT 1",
             (rk,),
-        ).fetchone()
-    except sqlite3.OperationalError:
+        )
+    except Exception:
         return None
     if not row:
         return None
     try:
-        return str(row[0] if not isinstance(row, sqlite3.Row) else row["id"])
+        return str(row.get("id"))
     except Exception:
         return None
 
 
 def upsert_backtest_run_by_run_key(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     run_key: str,
     run_row_fields: Dict[str, Any],
@@ -4629,34 +5624,28 @@ def upsert_backtest_run_by_run_key(
     if not rk:
         raise ValueError("run_key is required")
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-
     # Pull any existing row (for metadata merge + stable created_at).
     existing = None
     try:
-        existing = conn.execute(
-            """
-            SELECT id, created_at, metadata_json
+        existing = execute_fetchone(
+            conn,
+            f"""
+            SELECT id, created_at, metadata_json, metadata_jsonb
             FROM backtest_runs
-            WHERE json_extract(metadata_json, '$.run_key') = ?
+            WHERE {_run_key_expr(conn)} = {sql_placeholder(conn)}
             LIMIT 1
             """,
             (rk,),
-        ).fetchone()
-    except sqlite3.OperationalError:
+        )
+    except Exception:
         existing = None
 
     incoming_meta_raw = run_row_fields.get("metadata_json")
-    incoming_meta: Dict[str, Any]
-    if isinstance(incoming_meta_raw, dict):
-        incoming_meta = dict(incoming_meta_raw)
-    elif isinstance(incoming_meta_raw, str) and incoming_meta_raw.strip():
-        try:
-            incoming_meta = json.loads(incoming_meta_raw)
-        except Exception:
-            incoming_meta = {}
-    else:
+    incoming_meta = _load_json_field(
+        {"metadata_json": incoming_meta_raw, "metadata_jsonb": run_row_fields.get("metadata_jsonb")},
+        "metadata",
+    )
+    if not isinstance(incoming_meta, dict):
         incoming_meta = {}
 
     # Always include run_key (+ job_key if present).
@@ -4675,13 +5664,9 @@ def upsert_backtest_run_by_run_key(
         incoming_meta["job_key"] = str(job_key)
 
     if existing:
-        run_id = str(existing[0] if not isinstance(existing, sqlite3.Row) else existing["id"])
-        created_at_existing = str(existing[1] if not isinstance(existing, sqlite3.Row) else existing["created_at"])
-        existing_meta_raw = existing[2] if not isinstance(existing, sqlite3.Row) else existing["metadata_json"]
-        try:
-            existing_meta = json.loads(existing_meta_raw) if isinstance(existing_meta_raw, str) and existing_meta_raw else {}
-        except Exception:
-            existing_meta = {}
+        run_id = str(existing.get("id") or "")
+        created_at_existing = str(existing.get("created_at") or "")
+        existing_meta = _load_json_field(existing, "metadata")
         if not isinstance(existing_meta, dict):
             existing_meta = {}
         merged_meta = {**existing_meta, **incoming_meta}
@@ -4689,17 +5674,20 @@ def upsert_backtest_run_by_run_key(
 
         # Update summary row (keep created_at stable).
         # Only update known columns; ignore unknown keys.
+        ph = sql_placeholder(conn)
         conn.execute(
-            """
+            f"""
             UPDATE backtest_runs
-            SET symbol = ?, timeframe = ?, strategy_name = ?, strategy_version = ?,
-                config_json = ?, metrics_json = ?, metadata_json = ?,
-                start_time = ?, end_time = ?,
-                net_profit = ?, net_return_pct = ?, roi_pct_on_margin = ?, max_drawdown_pct = ?,
-                sharpe = ?, sortino = ?, win_rate = ?, profit_factor = ?,
-                cpc_index = ?, common_sense_ratio = ?, avg_position_time_s = ?, trades_json = ?,
-                sweep_id = ?, market_type = ?
-            WHERE id = ?
+            SET symbol = {ph}, timeframe = {ph}, strategy_name = {ph}, strategy_version = {ph},
+                config_json = {ph}, config_jsonb = {ph},
+                metrics_json = {ph}, metrics_jsonb = {ph},
+                metadata_json = {ph}, metadata_jsonb = {ph},
+                start_time = {ph}, end_time = {ph},
+                net_profit = {ph}, net_return_pct = {ph}, roi_pct_on_margin = {ph}, max_drawdown_pct = {ph},
+                sharpe = {ph}, sortino = {ph}, win_rate = {ph}, profit_factor = {ph},
+                cpc_index = {ph}, common_sense_ratio = {ph}, avg_position_time_s = {ph}, trades_json = {ph}, trades_jsonb = {ph},
+                sweep_id = {ph}, market_type = {ph}
+            WHERE id = {ph}
             """,
             (
                 run_row_fields.get("symbol"),
@@ -4707,8 +5695,11 @@ def upsert_backtest_run_by_run_key(
                 run_row_fields.get("strategy_name"),
                 run_row_fields.get("strategy_version"),
                 run_row_fields.get("config_json"),
+                to_jsonb(run_row_fields.get("config_jsonb")),
                 run_row_fields.get("metrics_json"),
+                to_jsonb(run_row_fields.get("metrics_jsonb")),
                 json.dumps(_sanitize_for_json(merged_meta)),
+                to_jsonb(merged_meta),
                 run_row_fields.get("start_time"),
                 run_row_fields.get("end_time"),
                 run_row_fields.get("net_profit"),
@@ -4723,6 +5714,7 @@ def upsert_backtest_run_by_run_key(
                 run_row_fields.get("common_sense_ratio"),
                 run_row_fields.get("avg_position_time_s"),
                 run_row_fields.get("trades_json"),
+                to_jsonb(run_row_fields.get("trades_jsonb")),
                 run_row_fields.get("sweep_id"),
                 run_row_fields.get("market_type"),
                 run_id,
@@ -4731,72 +5723,136 @@ def upsert_backtest_run_by_run_key(
 
         # Keep details table in sync.
         now_iso = now_utc_iso()
-        details_meta_raw = details_fields.get("metadata_json")
-        if isinstance(details_meta_raw, dict):
-            details_meta = {**existing_meta, **details_meta_raw, "run_key": rk}
+        details_meta_obj = _load_json_field(
+            {"metadata_json": details_fields.get("metadata_json"), "metadata_jsonb": details_fields.get("metadata_jsonb")},
+            "metadata",
+        )
+        if isinstance(details_meta_obj, dict):
+            details_meta = {**existing_meta, **details_meta_obj, "run_key": rk}
             if job_key:
                 details_meta["job_key"] = str(job_key)
             details_meta_json = json.dumps(_sanitize_for_json(details_meta))
-        elif isinstance(details_meta_raw, str) and details_meta_raw.strip():
-            try:
-                d = json.loads(details_meta_raw)
-                if isinstance(d, dict):
-                    d = {**existing_meta, **d, "run_key": rk}
-                    if job_key:
-                        d["job_key"] = str(job_key)
-                    details_meta_json = json.dumps(_sanitize_for_json(d))
-                else:
-                    details_meta_json = details_meta_raw
-            except Exception:
-                details_meta_json = details_meta_raw
         else:
-            details_meta_json = json.dumps(_sanitize_for_json(merged_meta))
+            details_meta = dict(merged_meta)
+            details_meta_json = json.dumps(_sanitize_for_json(details_meta))
 
         try:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO backtest_run_details(
-                    run_id, config_json, metrics_json, metadata_json, trades_json,
-                    equity_curve_json, equity_timestamps_json, extra_series_json,
-                    candles_json, params_json, run_context_json, computed_metrics_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+            upsert_backtest_run_details(
+                conn,
+                (
+                    "run_id",
+                    "config_json",
+                    "config_jsonb",
+                    "metrics_json",
+                    "metrics_jsonb",
+                    "metadata_json",
+                    "metadata_jsonb",
+                    "trades_json",
+                    "trades_jsonb",
+                    "equity_curve_json",
+                    "equity_curve_jsonb",
+                    "equity_timestamps_json",
+                    "equity_timestamps_jsonb",
+                    "extra_series_json",
+                    "extra_series_jsonb",
+                    "candles_json",
+                    "candles_jsonb",
+                    "params_json",
+                    "params_jsonb",
+                    "run_context_json",
+                    "run_context_jsonb",
+                    "computed_metrics_json",
+                    "computed_metrics_jsonb",
+                    "created_at",
+                    "updated_at",
+                ),
                 (
                     run_id,
                     details_fields.get("config_json"),
+                    to_jsonb(details_fields.get("config_jsonb") or details_fields.get("config_json")),
                     details_fields.get("metrics_json"),
+                    to_jsonb(details_fields.get("metrics_jsonb") or details_fields.get("metrics_json")),
                     details_meta_json,
+                    to_jsonb(details_meta),
                     details_fields.get("trades_json"),
+                    to_jsonb(details_fields.get("trades_jsonb") or details_fields.get("trades_json")),
                     details_fields.get("equity_curve_json"),
+                    to_jsonb(details_fields.get("equity_curve_jsonb") or details_fields.get("equity_curve_json")),
                     details_fields.get("equity_timestamps_json"),
+                    to_jsonb(details_fields.get("equity_timestamps_jsonb") or details_fields.get("equity_timestamps_json")),
                     details_fields.get("extra_series_json"),
+                    to_jsonb(details_fields.get("extra_series_jsonb") or details_fields.get("extra_series_json")),
                     details_fields.get("candles_json"),
+                    to_jsonb(details_fields.get("candles_jsonb") or details_fields.get("candles_json")),
                     details_fields.get("params_json"),
+                    to_jsonb(details_fields.get("params_jsonb") or details_fields.get("params_json")),
                     details_fields.get("run_context_json"),
+                    to_jsonb(details_fields.get("run_context_jsonb") or details_fields.get("run_context_json")),
                     details_fields.get("computed_metrics_json"),
+                    to_jsonb(details_fields.get("computed_metrics_jsonb") or details_fields.get("computed_metrics_json")),
                     created_at_existing,
                     now_iso,
                 ),
             )
-        except sqlite3.OperationalError:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO backtest_run_details(
-                    run_id, config_json, metrics_json, metadata_json, trades_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    details_fields.get("config_json"),
-                    details_fields.get("metrics_json"),
-                    details_meta_json,
-                    details_fields.get("trades_json"),
-                    created_at_existing,
-                    now_iso,
-                ),
-            )
+        except Exception:
+            try:
+                upsert_backtest_run_details(
+                    conn,
+                    (
+                        "run_id",
+                        "config_json",
+                        "metrics_json",
+                        "metadata_json",
+                        "trades_json",
+                        "equity_curve_json",
+                        "equity_timestamps_json",
+                        "extra_series_json",
+                        "candles_json",
+                        "params_json",
+                        "run_context_json",
+                        "computed_metrics_json",
+                        "created_at",
+                        "updated_at",
+                    ),
+                    (
+                        run_id,
+                        details_fields.get("config_json"),
+                        details_fields.get("metrics_json"),
+                        details_meta_json,
+                        details_fields.get("trades_json"),
+                        details_fields.get("equity_curve_json"),
+                        details_fields.get("equity_timestamps_json"),
+                        details_fields.get("extra_series_json"),
+                        details_fields.get("candles_json"),
+                        details_fields.get("params_json"),
+                        details_fields.get("run_context_json"),
+                        details_fields.get("computed_metrics_json"),
+                        created_at_existing,
+                        now_iso,
+                    ),
+                )
+            except Exception:
+                upsert_backtest_run_details(
+                    conn,
+                    (
+                        "run_id",
+                        "config_json",
+                        "metrics_json",
+                        "metadata_json",
+                        "trades_json",
+                        "created_at",
+                        "updated_at",
+                    ),
+                    (
+                        run_id,
+                        details_fields.get("config_json"),
+                        details_fields.get("metrics_json"),
+                        details_meta_json,
+                        details_fields.get("trades_json"),
+                        created_at_existing,
+                        now_iso,
+                    ),
+                )
 
         return run_id
 
@@ -4809,28 +5865,20 @@ def upsert_backtest_run_by_run_key(
         merged_meta["job_key"] = str(job_key)
 
     conn.execute(
-        """
+        f"""
         INSERT INTO backtest_runs (
             id, created_at, symbol, timeframe,
             strategy_name, strategy_version,
-            config_json, metrics_json, metadata_json,
+            config_json, config_jsonb, metrics_json, metrics_jsonb, metadata_json, metadata_jsonb,
             market_type,
             start_time, end_time,
             net_profit, net_return_pct, roi_pct_on_margin, max_drawdown_pct,
             sharpe, sortino, win_rate, profit_factor,
-            cpc_index, common_sense_ratio, avg_position_time_s, trades_json,
+            cpc_index, common_sense_ratio, avg_position_time_s, trades_json, trades_jsonb,
             sweep_id
         )
         VALUES (
-            ?, ?, ?, ?,
-            ?, ?,
-            ?, ?, ?,
-            ?,
-            ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?
+            {sql_placeholders(conn, 29)}
         )
         """,
         (
@@ -4841,8 +5889,11 @@ def upsert_backtest_run_by_run_key(
             run_row_fields.get("strategy_name"),
             run_row_fields.get("strategy_version"),
             run_row_fields.get("config_json"),
+            to_jsonb(run_row_fields.get("config_jsonb")),
             run_row_fields.get("metrics_json"),
+            to_jsonb(run_row_fields.get("metrics_jsonb")),
             json.dumps(_sanitize_for_json(merged_meta)),
+            to_jsonb(merged_meta),
             run_row_fields.get("market_type"),
             run_row_fields.get("start_time"),
             run_row_fields.get("end_time"),
@@ -4858,83 +5909,148 @@ def upsert_backtest_run_by_run_key(
             run_row_fields.get("common_sense_ratio"),
             run_row_fields.get("avg_position_time_s"),
             run_row_fields.get("trades_json"),
+            to_jsonb(run_row_fields.get("trades_jsonb")),
             run_row_fields.get("sweep_id"),
         ),
     )
 
     now_iso = now_utc_iso()
-    details_meta_raw = details_fields.get("metadata_json")
-    if isinstance(details_meta_raw, dict):
-        details_meta = dict(details_meta_raw)
+    details_meta_obj = _load_json_field(
+        {"metadata_json": details_fields.get("metadata_json"), "metadata_jsonb": details_fields.get("metadata_jsonb")},
+        "metadata",
+    )
+    if isinstance(details_meta_obj, dict):
+        details_meta = dict(details_meta_obj)
         details_meta["run_key"] = rk
         if job_key:
             details_meta["job_key"] = str(job_key)
         details_meta_json = json.dumps(_sanitize_for_json(details_meta))
-    elif isinstance(details_meta_raw, str) and details_meta_raw.strip():
-        try:
-            d = json.loads(details_meta_raw)
-            if isinstance(d, dict):
-                d["run_key"] = rk
-                if job_key:
-                    d["job_key"] = str(job_key)
-                details_meta_json = json.dumps(_sanitize_for_json(d))
-            else:
-                details_meta_json = details_meta_raw
-        except Exception:
-            details_meta_json = details_meta_raw
     else:
-        details_meta_json = json.dumps(_sanitize_for_json(merged_meta))
+        details_meta = dict(merged_meta)
+        details_meta_json = json.dumps(_sanitize_for_json(details_meta))
 
     try:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO backtest_run_details(
-                run_id, config_json, metrics_json, metadata_json, trades_json,
-                equity_curve_json, equity_timestamps_json, extra_series_json,
-                candles_json, params_json, run_context_json, computed_metrics_json,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+        upsert_backtest_run_details(
+            conn,
+            (
+                "run_id",
+                "config_json",
+                "config_jsonb",
+                "metrics_json",
+                "metrics_jsonb",
+                "metadata_json",
+                "metadata_jsonb",
+                "trades_json",
+                "trades_jsonb",
+                "equity_curve_json",
+                "equity_curve_jsonb",
+                "equity_timestamps_json",
+                "equity_timestamps_jsonb",
+                "extra_series_json",
+                "extra_series_jsonb",
+                "candles_json",
+                "candles_jsonb",
+                "params_json",
+                "params_jsonb",
+                "run_context_json",
+                "run_context_jsonb",
+                "computed_metrics_json",
+                "computed_metrics_jsonb",
+                "created_at",
+                "updated_at",
+            ),
             (
                 run_id,
                 details_fields.get("config_json"),
+                to_jsonb(details_fields.get("config_jsonb") or details_fields.get("config_json")),
                 details_fields.get("metrics_json"),
+                to_jsonb(details_fields.get("metrics_jsonb") or details_fields.get("metrics_json")),
                 details_meta_json,
+                to_jsonb(details_meta),
                 details_fields.get("trades_json"),
+                to_jsonb(details_fields.get("trades_jsonb") or details_fields.get("trades_json")),
                 details_fields.get("equity_curve_json"),
+                to_jsonb(details_fields.get("equity_curve_jsonb") or details_fields.get("equity_curve_json")),
                 details_fields.get("equity_timestamps_json"),
+                to_jsonb(details_fields.get("equity_timestamps_jsonb") or details_fields.get("equity_timestamps_json")),
                 details_fields.get("extra_series_json"),
+                to_jsonb(details_fields.get("extra_series_jsonb") or details_fields.get("extra_series_json")),
                 details_fields.get("candles_json"),
+                to_jsonb(details_fields.get("candles_jsonb") or details_fields.get("candles_json")),
                 details_fields.get("params_json"),
+                to_jsonb(details_fields.get("params_jsonb") or details_fields.get("params_json")),
                 details_fields.get("run_context_json"),
+                to_jsonb(details_fields.get("run_context_jsonb") or details_fields.get("run_context_json")),
                 details_fields.get("computed_metrics_json"),
+                to_jsonb(details_fields.get("computed_metrics_jsonb") or details_fields.get("computed_metrics_json")),
                 created_at,
                 now_iso,
             ),
         )
-    except sqlite3.OperationalError:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO backtest_run_details(
-                run_id, config_json, metrics_json, metadata_json, trades_json,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                details_fields.get("config_json"),
-                details_fields.get("metrics_json"),
-                details_meta_json,
-                details_fields.get("trades_json"),
-                created_at,
-                now_iso,
-            ),
-        )
+    except Exception:
+        try:
+            upsert_backtest_run_details(
+                conn,
+                (
+                    "run_id",
+                    "config_json",
+                    "metrics_json",
+                    "metadata_json",
+                    "trades_json",
+                    "equity_curve_json",
+                    "equity_timestamps_json",
+                    "extra_series_json",
+                    "candles_json",
+                    "params_json",
+                    "run_context_json",
+                    "computed_metrics_json",
+                    "created_at",
+                    "updated_at",
+                ),
+                (
+                    run_id,
+                    details_fields.get("config_json"),
+                    details_fields.get("metrics_json"),
+                    details_meta_json,
+                    details_fields.get("trades_json"),
+                    details_fields.get("equity_curve_json"),
+                    details_fields.get("equity_timestamps_json"),
+                    details_fields.get("extra_series_json"),
+                    details_fields.get("candles_json"),
+                    details_fields.get("params_json"),
+                    details_fields.get("run_context_json"),
+                    details_fields.get("computed_metrics_json"),
+                    created_at,
+                    now_iso,
+                ),
+            )
+        except Exception:
+            upsert_backtest_run_details(
+                conn,
+                (
+                    "run_id",
+                    "config_json",
+                    "metrics_json",
+                    "metadata_json",
+                    "trades_json",
+                    "created_at",
+                    "updated_at",
+                ),
+                (
+                    run_id,
+                    details_fields.get("config_json"),
+                    details_fields.get("metrics_json"),
+                    details_meta_json,
+                    details_fields.get("trades_json"),
+                    created_at,
+                    now_iso,
+                ),
+            )
 
     return run_id
 
 
-def finalize_sweep_if_complete(conn: sqlite3.Connection, sweep_id: str) -> None:
+def finalize_sweep_if_complete(conn: Any, sweep_id: str) -> None:
     """Mark sweep done/failed when all child backtest_run jobs are terminal.
 
     Race-safe: updates only if the sweep is not already terminal.
@@ -4944,25 +6060,23 @@ def finalize_sweep_if_complete(conn: sqlite3.Connection, sweep_id: str) -> None:
     sid = str(sweep_id or "").strip()
     if not sid:
         return
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-
-    rows = conn.execute(
+    rows = execute_fetchall(
+        conn,
         """
         SELECT status, COUNT(*) AS c
         FROM jobs
         WHERE job_type = 'backtest_run'
-          AND sweep_id = ?
+            AND sweep_id = %s
         GROUP BY status
         """,
         (sid,),
-    ).fetchall()
+    )
 
     counts: Dict[str, int] = {}
     total = 0
     for r in rows or []:
-        st = str(r[0] if not isinstance(r, sqlite3.Row) else r["status"])
-        c = int(r[1] if not isinstance(r, sqlite3.Row) else r["c"])
+        st = str(r.get("status"))
+        c = int(r.get("c"))
         counts[st] = int(c)
         total += int(c)
 
@@ -4981,8 +6095,8 @@ def finalize_sweep_if_complete(conn: sqlite3.Connection, sweep_id: str) -> None:
     conn.execute(
         """
         UPDATE sweeps
-        SET status = ?, error_message = COALESCE(error_message, ?)
-        WHERE id = ?
+                SET status = %s, error_message = COALESCE(error_message, %s)
+                WHERE id = %s
           AND status NOT IN ('done','failed','cancelled','canceled')
         """,
         (status, err_msg, sid),
@@ -4990,7 +6104,7 @@ def finalize_sweep_if_complete(conn: sqlite3.Connection, sweep_id: str) -> None:
 
 
 def get_backtest_run_job_counts_by_sweep(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     sweep_ids: Sequence[str],
     job_type: str = "backtest_run",
@@ -5001,29 +6115,28 @@ def get_backtest_run_job_counts_by_sweep(
     Returns mapping: sweep_id -> {"total": n, "queued": n, "running": n, "done": n, "failed": n, ...}
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     sids = [str(s).strip() for s in (sweep_ids or []) if str(s).strip()]
     if not sids:
         return {}
 
-    placeholders = ",".join(["?"] * len(sids))
-    rows = conn.execute(
+    placeholders = ",".join(["%s"] * len(sids))
+    rows = execute_fetchall(
+        conn,
         f"""
         SELECT sweep_id, status, COUNT(*) AS c
         FROM jobs
-        WHERE job_type = ?
+        WHERE job_type = %s
           AND sweep_id IN ({placeholders})
         GROUP BY sweep_id, status
         """,
         tuple([str(job_type)] + sids),
-    ).fetchall()
+    )
 
     out: Dict[str, Dict[str, int]] = {}
     for r in rows or []:
-        sid = str(r[0] if not isinstance(r, sqlite3.Row) else r["sweep_id"])
-        st = str(r[1] if not isinstance(r, sqlite3.Row) else r["status"])
-        c = int(r[2] if not isinstance(r, sqlite3.Row) else r["c"]) if r is not None else 0
+        sid = str(r.get("sweep_id") or "")
+        st = str(r.get("status") or "")
+        c = int(r.get("c") or 0) if r is not None else 0
         d = out.setdefault(sid, {})
         d[st] = int(c)
 
@@ -5043,7 +6156,7 @@ def get_backtest_run_job_counts_by_sweep(
 
 
 def renew_job_lease(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     job_id: int,
     worker_id: str,
@@ -5064,15 +6177,15 @@ def renew_job_lease(
         """
         UPDATE jobs
         SET
-          lease_expires_at = ?,
-          last_lease_renew_at = ?,
-          updated_at = ?,
-          worker_id = COALESCE(worker_id, ?),
-          claimed_by = COALESCE(claimed_by, ?)
-        WHERE id = ?
+                    lease_expires_at = %s,
+                    last_lease_renew_at = %s,
+                    updated_at = %s,
+                    worker_id = COALESCE(worker_id, %s),
+                    claimed_by = COALESCE(claimed_by, %s)
+                WHERE id = %s
           AND status = 'running'
-          AND claimed_by = ?
-          AND lease_version = ?
+                    AND claimed_by = %s
+                    AND lease_version = %s
         """,
         (
             lease_expires_iso,
@@ -5090,7 +6203,7 @@ def renew_job_lease(
 
 
 def reclaim_stale_job(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     job_id: int,
     new_worker_id: str,
@@ -5106,23 +6219,23 @@ def reclaim_stale_job(
     now_iso = now_dt.isoformat()
     lease_expires_iso = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
 
-    # Only reclaim when lease_expires_at < now (ISO strings are comparable in SQLite).
+        # Only reclaim when lease_expires_at < now (ISO strings are comparable in Postgres).
     cur = conn.execute(
         """
         UPDATE jobs
         SET
-          worker_id = ?,
-          claimed_by = ?,
-          claimed_at = ?,
-          lease_expires_at = ?,
-          last_lease_renew_at = ?,
+                    worker_id = %s,
+                    claimed_by = %s,
+                    claimed_at = %s,
+                    lease_expires_at = %s,
+                    last_lease_renew_at = %s,
           lease_version = COALESCE(lease_version, 0) + 1,
           stale_reclaims = COALESCE(stale_reclaims, 0) + 1,
-          updated_at = ?
-        WHERE id = ?
+                    updated_at = %s
+                WHERE id = %s
           AND status = 'running'
           AND lease_expires_at IS NOT NULL
-          AND lease_expires_at < ?
+                    AND lease_expires_at < %s
         """,
         (
             str(new_worker_id),
@@ -5139,18 +6252,19 @@ def reclaim_stale_job(
     return cur.rowcount > 0
 
 
-def update_bot(conn: sqlite3.Connection, bot_id: int, **fields: Any) -> None:
+def update_bot(conn: Any, bot_id: int, **fields: Any) -> None:
     if not fields:
         return
     now = datetime.now(timezone.utc).isoformat()
     fields = {**fields, "updated_at": now}
     columns = []
     params: list[Any] = []
+    ph = sql_placeholder(conn)
     for key, value in fields.items():
-        columns.append(f"{key} = ?")
+        columns.append(f"{key} = {ph}")
         params.append(value)
     params.append(bot_id)
-    conn.execute(f"UPDATE bots SET {', '.join(columns)} WHERE id = ?", tuple(params))
+    conn.execute(f"UPDATE bots SET {', '.join(columns)} WHERE id = {ph}", tuple(params))
     conn.commit()
 
 
@@ -5177,14 +6291,14 @@ def increment_bot_blocked_actions(bot_id: int, delta: int = 1) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with open_db_connection() as conn:
         conn.execute(
-            "UPDATE bots SET blocked_actions_count = COALESCE(blocked_actions_count, 0) + ?, updated_at = ? WHERE id = ?",
+            "UPDATE bots SET blocked_actions_count = COALESCE(blocked_actions_count, 0) + %s, updated_at = %s WHERE id = %s",
             (delta_int, now, int(bot_id)),
         )
         conn.commit()
 
 
 def set_bot_status(
-    conn: sqlite3.Connection,
+    conn: Any,
     bot_id: int,
     status: str,
     desired_status: Optional[str] = None,
@@ -5203,28 +6317,24 @@ def set_bot_status(
     update_bot(conn, bot_id, **fields)
 
 
-def get_bot(conn: sqlite3.Connection, bot_id: int) -> Optional[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM bots WHERE id = ?", (bot_id,)).fetchone()
+def get_bot(conn: Any, bot_id: int) -> Optional[Dict[str, Any]]:
+    row = execute_fetchone(conn, f"SELECT * FROM bots WHERE id = {sql_placeholder(conn)}", (bot_id,))
     return dict(row) if row else None
 
 
-def list_bots(conn: sqlite3.Connection, limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+def list_bots(conn: Any, limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
     query = "SELECT * FROM bots"
     params: list[Any] = []
     if status is not None:
-        query += " WHERE status = ?"
+        query += f" WHERE status = {sql_placeholder(conn)}"
         params.append(status)
-    query += " ORDER BY created_at DESC LIMIT ?"
+    query += f" ORDER BY created_at DESC LIMIT {sql_placeholder(conn)}"
     params.append(limit)
-    rows = conn.execute(query, tuple(params)).fetchall()
+    rows = execute_fetchall(conn, query, tuple(params))
     return [dict(r) for r in rows]
 
 def list_bots_with_accounts(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     *,
     limit: int = 200,
@@ -5235,34 +6345,29 @@ def list_bots_with_accounts(
     This is a UI/helper query (bots → trading_accounts) so Live Bots can display account metadata.
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
 
     base = (
         "SELECT b.*, a.label AS account_label, a.status AS account_status "
         "FROM bots b "
         "LEFT JOIN trading_accounts a ON a.id = b.account_id "
-        "WHERE b.user_id = ?"
+        f"WHERE b.user_id = {sql_placeholder(conn)}"
     )
     params: List[Any] = [uid]
     if status:
-        base += " AND b.status = ?"
+        base += f" AND b.status = {sql_placeholder(conn)}"
         params.append(str(status))
-    base += " ORDER BY b.updated_at DESC LIMIT ?"
+    base += f" ORDER BY b.updated_at DESC LIMIT {sql_placeholder(conn)}"
     params.append(int(limit))
-    rows = conn.execute(base, params).fetchall()
+    rows = execute_fetchall(conn, base, params)
     return [dict(r) for r in rows]
 
 
-def upsert_bot_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> None:
+def upsert_bot_snapshot(conn: Any, snapshot: Dict[str, Any]) -> None:
     """Upsert a durable bot snapshot.
 
     Must be safe to call frequently. Callers should throttle and treat failures as best-effort.
     """
-
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
 
     bot_id = snapshot.get("bot_id")
     if bot_id is None:
@@ -5298,8 +6403,19 @@ def upsert_bot_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> N
         "last_exchange_error_at": snapshot.get("last_exchange_error_at"),
     }
 
+    try:
+        cols = get_table_columns(conn, "bot_state_snapshots")
+    except Exception:
+        cols = set()
+    if "health_jsonb" in cols:
+        fields["health_jsonb"] = to_jsonb(_coerce_json_obj(snapshot.get("health_json")))
+    if "positions_summary_jsonb" in cols:
+        fields["positions_summary_jsonb"] = to_jsonb(_coerce_json_obj(snapshot.get("positions_summary_json")))
+    if "exchange_state_jsonb" in cols:
+        fields["exchange_state_jsonb"] = to_jsonb(_coerce_json_obj(snapshot.get("exchange_state")))
+
     cols = ",".join(fields.keys())
-    placeholders = ",".join(["?"] * len(fields))
+    placeholders = ",".join([sql_placeholder(conn)] * len(fields))
     update_clause = ",".join([f"{k}=excluded.{k}" for k in fields.keys() if k != "bot_id"])
     conn.execute(
         f"""
@@ -5312,12 +6428,10 @@ def upsert_bot_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> N
     conn.commit()
 
 
-def get_bot_snapshot(conn: sqlite3.Connection, bot_id: int) -> Optional[Dict[str, Any]]:
+def get_bot_snapshot(conn: Any, bot_id: int) -> Optional[Dict[str, Any]]:
     """Get a bot row joined with its latest durable snapshot (if present)."""
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-
-    row = conn.execute(
+    row = execute_fetchone(
+        conn,
         """
         SELECT
             b.*,
@@ -5330,9 +6444,9 @@ def get_bot_snapshot(conn: sqlite3.Connection, bot_id: int) -> Optional[Dict[str
             s.desired_action AS snapshot_desired_action,
             s.next_action AS snapshot_next_action,
             s.health_status AS snapshot_health_status,
-            s.health_json AS snapshot_health_json,
+            COALESCE(s.health_jsonb::text, s.health_json) AS snapshot_health_json,
             s.pos_status AS snapshot_pos_status,
-            s.positions_summary_json AS snapshot_positions_summary_json,
+            COALESCE(s.positions_summary_jsonb::text, s.positions_summary_json) AS snapshot_positions_summary_json,
             s.open_orders_count AS snapshot_open_orders_count,
             s.open_intents_count AS snapshot_open_intents_count,
             s.risk_blocked AS snapshot_risk_blocked,
@@ -5342,21 +6456,21 @@ def get_bot_snapshot(conn: sqlite3.Connection, bot_id: int) -> Optional[Dict[str
             s.last_event_level AS snapshot_last_event_level,
             s.last_event_type AS snapshot_last_event_type,
             s.last_event_message AS snapshot_last_event_message,
-            s.exchange_state AS snapshot_exchange_state,
+            COALESCE(s.exchange_state_jsonb::text, s.exchange_state) AS snapshot_exchange_state,
             s.last_exchange_error_at AS snapshot_last_exchange_error_at
         FROM bots b
         LEFT JOIN trading_accounts a ON a.id = b.account_id
         LEFT JOIN bot_state_snapshots s ON s.bot_id = b.id
-        WHERE b.id = ?
+        WHERE b.id = {sql_placeholder(conn)}
         LIMIT 1
         """,
         (int(bot_id),),
-    ).fetchone()
+    )
     return dict(row) if row else None
 
 
 def get_bot_snapshots(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     *,
     filters: Optional[Dict[str, Any]] = None,
@@ -5368,8 +6482,6 @@ def get_bot_snapshots(
     Returns bots joined with accounts and latest snapshot fields.
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     _ = filters  # reserved for future SQL WHERE clauses
 
@@ -5391,28 +6503,25 @@ def get_bot_snapshots(
         "  s.last_event_level AS snapshot_last_event_level, "
         "  s.last_event_type AS snapshot_last_event_type, "
         "  s.last_event_message AS snapshot_last_event_message, "
-        "  s.exchange_state AS snapshot_exchange_state, "
+        "  COALESCE(s.exchange_state_jsonb::text, s.exchange_state) AS snapshot_exchange_state, "
         "  s.last_exchange_error_at AS snapshot_last_exchange_error_at "
         "FROM bots b "
         "LEFT JOIN trading_accounts a ON a.id = b.account_id "
         "LEFT JOIN bot_state_snapshots s ON s.bot_id = b.id "
-        "WHERE b.user_id = ?"
+        f"WHERE b.user_id = {sql_placeholder(conn)}"
     )
     params: List[Any] = [uid]
     if status:
-        base += " AND b.status = ?"
+        base += f" AND b.status = {sql_placeholder(conn)}"
         params.append(str(status))
-    base += " ORDER BY b.updated_at DESC LIMIT ?"
+    base += f" ORDER BY b.updated_at DESC LIMIT {sql_placeholder(conn)}"
     params.append(int(limit))
-    rows = conn.execute(base, params).fetchall()
+    rows = execute_fetchall(conn, base, params)
     return [dict(r) for r in rows]
 
 
-def upsert_account_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> None:
+def upsert_account_snapshot(conn: Any, snapshot: Dict[str, Any]) -> None:
     """Upsert a durable trading account snapshot."""
-
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
 
     account_id = snapshot.get("account_id")
     if account_id is None:
@@ -5436,8 +6545,17 @@ def upsert_account_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) 
           "last_exchange_error_at": snapshot.get("last_exchange_error_at"),
     }
 
+    try:
+        cols = get_table_columns(conn, "account_state_snapshots")
+    except Exception:
+        cols = set()
+    if "positions_summary_jsonb" in cols:
+        fields["positions_summary_jsonb"] = to_jsonb(_coerce_json_obj(snapshot.get("positions_summary_json")))
+    if "exchange_state_jsonb" in cols:
+        fields["exchange_state_jsonb"] = to_jsonb(_coerce_json_obj(snapshot.get("exchange_state")))
+
     cols = ",".join(fields.keys())
-    placeholders = ",".join(["?"] * len(fields))
+    placeholders = ",".join([sql_placeholder(conn)] * len(fields))
     update_clause = ",".join([f"{k}=excluded.{k}" for k in fields.keys() if k != "account_id"])
     conn.execute(
         f"""
@@ -5451,7 +6569,7 @@ def upsert_account_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) 
 
 
 def get_account_snapshots(
-    conn: sqlite3.Connection,
+    conn: Any,
     user_id: str,
     *,
     include_deleted: bool = True,
@@ -5459,8 +6577,6 @@ def get_account_snapshots(
 ) -> List[Dict[str, Any]]:
     """Single-query account overview joined with latest durable snapshot."""
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
 
     base = (
@@ -5471,29 +6587,29 @@ def get_account_snapshots(
         "  s.status AS snapshot_status, "
         "  s.risk_blocked AS snapshot_risk_blocked, "
         "  s.risk_reason AS snapshot_risk_reason, "
-        "  s.positions_summary_json AS snapshot_positions_summary_json, "
+                "  COALESCE(s.positions_summary_jsonb::text, s.positions_summary_json) AS snapshot_positions_summary_json, "
         "  s.open_orders_count AS snapshot_open_orders_count, "
         "  s.margin_ratio AS snapshot_margin_ratio, "
         "  s.wallet_balance AS snapshot_wallet_balance, "
-          "  s.last_error AS snapshot_last_error, "
-          "  s.exchange_state AS snapshot_exchange_state, "
-          "  s.last_exchange_error_at AS snapshot_last_exchange_error_at "
+                    "  s.last_error AS snapshot_last_error, "
+                    "  COALESCE(s.exchange_state_jsonb::text, s.exchange_state) AS snapshot_exchange_state, "
+                    "  s.last_exchange_error_at AS snapshot_last_exchange_error_at "
         "FROM trading_accounts a "
         "LEFT JOIN account_state_snapshots s ON s.account_id = a.id "
-        "WHERE a.user_id = ?"
+        "WHERE a.user_id = %s"
     )
     params: List[Any] = [uid]
     if not include_deleted:
         base += " AND COALESCE(NULLIF(TRIM(a.status), ''), 'active') != 'deleted'"
     if exchange_id:
-        base += " AND a.exchange_id = ?"
+        base += " AND a.exchange_id = %s"
         params.append(str(exchange_id).strip().lower())
     base += " ORDER BY a.updated_at DESC, a.id DESC"
-    rows = conn.execute(base, params).fetchall()
+    rows = execute_fetchall(conn, base, params)
     return [dict(r) for r in rows]
 
 def set_job_link(
-    conn: sqlite3.Connection,
+    conn: Any,
     job_id: int,
     sweep_id: Optional[str] = None,
     run_id: Optional[str] = None,
@@ -5508,20 +6624,18 @@ def set_job_link(
     update_job(conn, job_id, **fields)
 
 
-def request_cancel_job(conn: sqlite3.Connection, job_id: int) -> None:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+def request_cancel_job(conn: Any, job_id: int) -> None:
+    row = execute_fetchone(conn, "SELECT status FROM jobs WHERE id = %s", (job_id,))
     if not row:
         return
-    status = row["status"] if isinstance(row, sqlite3.Row) else row[0]
+    status = row.get("status")
     if status in {"queued", "running"}:
         # Use update_job so updated_at is refreshed.
         update_job(conn, job_id, status="cancel_requested")
 
 
 def reconcile_inprocess_jobs_after_restart(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     current_worker_id: str,
     job_types: Sequence[str] = ("backtest", "sweep"),
@@ -5543,9 +6657,6 @@ def reconcile_inprocess_jobs_after_restart(
     Returns counts: {"requeued": int, "cancelled": int}
     """
 
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-
     types = [str(t).strip() for t in (job_types or []) if str(t).strip()]
     if not types:
         return {"requeued": 0, "cancelled": 0}
@@ -5553,13 +6664,13 @@ def reconcile_inprocess_jobs_after_restart(
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(seconds=float(min_age_s_unowned_running))).isoformat()
     now_iso = now.isoformat()
-    placeholders = ",".join(["?"] * len(types))
+    placeholders = ",".join(["%s"] * len(types))
 
     # 1) Finalize cancel requests (no worker should keep them alive after restart).
     cur_cancel = conn.execute(
         f"""
         UPDATE jobs
-        SET status = 'cancelled', finished_at = COALESCE(finished_at, ?), message = COALESCE(NULLIF(message, ''), 'Cancelled'), updated_at = ?
+                SET status = 'cancelled', finished_at = COALESCE(finished_at, %s), message = COALESCE(NULLIF(message, ''), 'Cancelled'), updated_at = %s
         WHERE job_type IN ({placeholders})
           AND status = 'cancel_requested'
         """,
@@ -5571,12 +6682,12 @@ def reconcile_inprocess_jobs_after_restart(
         f"""
         UPDATE jobs
         SET status = 'queued', worker_id = NULL, progress = 0.0,
-            message = 'Resumed after restart', updated_at = ?
+                        message = 'Resumed after restart', updated_at = %s
         WHERE job_type IN ({placeholders})
           AND status = 'running'
           AND (
-            (worker_id LIKE 'streamlit:%' AND worker_id != ?)
-            OR ((worker_id IS NULL OR worker_id = '') AND COALESCE(updated_at, created_at) < ?)
+                        (worker_id LIKE 'streamlit:%' AND worker_id != %s)
+                        OR ((worker_id IS NULL OR worker_id = '') AND COALESCE(updated_at, created_at) < %s)
           )
         """,
         tuple([now_iso] + types + [str(current_worker_id), cutoff]),
@@ -5594,20 +6705,19 @@ def reconcile_inprocess_jobs_after_restart(
     return {"requeued": requeued, "cancelled": cancelled}
 
 
-def link_bot_to_run(conn: sqlite3.Connection, bot_id: int, run_id: str) -> None:
+def link_bot_to_run(conn: Any, bot_id: int, run_id: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO bot_run_map (bot_id, run_id, created_at)
-        VALUES (?, ?, ?)
-        """,
+    insert_ignore(
+        conn,
+        "bot_run_map",
+        ["bot_id", "run_id", "created_at"],
         (bot_id, str(run_id), now),
     )
     conn.commit()
 
 
 def add_bot_event(
-    conn: sqlite3.Connection,
+    conn: Any,
     bot_id: int,
     level: str,
     event_type: str,
@@ -5615,20 +6725,48 @@ def add_bot_event(
     payload: Optional[Dict[str, Any]] = None,
 ) -> int:
     ts = datetime.now(timezone.utc).isoformat()
-    payload_json = json.dumps(payload or {})
-    cur = conn.execute(
-        """
-        INSERT INTO bot_events (bot_id, ts, level, event_type, message, json_payload)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (bot_id, ts, level, event_type, message, payload_json),
+    payload_obj = _sanitize_for_json(payload or {})
+    payload_json = json.dumps(payload_obj)
+    cols = get_table_columns(conn, "bot_events") if is_postgres(conn) else set()
+    use_jsonb = "json_payload_jsonb" in cols
+    if use_jsonb:
+        placeholders = sql_placeholders(conn, 7)
+        sql = (
+            "INSERT INTO bot_events (bot_id, ts, level, event_type, message, json_payload, json_payload_jsonb) "
+            f"VALUES ({placeholders})"
+        )
+        if is_postgres(conn):
+            sql += " RETURNING id"
+            cur = conn.execute(sql, (bot_id, ts, level, event_type, message, payload_json, to_jsonb(payload_obj)))
+            row = cur.fetchone()
+            conn.commit()
+            if row is None:
+                raise ValueError("Failed to insert bot_event")
+            return int(row[0])
+        cur = conn.execute(sql, (bot_id, ts, level, event_type, message, payload_json, payload_json))
+        conn.commit()
+        return int(cur.lastrowid)
+
+    placeholders = sql_placeholders(conn, 6)
+    sql = (
+        "INSERT INTO bot_events (bot_id, ts, level, event_type, message, json_payload) "
+        f"VALUES ({placeholders})"
     )
+    if is_postgres(conn):
+        sql += " RETURNING id"
+        cur = conn.execute(sql, (bot_id, ts, level, event_type, message, payload_json))
+        row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            raise ValueError("Failed to insert bot_event")
+        return int(row[0])
+    cur = conn.execute(sql, (bot_id, ts, level, event_type, message, payload_json))
     conn.commit()
     return int(cur.lastrowid)
 
 
 def add_ledger_row(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     bot_id: int,
     event_ts: str,
@@ -5646,17 +6784,27 @@ def add_ledger_row(
 ) -> bool:
     """Insert a ledger row, idempotent when ref_id is provided.
 
-    Uses INSERT OR IGNORE against the unique index (bot_id, kind, ref_id) where ref_id is not null.
+    Uses ON CONFLICT DO NOTHING against the unique index (bot_id, kind, ref_id) where ref_id is not null.
     """
     meta_json = json.dumps(meta or {})
-    cur = conn.execute(
-        """
-        INSERT OR IGNORE INTO bot_ledger (
-            bot_id, event_ts, kind, symbol, side, position_side,
-            qty, price, fee, funding, pnl, ref_id, meta_json
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+    cur = insert_ignore(
+        conn,
+        "bot_ledger",
+        [
+            "bot_id",
+            "event_ts",
+            "kind",
+            "symbol",
+            "side",
+            "position_side",
+            "qty",
+            "price",
+            "fee",
+            "funding",
+            "pnl",
+            "ref_id",
+            "meta_json",
+        ],
         (
             int(bot_id),
             str(event_ts),
@@ -5677,19 +6825,18 @@ def add_ledger_row(
     return cur.rowcount > 0
 
 
-def list_ledger(conn: sqlite3.Connection, bot_id: int, limit: int = 500) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
+def list_ledger(conn: Any, bot_id: int, limit: int = 500) -> List[Dict[str, Any]]:
+    rows = execute_fetchall(
+        conn,
         """
         SELECT id, bot_id, event_ts, kind, symbol, side, position_side, qty, price, fee, funding, pnl, ref_id, meta_json
         FROM bot_ledger
-        WHERE bot_id = ?
+        WHERE bot_id = %s
         ORDER BY event_ts DESC, id DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (int(bot_id), int(limit)),
-    ).fetchall()
+    )
     out: List[Dict[str, Any]] = []
     for row in rows:
         data = dict(row)
@@ -5702,20 +6849,19 @@ def list_ledger(conn: sqlite3.Connection, bot_id: int, limit: int = 500) -> List
     return out
 
 
-def sum_ledger(conn: sqlite3.Connection, bot_id: int) -> Dict[str, float]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute(
+def sum_ledger(conn: Any, bot_id: int) -> Dict[str, float]:
+    row = execute_fetchone(
+        conn,
         """
         SELECT
             COALESCE(SUM(COALESCE(fee, 0.0)), 0.0) AS fees_total,
             COALESCE(SUM(COALESCE(funding, 0.0)), 0.0) AS funding_total,
             COALESCE(SUM(COALESCE(pnl, 0.0)), 0.0) AS realized_total
         FROM bot_ledger
-        WHERE bot_id = ?
+        WHERE bot_id = %s
         """,
         (int(bot_id),),
-    ).fetchone()
+    )
     if not row:
         return {"fees_total": 0.0, "funding_total": 0.0, "realized_total": 0.0}
     return {
@@ -5725,19 +6871,33 @@ def sum_ledger(conn: sqlite3.Connection, bot_id: int) -> Dict[str, float]:
     }
 
 
-def list_bot_events(conn: sqlite3.Connection, bot_id: int, limit: int = 200) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT id, bot_id, ts, level, event_type, message, json_payload
-        FROM bot_events
-        WHERE bot_id = ?
-        ORDER BY ts DESC
-        LIMIT ?
-        """,
-        (bot_id, limit),
-    ).fetchall()
+def list_bot_events(conn: Any, bot_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    rows = None
+    try:
+        rows = execute_fetchall(
+            conn,
+            """
+            SELECT id, bot_id, ts, level, event_type, message,
+                   COALESCE(json_payload_jsonb::text, json_payload) AS json_payload
+            FROM bot_events
+            WHERE bot_id = %s
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
+            (bot_id, limit),
+        )
+    except Exception:
+        rows = execute_fetchall(
+            conn,
+            """
+            SELECT id, bot_id, ts, level, event_type, message, json_payload
+            FROM bot_events
+            WHERE bot_id = %s
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
+            (bot_id, limit),
+        )
     out: List[Dict[str, Any]] = []
     for row in rows:
         data = dict(row)
@@ -5750,7 +6910,7 @@ def list_bot_events(conn: sqlite3.Connection, bot_id: int, limit: int = 200) -> 
     return out
 
 
-def add_bot_fill(conn: sqlite3.Connection, fill: Dict[str, Any]) -> int:
+def add_bot_fill(conn: Any, fill: Dict[str, Any]) -> int:
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "bot_id": fill.get("bot_id"),
@@ -5778,19 +6938,41 @@ def add_bot_fill(conn: sqlite3.Connection, fill: Dict[str, Any]) -> int:
             client_order_id, external_order_id, filled_qty, avg_fill_price,
             fee_paid, fee_asset, is_reduce_only, is_dca, note, event_ts, created_at
         ) VALUES (
-            :bot_id, :run_id, :symbol, :exchange_id, :position_side, :order_action,
-            :client_order_id, :external_order_id, :filled_qty, :avg_fill_price,
-            :fee_paid, :fee_asset, :is_reduce_only, :is_dca, :note, :event_ts, :created_at
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s
         )
+        RETURNING id
         """,
-        payload,
+        (
+            payload.get("bot_id"),
+            payload.get("run_id"),
+            payload.get("symbol"),
+            payload.get("exchange_id"),
+            payload.get("position_side"),
+            payload.get("order_action"),
+            payload.get("client_order_id"),
+            payload.get("external_order_id"),
+            payload.get("filled_qty"),
+            payload.get("avg_fill_price"),
+            payload.get("fee_paid"),
+            payload.get("fee_asset"),
+            payload.get("is_reduce_only"),
+            payload.get("is_dca"),
+            payload.get("note"),
+            payload.get("event_ts"),
+            payload.get("created_at"),
+        ),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError("Failed to insert bot_fill")
+    return int(row[0])
 
 
 def upsert_bot_order_intent(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     bot_id: int,
     intent_key: str,
@@ -5816,9 +6998,9 @@ def upsert_bot_order_intent(
             activation_pct, target_price, qty, reduce_only, post_only,
             client_order_id, external_order_id, last_error, created_at, updated_at
         ) VALUES (
-            :bot_id, :intent_key, :kind, :status, :local_id, :note, :position_side,
-            :activation_pct, :target_price, :qty, :reduce_only, :post_only,
-            :client_order_id, :external_order_id, :last_error, :created_at, :updated_at
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s
         )
         ON CONFLICT(bot_id, intent_key) DO UPDATE SET
             status=excluded.status,
@@ -5835,90 +7017,85 @@ def upsert_bot_order_intent(
             last_error=excluded.last_error,
             updated_at=excluded.updated_at
         """,
-        {
-            "bot_id": int(bot_id),
-            "intent_key": str(intent_key),
-            "kind": str(kind),
-            "status": str(status),
-            "local_id": int(local_id),
-            "note": note,
-            "position_side": position_side,
-            "activation_pct": activation_pct,
-            "target_price": target_price,
-            "qty": qty,
-            "reduce_only": 1 if reduce_only else 0,
-            "post_only": 1 if post_only else 0,
-            "client_order_id": client_order_id,
-            "external_order_id": external_order_id,
-            "last_error": last_error,
-            "created_at": now,
-            "updated_at": now,
-        },
+        (
+            int(bot_id),
+            str(intent_key),
+            str(kind),
+            str(status),
+            int(local_id),
+            note,
+            position_side,
+            activation_pct,
+            target_price,
+            qty,
+            1 if reduce_only else 0,
+            1 if post_only else 0,
+            client_order_id,
+            external_order_id,
+            last_error,
+            now,
+            now,
+        ),
     )
     conn.commit()
 
 
 def list_bot_order_intents(
-    conn: sqlite3.Connection,
+    conn: Any,
     bot_id: int,
     *,
     statuses: Optional[List[str]] = None,
     kind: Optional[str] = None,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    clauses = ["bot_id = ?"]
+    clauses = ["bot_id = %s"]
     params: List[Any] = [int(bot_id)]
     if kind:
-        clauses.append("kind = ?")
+        clauses.append("kind = %s")
         params.append(str(kind))
     if statuses:
-        placeholders = ",".join(["?"] * len(statuses))
+        placeholders = ",".join(["%s"] * len(statuses))
         clauses.append(f"status IN ({placeholders})")
         params.extend([str(s) for s in statuses])
     sql = (
         "SELECT * FROM bot_order_intents WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        + " ORDER BY updated_at DESC, id DESC LIMIT %s"
     )
     params.append(int(limit))
-    rows = conn.execute(sql, tuple(params)).fetchall()
+    rows = execute_fetchall(conn, sql, tuple(params))
     return [dict(r) for r in rows]
 
 
-def get_bot_order_intent(conn: sqlite3.Connection, bot_id: int, intent_key: str) -> Optional[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM bot_order_intents WHERE bot_id = ? AND intent_key = ?",
+def get_bot_order_intent(conn: Any, bot_id: int, intent_key: str) -> Optional[Dict[str, Any]]:
+    row = execute_fetchone(
+        conn,
+        "SELECT * FROM bot_order_intents WHERE bot_id = %s AND intent_key = %s",
         (int(bot_id), str(intent_key)),
-    ).fetchone()
+    )
     return dict(row) if row else None
 
 
 def get_bot_order_intent_by_local_id(
-    conn: sqlite3.Connection,
+    conn: Any,
     bot_id: int,
     local_id: int,
     *,
     statuses: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     params: List[Any] = [int(bot_id), int(local_id)]
-    sql = "SELECT * FROM bot_order_intents WHERE bot_id = ? AND local_id = ?"
+    sql = "SELECT * FROM bot_order_intents WHERE bot_id = %s AND local_id = %s"
     if statuses:
-        placeholders = ",".join(["?"] * len(statuses))
+        placeholders = ",".join(["%s"] * len(statuses))
         sql += f" AND status IN ({placeholders})"
         params.extend([str(s) for s in statuses])
     sql += " ORDER BY updated_at DESC, id DESC LIMIT 1"
-    row = conn.execute(sql, tuple(params)).fetchone()
+    row = execute_fetchone(conn, sql, tuple(params))
     return dict(row) if row else None
 
 
 def update_bot_order_intent(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     bot_id: int,
     intent_key: str,
@@ -5929,32 +7106,30 @@ def update_bot_order_intent(
     now = datetime.now(timezone.utc).isoformat()
     fields = dict(fields)
     fields["updated_at"] = now
-    sets = ", ".join([f"{k} = :{k}" for k in fields.keys()])
-    payload = {"bot_id": int(bot_id), "intent_key": str(intent_key), **fields}
+    sets = ", ".join([f"{k} = %s" for k in fields.keys()])
+    params = list(fields.values()) + [int(bot_id), str(intent_key)]
     conn.execute(
-        f"UPDATE bot_order_intents SET {sets} WHERE bot_id = :bot_id AND intent_key = :intent_key",
-        payload,
+        f"UPDATE bot_order_intents SET {sets} WHERE bot_id = %s AND intent_key = %s",
+        params,
     )
     conn.commit()
 
 
-def list_bot_fills(conn: sqlite3.Connection, bot_id: int, limit: int = 200, since_ts: Optional[str] = None) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
+def list_bot_fills(conn: Any, bot_id: int, limit: int = 200, since_ts: Optional[str] = None) -> List[Dict[str, Any]]:
     params: List[Any] = [bot_id]
     query = [
-        "SELECT * FROM bot_fills WHERE bot_id = ?",
+        "SELECT * FROM bot_fills WHERE bot_id = %s",
     ]
     if since_ts:
-        query.append("AND event_ts >= ?")
+        query.append("AND event_ts >= %s")
         params.append(since_ts)
-    query.append("ORDER BY event_ts DESC LIMIT ?")
+    query.append("ORDER BY event_ts DESC LIMIT %s")
     params.append(limit)
-    rows = conn.execute("\n".join(query), tuple(params)).fetchall()
+    rows = execute_fetchall(conn, "\n".join(query), tuple(params))
     return [dict(r) for r in rows]
 
 
-def create_position_history(conn: sqlite3.Connection, row: Dict[str, Any]) -> int:
+def create_position_history(conn: Any, row: Dict[str, Any]) -> int:
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "bot_id": row.get("bot_id"),
@@ -5981,29 +7156,49 @@ def create_position_history(conn: sqlite3.Connection, row: Dict[str, Any]) -> in
             max_size, entry_avg_price, exit_avg_price, realized_pnl, fees_paid,
             num_fills, num_dca_fills, metadata_json, created_at
         ) VALUES (
-            :bot_id, :run_id, :symbol, :exchange_id, :position_side, :opened_at, :closed_at,
-            :max_size, :entry_avg_price, :exit_avg_price, :realized_pnl, :fees_paid,
-            :num_fills, :num_dca_fills, :metadata_json, :created_at
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s
         )
+        RETURNING id
         """,
-        payload,
+        (
+            payload.get("bot_id"),
+            payload.get("run_id"),
+            payload.get("symbol"),
+            payload.get("exchange_id"),
+            payload.get("position_side"),
+            payload.get("opened_at"),
+            payload.get("closed_at"),
+            payload.get("max_size"),
+            payload.get("entry_avg_price"),
+            payload.get("exit_avg_price"),
+            payload.get("realized_pnl"),
+            payload.get("fees_paid"),
+            payload.get("num_fills"),
+            payload.get("num_dca_fills"),
+            payload.get("metadata_json"),
+            payload.get("created_at"),
+        ),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    row_id = cur.fetchone()
+    if row_id is None:
+        raise ValueError("Failed to insert position history")
+    return int(row_id[0])
 
 
-def list_positions_history(conn: sqlite3.Connection, bot_id: int, limit: int = 50) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
+def list_positions_history(conn: Any, bot_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+    rows = execute_fetchall(
+        conn,
         """
         SELECT * FROM bot_positions_history
-        WHERE bot_id = ?
+        WHERE bot_id = %s
         ORDER BY closed_at DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (bot_id, limit),
-    ).fetchall()
+    )
     out: List[Dict[str, Any]] = []
     for r in rows:
         data = dict(r)
@@ -6017,33 +7212,31 @@ def list_positions_history(conn: sqlite3.Connection, bot_id: int, limit: int = 5
     return out
 
 
-def list_bots_for_run(conn: sqlite3.Connection, run_id: str) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
+def list_bots_for_run(conn: Any, run_id: str) -> List[Dict[str, Any]]:
+    rows = execute_fetchall(
+        conn,
+        f"""
         SELECT bot_id, run_id, created_at
         FROM bot_run_map
-        WHERE run_id = ?
+        WHERE run_id = {sql_placeholder(conn)}
         ORDER BY created_at DESC
         """,
         (run_id,),
-    ).fetchall()
+    )
     return [dict(r) for r in rows]
 
 
-def list_runs_for_bot(conn: sqlite3.Connection, bot_id: int) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
+def list_runs_for_bot(conn: Any, bot_id: int) -> List[Dict[str, Any]]:
+    rows = execute_fetchall(
+        conn,
+        f"""
         SELECT bot_id, run_id, created_at
         FROM bot_run_map
-        WHERE bot_id = ?
+        WHERE bot_id = {sql_placeholder(conn)}
         ORDER BY created_at DESC
         """,
         (bot_id,),
-    ).fetchall()
+    )
     return [dict(r) for r in rows]
 
 
@@ -6058,7 +7251,7 @@ def _ts_to_ms(ts: Any) -> Optional[int]:
 
 
 def upsert_candles(
-    conn: sqlite3.Connection,
+    conn: Any,
     exchange_id: str,
     market_type: str,
     symbol: str,
@@ -6090,11 +7283,18 @@ def upsert_candles(
     if not rows:
         return
     conn.executemany(
-        """
-        INSERT OR REPLACE INTO candles_cache (
+        f"""
+        INSERT INTO candles_cache (
             exchange_id, market_type, symbol, timeframe, timestamp_ms,
             open, high, low, close, volume
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES ({sql_placeholders(conn, 10)})
+        ON CONFLICT (exchange_id, market_type, symbol, timeframe, timestamp_ms)
+        DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume
         """,
         rows,
     )
@@ -6102,7 +7302,7 @@ def upsert_candles(
 
 
 def load_cached_range(
-    conn: sqlite3.Connection,
+    conn: Any,
     exchange_id: str,
     market_type: str,
     symbol: str,
@@ -6110,18 +7310,22 @@ def load_cached_range(
     start_ms: Optional[int],
     end_ms: Optional[int],
 ) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     market_type = (market_type or "unknown").lower()
     start_ms = _ts_to_ms(start_ms)
     end_ms = _ts_to_ms(end_ms)
+    ph = sql_placeholder(conn)
     params: list[Any] = [exchange_id, market_type, symbol, timeframe]
-    conditions = ["exchange_id = ?", "market_type = ?", "symbol = ?", "timeframe = ?"]
+    conditions = [
+        f"exchange_id = {ph}",
+        f"market_type = {ph}",
+        f"symbol = {ph}",
+        f"timeframe = {ph}",
+    ]
     if start_ms is not None:
-        conditions.append("timestamp_ms >= ?")
+        conditions.append(f"timestamp_ms >= {ph}")
         params.append(int(start_ms))
     if end_ms is not None:
-        conditions.append("timestamp_ms <= ?")
+        conditions.append(f"timestamp_ms <= {ph}")
         params.append(int(end_ms))
     query = (
         "SELECT timestamp_ms, open, high, low, close, volume FROM candles_cache "
@@ -6129,56 +7333,57 @@ def load_cached_range(
         + " AND ".join(conditions)
         + " ORDER BY timestamp_ms ASC"
     )
-    rows = conn.execute(query, tuple(params)).fetchall()
-    return [dict(r) for r in rows]
+    rows = fetchall_dicts(conn.execute(query, tuple(params)))
+    return rows
 
 
 def get_cached_coverage(
-    conn: sqlite3.Connection,
+    conn: Any,
     exchange_id: str,
     market_type: str,
     symbol: str,
     timeframe: str,
 ) -> tuple[Optional[int], Optional[int]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
     market_type = (market_type or "unknown").lower()
-    row = conn.execute(
-        """
-        SELECT MIN(timestamp_ms) AS min_ts, MAX(timestamp_ms) AS max_ts
-        FROM candles_cache
-        WHERE exchange_id = ? AND market_type = ? AND symbol = ? AND timeframe = ?
-        """,
-        (exchange_id, market_type, symbol, timeframe),
-    ).fetchone()
+    row = fetchone_dict(
+        conn.execute(
+            f"""
+            SELECT MIN(timestamp_ms) AS min_ts, MAX(timestamp_ms) AS max_ts
+            FROM candles_cache
+            WHERE exchange_id = {sql_placeholder(conn)} AND market_type = {sql_placeholder(conn)}
+              AND symbol = {sql_placeholder(conn)} AND timeframe = {sql_placeholder(conn)}
+            """,
+            (exchange_id, market_type, symbol, timeframe),
+        )
+    )
     if not row:
         return None, None
-    return row["min_ts"], row["max_ts"]
+    return row.get("min_ts"), row.get("max_ts")
 
 
-def purge_old_candles(conn: sqlite3.Connection, keep_months: int) -> int:
+def purge_old_candles(conn: Any, keep_months: int) -> int:
     if keep_months <= 0:
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=30 * keep_months)
     cutoff_ms = int(cutoff.timestamp() * 1000)
-    cur = conn.execute("DELETE FROM candles_cache WHERE timestamp_ms < ?", (cutoff_ms,))
+    cur = conn.execute("DELETE FROM candles_cache WHERE timestamp_ms < %s", (cutoff_ms,))
     conn.commit()
     return cur.rowcount
 
 
-def list_cached_coverages(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    if conn.row_factory is None:
-        conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT exchange_id, market_type, symbol, timeframe,
-               MIN(timestamp_ms) AS min_ts, MAX(timestamp_ms) AS max_ts, COUNT(*) AS rows_count
-        FROM candles_cache
-        GROUP BY exchange_id, market_type, symbol, timeframe
-        ORDER BY symbol, timeframe
-        """
-    ).fetchall()
-    return [dict(r) for r in rows]
+def list_cached_coverages(conn: Any) -> List[Dict[str, Any]]:
+    rows = fetchall_dicts(
+        conn.execute(
+            """
+            SELECT exchange_id, market_type, symbol, timeframe,
+                   MIN(timestamp_ms) AS min_ts, MAX(timestamp_ms) AS max_ts, COUNT(*) AS rows_count
+            FROM candles_cache
+            GROUP BY exchange_id, market_type, symbol, timeframe
+            ORDER BY symbol, timeframe
+            """
+        )
+    )
+    return rows
 
 
 def _extract_initial_entry_notional_usd(config_obj: Any, metadata: Dict[str, Any]) -> Optional[float]:
@@ -6281,14 +7486,19 @@ def build_backtest_run_rows(
     start_time = _to_iso8601(start_dt)
     end_time = _to_iso8601(end_dt)
 
-    config_payload = json.dumps(_sanitize_for_json(config))
-    metrics_payload = json.dumps(_sanitize_for_json(metrics_source))
+    config_obj = _sanitize_for_json(config)
+    metrics_obj = _sanitize_for_json(metrics_source)
+    config_payload = json.dumps(config_obj)
+    metrics_payload = json.dumps(metrics_obj)
     # Keep metadata as a dict for merge-by-run_key at write time.
     metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata_obj = _sanitize_for_json(metadata_dict)
 
     trades_json: Optional[str] = None
+    trades_obj: Optional[Any] = None
     if result is not None and getattr(result, "trades", None) is not None:
-        trades_json = json.dumps([t.to_dict() if hasattr(t, "to_dict") else _sanitize_for_json(t) for t in result.trades])
+        trades_obj = [t.to_dict() if hasattr(t, "to_dict") else _sanitize_for_json(t) for t in result.trades]
+        trades_json = json.dumps(trades_obj)
 
     # Artifacts
     equity_curve_json: Optional[str] = None
@@ -6298,13 +7508,22 @@ def build_backtest_run_rows(
     params_json: Optional[str] = None
     run_context_json: Optional[str] = None
     computed_metrics_json: Optional[str] = None
+    equity_curve_obj: Optional[Any] = None
+    equity_timestamps_obj: Optional[Any] = None
+    extra_series_obj: Optional[Any] = None
+    candles_obj: Optional[Any] = None
+    params_obj: Optional[Any] = None
+    run_context_obj: Optional[Any] = None
+    computed_metrics_obj: Optional[Any] = None
     if result is not None:
         try:
             eq = getattr(result, "equity_curve", None)
             if isinstance(eq, list) and eq:
-                equity_curve_json = json.dumps(_sanitize_for_json(eq))
+                equity_curve_obj = _sanitize_for_json(eq)
+                equity_curve_json = json.dumps(equity_curve_obj)
         except Exception:
             equity_curve_json = None
+            equity_curve_obj = None
         try:
             eq_ts = getattr(result, "equity_timestamps", None)
             if isinstance(eq_ts, list) and eq_ts:
@@ -6316,7 +7535,8 @@ def build_backtest_run_rows(
                         ts_list.append(ts.isoformat())
                     else:
                         ts_list.append(str(ts))
-                equity_timestamps_json = json.dumps(_sanitize_for_json(ts_list))
+                equity_timestamps_obj = _sanitize_for_json(ts_list)
+                equity_timestamps_json = json.dumps(equity_timestamps_obj)
             else:
                 candles = getattr(result, "candles", None)
                 if isinstance(candles, list) and candles:
@@ -6329,15 +7549,19 @@ def build_backtest_run_rows(
                             ts_list.append(ts.isoformat())
                         else:
                             ts_list.append(str(ts))
-                    equity_timestamps_json = json.dumps(_sanitize_for_json(ts_list))
+                    equity_timestamps_obj = _sanitize_for_json(ts_list)
+                    equity_timestamps_json = json.dumps(equity_timestamps_obj)
         except Exception:
             equity_timestamps_json = None
+            equity_timestamps_obj = None
         try:
             extra = getattr(result, "extra_series", None)
             if isinstance(extra, dict) and extra:
-                extra_series_json = json.dumps(_sanitize_for_json(extra))
+                extra_series_obj = _sanitize_for_json(extra)
+                extra_series_json = json.dumps(extra_series_obj)
         except Exception:
             extra_series_json = None
+            extra_series_obj = None
         try:
             candles = getattr(result, "candles", None)
             if isinstance(candles, list) and candles:
@@ -6360,28 +7584,36 @@ def build_backtest_run_rows(
                             _safe_float(getattr(c, "volume", None)),
                         ]
                     )
-                candles_json = json.dumps(_sanitize_for_json(packed))
+                candles_obj = _sanitize_for_json(packed)
+                candles_json = json.dumps(candles_obj)
         except Exception:
             candles_json = None
+            candles_obj = None
 
         try:
             params = getattr(result, "params", None)
             if isinstance(params, dict) and params:
-                params_json = json.dumps(_sanitize_for_json(params))
+                params_obj = _sanitize_for_json(params)
+                params_json = json.dumps(params_obj)
         except Exception:
             params_json = None
+            params_obj = None
         try:
             rc = getattr(result, "run_context", None)
             if isinstance(rc, dict) and rc:
-                run_context_json = json.dumps(_sanitize_for_json(rc))
+                run_context_obj = _sanitize_for_json(rc)
+                run_context_json = json.dumps(run_context_obj)
         except Exception:
             run_context_json = None
+            run_context_obj = None
         try:
             cm = getattr(result, "computed_metrics", None)
             if isinstance(cm, dict) and cm:
-                computed_metrics_json = json.dumps(_sanitize_for_json(cm))
+                computed_metrics_obj = _sanitize_for_json(cm)
+                computed_metrics_json = json.dumps(computed_metrics_obj)
         except Exception:
             computed_metrics_json = None
+            computed_metrics_obj = None
 
     run_row_fields: Dict[str, Any] = {
         "created_at": created_at,
@@ -6390,8 +7622,11 @@ def build_backtest_run_rows(
         "strategy_name": strategy_name,
         "strategy_version": strategy_version,
         "config_json": config_payload,
+        "config_jsonb": config_obj,
         "metrics_json": metrics_payload,
+        "metrics_jsonb": metrics_obj,
         "metadata_json": metadata_dict,
+        "metadata_jsonb": metadata_obj,
         "sweep_id": sweep_id,
         "market_type": market_type or None,
         "start_time": start_time,
@@ -6408,20 +7643,32 @@ def build_backtest_run_rows(
         "common_sense_ratio": _safe_float(metrics_source.get("common_sense_ratio")),
         "avg_position_time_s": _safe_float(metrics_source.get("avg_position_time_s")),
         "trades_json": trades_json,
+        "trades_jsonb": trades_obj,
     }
 
     details_fields: Dict[str, Any] = {
         "config_json": config_payload,
+        "config_jsonb": config_obj,
         "metrics_json": metrics_payload,
+        "metrics_jsonb": metrics_obj,
         "metadata_json": metadata_dict,
+        "metadata_jsonb": metadata_obj,
         "trades_json": trades_json,
+        "trades_jsonb": trades_obj,
         "equity_curve_json": equity_curve_json,
+        "equity_curve_jsonb": equity_curve_obj,
         "equity_timestamps_json": equity_timestamps_json,
+        "equity_timestamps_jsonb": equity_timestamps_obj,
         "extra_series_json": extra_series_json,
+        "extra_series_jsonb": extra_series_obj,
         "candles_json": candles_json,
+        "candles_jsonb": candles_obj,
         "params_json": params_json,
+        "params_jsonb": params_obj,
         "run_context_json": run_context_json,
+        "run_context_jsonb": run_context_obj,
         "computed_metrics_json": computed_metrics_json,
+        "computed_metrics_jsonb": computed_metrics_obj,
         "created_at": created_at,
     }
 
@@ -6448,75 +7695,124 @@ def save_backtest_run(
     payload["id"] = run_id
     payload["created_at"] = created_at
     payload["metadata_json"] = json.dumps(_sanitize_for_json(run_row_fields.get("metadata_json") or {}))
+    payload["metadata_jsonb"] = to_jsonb(run_row_fields.get("metadata_jsonb") or run_row_fields.get("metadata_json"))
+    payload["config_jsonb"] = to_jsonb(run_row_fields.get("config_jsonb"))
+    payload["metrics_jsonb"] = to_jsonb(run_row_fields.get("metrics_jsonb"))
+    payload["trades_jsonb"] = to_jsonb(run_row_fields.get("trades_jsonb"))
 
     with _get_conn() as conn:
         _ensure_schema(conn)
+        cols = [
+            "id",
+            "created_at",
+            "symbol",
+            "timeframe",
+            "strategy_name",
+            "strategy_version",
+            "config_json",
+            "config_jsonb",
+            "metrics_json",
+            "metrics_jsonb",
+            "metadata_json",
+            "metadata_jsonb",
+            "market_type",
+            "start_time",
+            "end_time",
+            "net_profit",
+            "net_return_pct",
+            "roi_pct_on_margin",
+            "max_drawdown_pct",
+            "sharpe",
+            "sortino",
+            "win_rate",
+            "profit_factor",
+            "cpc_index",
+            "common_sense_ratio",
+            "avg_position_time_s",
+            "trades_json",
+            "trades_jsonb",
+            "sweep_id",
+        ]
+        values = [payload.get(c) for c in cols]
+        placeholders = sql_placeholders(conn, len(cols))
         conn.execute(
-            """
-            INSERT INTO backtest_runs (
-                id, created_at, symbol, timeframe,
-                strategy_name, strategy_version,
-                config_json, metrics_json, metadata_json,
-                market_type,
-                start_time, end_time,
-                net_profit, net_return_pct, roi_pct_on_margin, max_drawdown_pct,
-                sharpe, sortino, win_rate, profit_factor,
-                cpc_index, common_sense_ratio, avg_position_time_s, trades_json,
-                sweep_id
-            )
-            VALUES (
-                :id, :created_at, :symbol, :timeframe,
-                :strategy_name, :strategy_version,
-                :config_json, :metrics_json, :metadata_json,
-                :market_type,
-                :start_time, :end_time,
-                :net_profit, :net_return_pct, :roi_pct_on_margin, :max_drawdown_pct,
-                :sharpe, :sortino, :win_rate, :profit_factor,
-                :cpc_index, :common_sense_ratio, :avg_position_time_s, :trades_json,
-                :sweep_id
-            )
-            """,
-            payload,
+            f"INSERT INTO backtest_runs ({', '.join(cols)}) VALUES ({placeholders})",
+            tuple(values),
         )
 
         # Keep details table in sync for newer DBs. This enables summary-only list queries.
         try:
             try:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO backtest_run_details(
-                        run_id, config_json, metrics_json, metadata_json, trades_json,
-                        equity_curve_json, equity_timestamps_json, extra_series_json,
-                        candles_json, params_json, run_context_json, computed_metrics_json,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+                upsert_backtest_run_details(
+                    conn,
+                    (
+                        "run_id",
+                        "config_json",
+                        "config_jsonb",
+                        "metrics_json",
+                        "metrics_jsonb",
+                        "metadata_json",
+                        "metadata_jsonb",
+                        "trades_json",
+                        "trades_jsonb",
+                        "equity_curve_json",
+                        "equity_curve_jsonb",
+                        "equity_timestamps_json",
+                        "equity_timestamps_jsonb",
+                        "extra_series_json",
+                        "extra_series_jsonb",
+                        "candles_json",
+                        "candles_jsonb",
+                        "params_json",
+                        "params_jsonb",
+                        "run_context_json",
+                        "run_context_jsonb",
+                        "computed_metrics_json",
+                        "computed_metrics_jsonb",
+                        "created_at",
+                        "updated_at",
+                    ),
                     (
                         run_id,
                         details_fields.get("config_json"),
+                        to_jsonb(details_fields.get("config_jsonb")),
                         details_fields.get("metrics_json"),
+                        to_jsonb(details_fields.get("metrics_jsonb")),
                         json.dumps(_sanitize_for_json(details_fields.get("metadata_json") or {})),
+                        to_jsonb(details_fields.get("metadata_jsonb")),
                         details_fields.get("trades_json"),
+                        to_jsonb(details_fields.get("trades_jsonb")),
                         details_fields.get("equity_curve_json"),
+                        to_jsonb(details_fields.get("equity_curve_jsonb")),
                         details_fields.get("equity_timestamps_json"),
+                        to_jsonb(details_fields.get("equity_timestamps_jsonb")),
                         details_fields.get("extra_series_json"),
+                        to_jsonb(details_fields.get("extra_series_jsonb")),
                         details_fields.get("candles_json"),
+                        to_jsonb(details_fields.get("candles_jsonb")),
                         details_fields.get("params_json"),
+                        to_jsonb(details_fields.get("params_jsonb")),
                         details_fields.get("run_context_json"),
+                        to_jsonb(details_fields.get("run_context_jsonb")),
                         details_fields.get("computed_metrics_json"),
+                        to_jsonb(details_fields.get("computed_metrics_jsonb")),
                         created_at,
                         created_at,
                     ),
                 )
-            except sqlite3.OperationalError:
+            except Exception:
                 # Legacy DB without the new artifact columns.
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO backtest_run_details(
-                        run_id, config_json, metrics_json, metadata_json, trades_json,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
+                upsert_backtest_run_details(
+                    conn,
+                    (
+                        "run_id",
+                        "config_json",
+                        "metrics_json",
+                        "metadata_json",
+                        "trades_json",
+                        "created_at",
+                        "updated_at",
+                    ),
                     (
                         run_id,
                         details_fields.get("config_json"),
@@ -6527,7 +7823,7 @@ def save_backtest_run(
                         created_at,
                     ),
                 )
-        except sqlite3.OperationalError as e:
+        except Exception as e:
             # Allow legacy DBs that haven't been migrated yet.
             # Otherwise, surface the error so the caller gets an atomic rollback.
             msg = str(e).lower()
@@ -6538,42 +7834,277 @@ def save_backtest_run(
     return run_id
 
 
-def count_backtest_runs_missing_details(conn: sqlite3.Connection) -> int:
+def save_backtest_run_details_for_existing_run(
+    *,
+    run_id: str,
+    config: Any,
+    metrics: Dict[str, Any],
+    metadata: Dict[str, Any],
+    result: Optional["BacktestResult"],
+) -> None:
+    """Upsert heavy detail payloads for an existing run.
+
+    This updates backtest_run_details only (no changes to backtest_runs summary).
+    """
+
+    rid = str(run_id or "").strip()
+    if not rid:
+        raise ValueError("run_id is required")
+
+    run_row_fields, details_fields = build_backtest_run_rows(
+        config,
+        metrics,
+        metadata,
+        sweep_id=metadata.get("sweep_id"),
+        result=result,
+    )
+    now_iso = now_utc_iso()
+
+    def _do_write() -> None:
+        with open_db_connection() as conn:
+            _ensure_schema(conn)
+
+            try:
+                cols = get_table_columns(conn, "backtest_run_details")
+            except Exception:
+                cols = set()
+            if not cols:
+                return
+
+            created_at = None
+            try:
+                row = execute_fetchone(
+                    conn,
+                    f"SELECT created_at FROM backtest_run_details WHERE run_id = {sql_placeholder(conn)}",
+                    (rid,),
+                )
+                if row is not None:
+                    created_at = row.get("created_at")
+            except Exception:
+                created_at = None
+            if not created_at:
+                try:
+                    row2 = execute_fetchone(
+                        conn,
+                        f"SELECT created_at FROM backtest_runs WHERE id = {sql_placeholder(conn)}",
+                        (rid,),
+                    )
+                    if row2 is not None:
+                        created_at = row2.get("created_at")
+                except Exception:
+                    created_at = None
+            created_at = created_at or str(details_fields.get("created_at") or now_iso)
+
+            def _json_or_none(val: Any) -> Optional[str]:
+                if val is None:
+                    return None
+                if isinstance(val, str):
+                    return val
+                try:
+                    return json.dumps(_sanitize_for_json(val))
+                except Exception:
+                    return None
+
+            details_meta = details_fields.get("metadata_json")
+            details_meta_json = _json_or_none(details_meta) or "{}"
+            has_jsonb = "config_jsonb" in cols
+
+            if {"equity_curve_json", "equity_timestamps_json", "extra_series_json"}.issubset(cols):
+                if has_jsonb:
+                    upsert_backtest_run_details(
+                        conn,
+                        (
+                            "run_id",
+                            "config_json",
+                            "config_jsonb",
+                            "metrics_json",
+                            "metrics_jsonb",
+                            "metadata_json",
+                            "metadata_jsonb",
+                            "trades_json",
+                            "trades_jsonb",
+                            "equity_curve_json",
+                            "equity_curve_jsonb",
+                            "equity_timestamps_json",
+                            "equity_timestamps_jsonb",
+                            "extra_series_json",
+                            "extra_series_jsonb",
+                            "candles_json",
+                            "candles_jsonb",
+                            "params_json",
+                            "params_jsonb",
+                            "run_context_json",
+                            "run_context_jsonb",
+                            "computed_metrics_json",
+                            "computed_metrics_jsonb",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        (
+                            rid,
+                            details_fields.get("config_json"),
+                            to_jsonb(details_fields.get("config_jsonb") or details_fields.get("config_json")),
+                            details_fields.get("metrics_json"),
+                            to_jsonb(details_fields.get("metrics_jsonb") or details_fields.get("metrics_json")),
+                            details_meta_json,
+                            to_jsonb(details_fields.get("metadata_jsonb") or details_fields.get("metadata_json")),
+                            details_fields.get("trades_json"),
+                            to_jsonb(details_fields.get("trades_jsonb") or details_fields.get("trades_json")),
+                            details_fields.get("equity_curve_json"),
+                            to_jsonb(details_fields.get("equity_curve_jsonb") or details_fields.get("equity_curve_json")),
+                            details_fields.get("equity_timestamps_json"),
+                            to_jsonb(details_fields.get("equity_timestamps_jsonb") or details_fields.get("equity_timestamps_json")),
+                            details_fields.get("extra_series_json"),
+                            to_jsonb(details_fields.get("extra_series_jsonb") or details_fields.get("extra_series_json")),
+                            details_fields.get("candles_json"),
+                            to_jsonb(details_fields.get("candles_jsonb") or details_fields.get("candles_json")),
+                            details_fields.get("params_json"),
+                            to_jsonb(details_fields.get("params_jsonb") or details_fields.get("params_json")),
+                            details_fields.get("run_context_json"),
+                            to_jsonb(details_fields.get("run_context_jsonb") or details_fields.get("run_context_json")),
+                            details_fields.get("computed_metrics_json"),
+                            to_jsonb(details_fields.get("computed_metrics_jsonb") or details_fields.get("computed_metrics_json")),
+                            created_at,
+                            now_iso,
+                        ),
+                    )
+                else:
+                    upsert_backtest_run_details(
+                        conn,
+                        (
+                            "run_id",
+                            "config_json",
+                            "metrics_json",
+                            "metadata_json",
+                            "trades_json",
+                            "equity_curve_json",
+                            "equity_timestamps_json",
+                            "extra_series_json",
+                            "candles_json",
+                            "params_json",
+                            "run_context_json",
+                            "computed_metrics_json",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        (
+                            rid,
+                            details_fields.get("config_json"),
+                            details_fields.get("metrics_json"),
+                            details_meta_json,
+                            details_fields.get("trades_json"),
+                            details_fields.get("equity_curve_json"),
+                            details_fields.get("equity_timestamps_json"),
+                            details_fields.get("extra_series_json"),
+                            details_fields.get("candles_json"),
+                            details_fields.get("params_json"),
+                            details_fields.get("run_context_json"),
+                            details_fields.get("computed_metrics_json"),
+                            created_at,
+                            now_iso,
+                        ),
+                    )
+            else:
+                if has_jsonb:
+                    upsert_backtest_run_details(
+                        conn,
+                        (
+                            "run_id",
+                            "config_json",
+                            "config_jsonb",
+                            "metrics_json",
+                            "metrics_jsonb",
+                            "metadata_json",
+                            "metadata_jsonb",
+                            "trades_json",
+                            "trades_jsonb",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        (
+                            rid,
+                            details_fields.get("config_json"),
+                            to_jsonb(details_fields.get("config_jsonb") or details_fields.get("config_json")),
+                            details_fields.get("metrics_json"),
+                            to_jsonb(details_fields.get("metrics_jsonb") or details_fields.get("metrics_json")),
+                            details_meta_json,
+                            to_jsonb(details_fields.get("metadata_jsonb") or details_fields.get("metadata_json")),
+                            details_fields.get("trades_json"),
+                            to_jsonb(details_fields.get("trades_jsonb") or details_fields.get("trades_json")),
+                            created_at,
+                            now_iso,
+                        ),
+                    )
+                else:
+                    upsert_backtest_run_details(
+                        conn,
+                        (
+                            "run_id",
+                            "config_json",
+                            "metrics_json",
+                            "metadata_json",
+                            "trades_json",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        (
+                            rid,
+                            details_fields.get("config_json"),
+                            details_fields.get("metrics_json"),
+                            details_meta_json,
+                            details_fields.get("trades_json"),
+                            created_at,
+                            now_iso,
+                        ),
+                    )
+            conn.commit()
+
+    try:
+        _run_write_with_retry(_do_write)
+    except Exception as exc:
+        if _is_db_locked_error(exc):
+            raise RuntimeError("Database is locked. Please retry in a moment.") from exc
+        raise
+
+
+def count_backtest_runs_missing_details(conn: Any) -> int:
     """Count backtest_runs that don't have a matching backtest_run_details row."""
 
-    row = conn.execute(
+    row = execute_fetchone(
+        conn,
         """
-        SELECT COUNT(1)
+        SELECT COUNT(1) AS c
         FROM backtest_runs r
         LEFT JOIN backtest_run_details d ON d.run_id = r.id
         WHERE d.run_id IS NULL
-        """
-    ).fetchone()
+        """,
+    )
     try:
-        return int(row[0]) if row else 0
+        return int(row.get("c") if row else 0)
     except Exception:
         return 0
 
 
-def sample_backtest_runs_missing_details(conn: sqlite3.Connection, limit: int = 5) -> List[str]:
+def sample_backtest_runs_missing_details(conn: Any, limit: int = 5) -> List[str]:
     """Return up to `limit` run IDs missing details rows."""
 
     lim = max(1, int(limit))
-    rows = conn.execute(
+    rows = execute_fetchall(
+        conn,
         """
         SELECT r.id
         FROM backtest_runs r
         LEFT JOIN backtest_run_details d ON d.run_id = r.id
         WHERE d.run_id IS NULL
         ORDER BY r.created_at DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (lim,),
-    ).fetchall()
+    )
     out: List[str] = []
     for r in rows or []:
         try:
-            out.append(str(r[0]))
+            out.append(str(r.get("id")))
         except Exception:
             continue
     return out
@@ -6582,7 +8113,7 @@ def sample_backtest_runs_missing_details(conn: sqlite3.Connection, limit: int = 
 def load_backtest_run_summaries(
     limit: Optional[int] = None,
     filters: Optional[Dict[str, Any]] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Load summary rows for list views (no blob JSON parsing).
 
@@ -6601,7 +8132,7 @@ def load_backtest_run_summaries(
     filters = filters or {}
     min_ret = filters.get("min_net_return_pct")
     if min_ret is not None:
-        where_clauses.append("net_return_pct IS NOT NULL AND net_return_pct >= ?")
+        where_clauses.append("net_return_pct IS NOT NULL AND net_return_pct >= %s")
         params_list.append(min_ret)
 
     if where_clauses:
@@ -6610,17 +8141,15 @@ def load_backtest_run_summaries(
     query += " ORDER BY created_at DESC"
 
     if limit is not None:
-        query += " LIMIT ?"
+        query += " LIMIT %s"
         params_list.append(limit)
 
     connection = conn or _get_conn()
-    if connection.row_factory is None:
-        connection.row_factory = sqlite3.Row
     with profile_span(
         "db.load_backtest_run_summaries",
         meta={"limit": limit if limit is not None else None, "has_filters": bool(filters)},
     ):
-        rows = connection.execute(query, tuple(params_list)).fetchall()
+        rows = execute_fetchall(connection, query, tuple(params_list))
     if conn is None:
         connection.close()
     return [dict(r) for r in rows]
@@ -6629,7 +8158,7 @@ def load_backtest_run_summaries(
 def get_backtest_run_details(
     run_id: str,
     *,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Load the large JSON payloads for a run.
 
@@ -6638,34 +8167,42 @@ def get_backtest_run_details(
 
     rid = str(run_id)
     connection = conn or _get_conn()
-    if connection.row_factory is None:
-        connection.row_factory = sqlite3.Row
 
     row = None
     try:
         with profile_span("db.get_backtest_run_details", meta={"run_id": rid}):
-            row = connection.execute(
+            row = execute_fetchone(
+                connection,
                 """
-                SELECT run_id, config_json, metrics_json, metadata_json, trades_json
+                SELECT run_id,
+                       config_json, config_jsonb,
+                       metrics_json, metrics_jsonb,
+                       metadata_json, metadata_jsonb,
+                       trades_json, trades_jsonb
                 FROM backtest_run_details
-                WHERE run_id = ?
+                WHERE run_id = %s
                 """,
                 (rid,),
-            ).fetchone()
-    except sqlite3.OperationalError:
+            )
+    except Exception:
         row = None
 
     if row is None:
         # Legacy fallback.
         with profile_span("db.get_backtest_run_details_legacy", meta={"run_id": rid}):
-            row = connection.execute(
+            row = execute_fetchone(
+                connection,
                 """
-                SELECT id AS run_id, config_json, metrics_json, metadata_json, trades_json
+                SELECT id AS run_id,
+                       config_json, config_jsonb,
+                       metrics_json, metrics_jsonb,
+                       metadata_json, metadata_jsonb,
+                       trades_json, trades_jsonb
                 FROM backtest_runs
-                WHERE id = ?
+                WHERE id = %s
                 """,
                 (rid,),
-            ).fetchone()
+            )
 
     if conn is None:
         connection.close()
@@ -6673,42 +8210,37 @@ def get_backtest_run_details(
     if row is None:
         return None
 
-    config_obj: Any = {}
-    metrics_obj: Any = {}
-    metadata_obj: Any = {}
-    try:
-        config_obj = json.loads(row["config_json"]) if row["config_json"] else {}
-    except (TypeError, json.JSONDecodeError):
-        config_obj = {}
-    try:
-        metrics_obj = json.loads(row["metrics_json"]) if row["metrics_json"] else {}
-    except (TypeError, json.JSONDecodeError):
-        metrics_obj = {}
-    try:
-        metadata_obj = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
-    except (TypeError, json.JSONDecodeError):
-        metadata_obj = {}
+    config_obj: Any = _coerce_json_obj(row.get("config_jsonb"))
+    if config_obj is None:
+        config_obj = _coerce_json_obj(row.get("config_json")) or {}
+    metrics_obj: Any = _coerce_json_obj(row.get("metrics_jsonb"))
+    if metrics_obj is None:
+        metrics_obj = _coerce_json_obj(row.get("metrics_json")) or {}
+    metadata_obj: Any = _coerce_json_obj(row.get("metadata_jsonb"))
+    if metadata_obj is None:
+        metadata_obj = _coerce_json_obj(row.get("metadata_json")) or {}
+    trades_payload = row.get("trades_jsonb") if row.get("trades_jsonb") is not None else row.get("trades_json")
 
     return {
         "run_id": row["run_id"],
         "config": config_obj,
         "metrics": metrics_obj,
         "metadata": metadata_obj,
-        "trades_json": row["trades_json"],
+        "trades_json": trades_payload,
     }
 
 
 def load_backtest_runs(
     limit: Optional[int] = None,
     filters: Optional[Dict[str, Any]] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     query = """
          SELECT id, created_at, symbol, timeframe, strategy_name, strategy_version,
-             config_json, metrics_json, metadata_json,
+             config_json, config_jsonb, metrics_json, metrics_jsonb, metadata_json, metadata_jsonb,
              start_time, end_time, net_profit, net_return_pct, roi_pct_on_margin, max_drawdown_pct,
              sharpe, sortino, win_rate, profit_factor, cpc_index, common_sense_ratio,
-             trades_json, sweep_id
+             trades_json, trades_jsonb, sweep_id
         FROM backtest_runs
     """
     where_clauses: list[str] = []
@@ -6716,7 +8248,7 @@ def load_backtest_runs(
     filters = filters or {}
     min_ret = filters.get("min_net_return_pct")
     if min_ret is not None:
-        where_clauses.append("net_return_pct IS NOT NULL AND net_return_pct >= ?")
+        where_clauses.append("net_return_pct IS NOT NULL AND net_return_pct >= %s")
         params_list.append(min_ret)
 
     if where_clauses:
@@ -6725,7 +8257,7 @@ def load_backtest_runs(
     query += " ORDER BY created_at DESC"
 
     if limit is not None:
-        query += " LIMIT ?"
+        query += " LIMIT %s"
         params_list.append(limit)
 
     connection = conn or _get_conn()
@@ -6733,7 +8265,7 @@ def load_backtest_runs(
         "db.load_backtest_runs",
         meta={"limit": limit if limit is not None else None, "has_filters": bool(filters)},
     ):
-        rows = connection.execute(query, tuple(params_list)).fetchall()
+        rows = execute_fetchall(connection, query, tuple(params_list))
     if conn is None:
         connection.close()
 
@@ -6745,9 +8277,9 @@ def load_backtest_runs(
             "timeframe": row["timeframe"],
             "strategy_name": row["strategy_name"],
             "strategy_version": row["strategy_version"],
-            "config": json.loads(row["config_json"]),
-            "metrics": json.loads(row["metrics_json"]),
-            "metadata": json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+            "config": _load_json_field(row, "config"),
+            "metrics": _load_json_field(row, "metrics"),
+            "metadata": _load_json_field(row, "metadata"),
             "start_time": row["start_time"],
             "end_time": row["end_time"],
             "net_profit": row["net_profit"],
@@ -6760,7 +8292,7 @@ def load_backtest_runs(
             "profit_factor": row["profit_factor"],
             "cpc_index": row["cpc_index"],
             "common_sense_ratio": row["common_sense_ratio"],
-            "trades_json": row["trades_json"],
+            "trades_json": row["trades_jsonb"] if row.get("trades_jsonb") is not None else row["trades_json"],
             "sweep_id": row["sweep_id"],
         }
         for row in rows
@@ -6773,27 +8305,26 @@ def get_user_run_shortlist_map(user_id: str) -> Dict[str, Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
+            rows = execute_fetchall(
+                conn,
                 """
                 SELECT run_id, shortlisted, note, updated_at
                 FROM run_shortlists
-                WHERE user_id = ? AND shortlisted = 1
+                WHERE user_id = %s AND shortlisted = 1
                 ORDER BY updated_at DESC
                 """,
                 (uid,),
-            ).fetchall()
-        except sqlite3.OperationalError:
+            )
+        except DbErrors.OperationalError:
             return {}
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows or []:
-        rid = str(r["run_id"]) if isinstance(r, sqlite3.Row) else str(r[0])
+        rid = str(r.get("run_id"))
         out[rid] = {
-            "shortlisted": bool(r["shortlisted"] if isinstance(r, sqlite3.Row) else r[1]),
-            "note": (r["note"] if isinstance(r, sqlite3.Row) else r[2]) or "",
-            "updated_at": (r["updated_at"] if isinstance(r, sqlite3.Row) else r[3]),
+            "shortlisted": bool(r.get("shortlisted")),
+            "note": (r.get("note") or ""),
+            "updated_at": r.get("updated_at"),
         }
     return out
 
@@ -6829,7 +8360,7 @@ def set_user_run_shortlists(
             conn.executemany(
                 """
                 INSERT INTO run_shortlists(user_id, run_id, shortlisted, note, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT(user_id, run_id) DO UPDATE SET
                     shortlisted = excluded.shortlisted,
                     note = excluded.note,
@@ -6837,7 +8368,7 @@ def set_user_run_shortlists(
                 """,
                 rows,
             )
-        except sqlite3.OperationalError:
+        except DbErrors.OperationalError:
             # Table may not exist on legacy DBs.
             return
 
@@ -6861,24 +8392,21 @@ def load_backtest_runs_explorer_rows(
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
-
         shortlist_join = ""
         shortlist_cols = "0 AS shortlisted, '' AS shortlist_note"
         filter_params: List[Any] = []
         params: List[Any] = []
         if uid:
-            shortlist_join = "LEFT JOIN run_shortlists rs ON rs.run_id = r.id AND rs.user_id = ?"
+            shortlist_join = "LEFT JOIN run_shortlists rs ON rs.run_id = r.id AND rs.user_id = %s"
             shortlist_cols = "COALESCE(rs.shortlisted, 0) AS shortlisted, COALESCE(rs.note, '') AS shortlist_note"
             params.append(uid)
 
         where_clauses: list[str] = []
         if filters.get("sweep_id") is not None:
-            where_clauses.append("r.sweep_id = ?")
+            where_clauses.append("r.sweep_id = %s")
             filter_params.append(filters.get("sweep_id"))
         if filters.get("min_net_return_pct") is not None:
-            where_clauses.append("r.net_return_pct IS NOT NULL AND r.net_return_pct >= ?")
+            where_clauses.append("r.net_return_pct IS NOT NULL AND r.net_return_pct >= %s")
             filter_params.append(filters.get("min_net_return_pct"))
 
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
@@ -6887,7 +8415,7 @@ def load_backtest_runs_explorer_rows(
         # Doing a full-table scan each time makes the Results page feel very slow.
         try:
             sym_rows = conn.execute(
-                f"SELECT r.symbol FROM backtest_runs r{where_sql} ORDER BY r.created_at DESC LIMIT ?",
+                f"SELECT r.symbol FROM backtest_runs r{where_sql} ORDER BY r.created_at DESC LIMIT %s",
                 tuple(list(filter_params) + [lim]),
             ).fetchall()
             symbols = []
@@ -6945,11 +8473,11 @@ def load_backtest_runs_explorer_rows(
             {shortlist_join}
             {where_sql}
             ORDER BY r.created_at DESC
-            LIMIT ?
+            LIMIT %s
         """
         params.append(lim)
 
-        rows = conn.execute(sql, tuple(params)).fetchall()
+        rows = execute_fetchall(conn, sql, tuple(params))
         return [dict(r) for r in rows]
 
 
@@ -6962,10 +8490,11 @@ def list_backtest_run_strategies(*, limit: int = 5000) -> List[str]:
     lim = max(1, min(int(limit or 5000), 50000))
     with _get_conn() as conn:
         _ensure_schema(conn)
-        rows = conn.execute(
-            "SELECT DISTINCT strategy_name FROM backtest_runs WHERE strategy_name IS NOT NULL ORDER BY strategy_name LIMIT ?",
+        rows = execute_fetchall(
+            conn,
+            "SELECT DISTINCT strategy_name FROM backtest_runs WHERE strategy_name IS NOT NULL ORDER BY strategy_name LIMIT %s",
             (lim,),
-        ).fetchall()
+        )
     out: List[str] = []
     for r in rows or []:
         try:
@@ -7010,29 +8539,29 @@ def get_runs_explorer_rows(
 
     strategy_name = filters.get("strategy_name")
     if strategy_name:
-        where.append("r.strategy_name = ?")
+        where.append("r.strategy_name = %s")
         params.append(str(strategy_name))
 
     sweep_id = filters.get("sweep_id")
     if sweep_id is not None and str(sweep_id).strip() != "":
-        where.append("r.sweep_id = ?")
+        where.append("r.sweep_id = %s")
         params.append(sweep_id)
 
     created_from = filters.get("created_from")
     if created_from:
-        where.append("r.created_at >= ?")
+        where.append("r.created_at >= %s")
         params.append(str(created_from))
 
     created_to = filters.get("created_to")
     if created_to:
-        where.append("r.created_at < ?")
+        where.append("r.created_at < %s")
         params.append(str(created_to))
 
     symbols = filters.get("symbols")
     if isinstance(symbols, list) and symbols:
         syms = [str(s).strip() for s in symbols if str(s).strip()]
         if syms:
-            where.append("r.symbol IN (" + ",".join(["?"] * len(syms)) + ")")
+            where.append("r.symbol IN (" + ",".join(["%s"] * len(syms)) + ")")
             params.extend(syms)
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
@@ -7059,9 +8588,9 @@ def get_runs_explorer_rows(
             r.profit_factor,
             r.cpc_index,
             r.common_sense_ratio,
-            COALESCE(d.config_json, r.config_json) AS config_json,
-            COALESCE(d.metrics_json, r.metrics_json) AS metrics_json,
-            COALESCE(d.metadata_json, r.metadata_json) AS metadata_json,
+            COALESCE(d.config_jsonb, d.config_json::jsonb, r.config_jsonb, r.config_json::jsonb)::text AS config_json,
+            COALESCE(d.metrics_jsonb, d.metrics_json::jsonb, r.metrics_jsonb, r.metrics_json::jsonb)::text AS metrics_json,
+            COALESCE(d.metadata_jsonb, d.metadata_json::jsonb, r.metadata_jsonb, r.metadata_json::jsonb)::text AS metadata_json,
             sw.name AS sweep_name,
             sw.exchange_id AS sweep_exchange_id,
             s.base_asset,
@@ -7074,15 +8603,13 @@ def get_runs_explorer_rows(
         LEFT JOIN symbols s ON s.exchange_symbol = r.symbol
         {where_sql}
         ORDER BY r.created_at DESC
-        LIMIT ? OFFSET ?
+        LIMIT %s OFFSET %s
     """
     params2 = list(params)
     params2.extend([lim, off])
 
     with _get_conn() as conn:
         _ensure_schema(conn)
-        if conn.row_factory is None:
-            conn.row_factory = sqlite3.Row
         with profile_span(
             "db.get_runs_explorer_rows",
             meta={
@@ -7091,14 +8618,14 @@ def get_runs_explorer_rows(
                 "has_filters": bool(filters),
             },
         ):
-            rows = conn.execute(sql, tuple(params2)).fetchall()
+            rows = execute_fetchall(conn, sql, tuple(params2))
 
     if not rows:
         return [], 0
 
     total = 0
     try:
-        total = int(rows[0]["total_count"]) if isinstance(rows[0], sqlite3.Row) else int(rows[0]["total_count"])
+        total = int(rows[0].get("total_count") or 0)
     except Exception:
         try:
             total = int(dict(rows[0]).get("total_count") or 0)
@@ -7115,17 +8642,18 @@ def get_runs_explorer_rows(
 
 def get_backtest_run(run_id: str) -> Optional[Dict[str, Any]]:
     with _get_conn() as conn:
-        row = conn.execute(
+        row = execute_fetchone(
+            conn,
             """
                  SELECT id, created_at, symbol, timeframe, strategy_name, strategy_version,
                      start_time, end_time, net_profit, net_return_pct, max_drawdown_pct,
                      sharpe, sortino, win_rate, profit_factor, cpc_index, common_sense_ratio,
                      sweep_id
             FROM backtest_runs
-            WHERE id = ?
+            WHERE id = %s
             """,
             (run_id,),
-        ).fetchone()
+        )
 
         if row is None:
             return None
@@ -7175,6 +8703,68 @@ def _sanitize_for_json(value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     return value
+
+
+def _coerce_json_obj(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return value
+
+
+def _json_text_from_obj(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(_sanitize_for_json(value))
+    except Exception:
+        return None
+
+
+def to_jsonb(value: Any) -> Any:
+    if value is None:
+        return None
+    obj = _sanitize_for_json(value)
+    try:
+        if psycopg is not None:
+            from psycopg.types.json import Jsonb  # type: ignore
+
+            return Jsonb(obj)
+    except Exception:
+        pass
+    try:
+        if psycopg2_extras is not None:
+            return psycopg2_extras.Json(obj, dumps=json.dumps)
+    except Exception:
+        pass
+    return obj
+
+
+def _load_json_field(row: Mapping[str, Any], base: str, default: Any = None) -> Any:
+    if default is None:
+        default = {}
+    jsonb_key = f"{base}_jsonb"
+    text_key = f"{base}_json"
+    if jsonb_key in row and row.get(jsonb_key) is not None:
+        value = row.get(jsonb_key)
+        obj = _coerce_json_obj(value)
+        return obj if obj is not None else default
+    if text_key in row and row.get(text_key) is not None:
+        value = row.get(text_key)
+        obj = _coerce_json_obj(value)
+        return obj if obj is not None else default
+    return default
 
 
 def _safe_float(value: Any) -> Optional[float]:

@@ -273,17 +273,15 @@ def _prefetch_group_candles(*, conn, group_key: str, worker_id: str) -> None:
     _LAST_PREFETCH_GROUP_KEY = gk
 
     try:
-        if conn.row_factory is None:
-            conn.row_factory = __import__("sqlite3").Row
         rows = conn.execute(
             """
             SELECT payload_json
             FROM jobs
-            WHERE group_key = ?
+            WHERE group_key = %s
               AND job_type = 'backtest_run'
               AND status = 'queued'
             ORDER BY COALESCE(created_at, updated_at) ASC
-            LIMIT ?
+            LIMIT %s
             """,
             (gk, int(_CANDLE_CACHE_PREFETCH_QUERY_LIMIT)),
         ).fetchall()
@@ -428,7 +426,7 @@ def _write_with_retry(fn, *, timeout_s: float = 5.0) -> None:
 
 
 def _write_tx_with_retry(fn, *, timeout_s: float = 8.0) -> None:
-    """Retry a short BEGIN IMMEDIATE transaction block on SQLite lock errors."""
+    """Retry a short transaction block on transient DB errors."""
 
     start = time.time()
     delay = 0.05
@@ -517,7 +515,7 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
     group_key = f"sweep:{sweep_id}"
     try:
         conn.execute(
-            "UPDATE jobs SET group_key = COALESCE(NULLIF(group_key,''), ?) WHERE id = ?",
+            "UPDATE jobs SET group_key = COALESCE(NULLIF(group_key,''), %s) WHERE id = %s",
             (group_key, int(job_id)),
         )
         conn.commit()
@@ -877,8 +875,8 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
 
     def _tx() -> None:
         nonlocal run_id
-        # BEGIN IMMEDIATE ensures write serialization so two workers can't both insert a new run for the same run_key.
-        conn.execute("BEGIN IMMEDIATE")
+        # BEGIN ensures write serialization so two workers can't both insert a new run for the same run_key.
+        conn.execute("BEGIN")
         try:
             run_id = upsert_backtest_run_by_run_key(
                 conn,
@@ -898,8 +896,8 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, finished_at = ?, progress = ?, message = ?, run_id = ?, payload_json = ?, updated_at = ?
-                WHERE id = ?
+                SET status = %s, finished_at = %s, progress = %s, message = %s, run_id = %s, payload_json = %s, updated_at = %s
+                WHERE id = %s
                 """,
                 (
                     "done",
@@ -931,11 +929,11 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
         logger.exception("Backtest run job failed")
 
         def _tx_fail() -> None:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN")
             try:
                 now_iso = _now_iso()
                 conn.execute(
-                    "UPDATE jobs SET status = ?, error_text = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE jobs SET status = %s, error_text = %s, finished_at = %s, updated_at = %s WHERE id = %s",
                     ("failed", err[-4000:], now_iso, now_iso, int(job_id)),
                 )
                 if sweep_id is not None:
@@ -966,15 +964,10 @@ def _poll_once(worker_id: str) -> int:
 
     with open_db_connection() as conn:
         init_db()  # ensure schema
-        if conn.row_factory is None:
-            conn.row_factory = None
-
         now_iso = _now_iso()
 
                 # Reclaim one stale running job (planner or run).
         try:
-            if conn.row_factory is None:
-                conn.row_factory = __import__("sqlite3").Row
             stale = conn.execute(
                 """
                 SELECT *
@@ -982,7 +975,7 @@ def _poll_once(worker_id: str) -> int:
                                 WHERE job_type IN ('sweep_parent','backtest_run')
                   AND status = 'running'
                   AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < ?
+                  AND lease_expires_at < %s
                 ORDER BY lease_expires_at ASC
                 LIMIT 1
                 """,
