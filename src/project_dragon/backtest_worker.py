@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from project_dragon.backtest_core import DataSettings, compute_analysis_window_from_snapshot, run_single_backtest
-from project_dragon.candle_cache import get_candles_analysis_window, prefetch_analysis_window
+from project_dragon.candle_cache import get_candles_analysis_window, enqueue_prefetch_analysis_window
 from project_dragon.data_online import get_candles_with_cache, load_ccxt_candles
 from project_dragon.domain import Candle
 from project_dragon.storage import (
@@ -203,11 +203,7 @@ def _prefetch_group_candles(*, conn, group_key: str, worker_id: str) -> None:
             ds, analysis_info = key_to_payload.get(k, (None, None))
             if ds is None:
                 continue
-            prefetch_analysis_window(
-                data_settings=ds,
-                analysis_info=analysis_info or {},
-                reason=f"group:{gk}",
-            )
+            enqueue_prefetch_analysis_window(data_settings=ds, analysis_info=analysis_info or {}, reason=f"group:{gk}")
             prefetched += 1
         except Exception:
             continue
@@ -459,6 +455,11 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
 
     jobs_to_enqueue: list[tuple[str, Dict[str, Any], Optional[str]]] = []
     total_seen = 0
+    prefetch_candidates: list[tuple[DataSettings, Dict[str, Any]]] = []
+    try:
+        prefetch_top_n = max(0, int(_CANDLE_CACHE_PREFETCH_TOP_N or 0))
+    except Exception:
+        prefetch_top_n = 0
 
     def _flush() -> bool:
         nonlocal total_seen
@@ -567,6 +568,15 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
                 "parent_job_id": int(job_id),
             }
 
+            # Best-effort prefetch candidates during planning (non-blocking enqueue).
+            try:
+                if prefetch_top_n > 0 and len(prefetch_candidates) < prefetch_top_n:
+                    ds_obj = DataSettings(**(ds_snapshot or {}))
+                    ai = compute_analysis_window_from_snapshot(cfg_snapshot, ds_obj)
+                    prefetch_candidates.append((ds_obj, dict(ai or {})))
+            except Exception:
+                pass
+
             job_key = (
                 f"backtest_run:sweep:{str(sweep_id)}:{pair_key}:"
                 f"{str(ds_snapshot.get('data_source') or '')}:"
@@ -582,6 +592,13 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
                     return
 
     _flush()
+
+    # Kick prefetch for a few representative runs as soon as the sweep is planned.
+    try:
+        for ds_obj, ai in prefetch_candidates:
+            enqueue_prefetch_analysis_window(data_settings=ds_obj, analysis_info=ai, reason=f"sweep_plan:{sweep_id}")
+    except Exception:
+        pass
 
     if total_seen <= 0:
         update_job(conn, job_id, status="failed", error_text="no_child_jobs", finished_at=_now_iso())

@@ -404,7 +404,7 @@ def dragon_config_from_snapshot(config_dict: Dict[str, Any]) -> DragonAlgoConfig
     )
 
 
-def load_candles_for_settings(data_settings: DataSettings) -> Tuple[List[Candle], str, str, str]:
+def load_candles_for_settings(data_settings: DataSettings, *, config_snapshot: Optional[Dict[str, Any]] = None) -> Tuple[List[Candle], str, str, str]:
     ds = data_settings
     if str(ds.data_source).lower() == "synthetic":
         count = int((ds.range_params or {}).get("count", 300))
@@ -418,10 +418,17 @@ def load_candles_for_settings(data_settings: DataSettings) -> Tuple[List[Candle]
     range_mode = (ds.range_mode or "bars").lower()
     market_type = (ds.market_type or "unknown")
 
+    analysis_info: Optional[Dict[str, Any]] = None
+    if isinstance(config_snapshot, dict) and config_snapshot:
+        try:
+            analysis_info = compute_analysis_window_from_snapshot(config_snapshot, ds)
+        except Exception:
+            analysis_info = None
+
     try:
         _analysis_start, _display_start, _display_end, _candles_analysis, candles_display = get_candles_analysis_window(
             data_settings=ds,
-            analysis_info=None,
+            analysis_info=analysis_info,
             fetch_fn=get_candles_with_cache,
         )
         candles = list(candles_display)
@@ -432,7 +439,7 @@ def load_candles_for_settings(data_settings: DataSettings) -> Tuple[List[Candle]
         if "database is locked" in msg or "locked" in msg:
             _analysis_start, _display_start, _display_end, _candles_analysis, candles_display = get_candles_analysis_window(
                 data_settings=ds,
-                analysis_info=None,
+                analysis_info=analysis_info,
                 fetch_fn=load_ccxt_candles,
             )
             candles = list(candles_display)

@@ -3187,7 +3187,23 @@ def list_assets_server_side(
     if not ex_id:
         return [], 0
 
-    def _order_sql(model: Optional[List[Dict[str, Any]]]) -> str:
+    def _assets_allowed_filters() -> Dict[str, Dict[str, str]]:
+        return {
+            "id": {"type": "number", "sql": "a.id"},
+            "exchange_id": {"type": "text", "sql": "a.exchange_id"},
+            "symbol": {"type": "text", "sql": "a.symbol"},
+            "base_asset": {"type": "text", "sql": "a.base_asset"},
+            "quote_asset": {"type": "text", "sql": "a.quote_asset"},
+            "status": {"type": "text", "sql": "a.status"},
+            "created_at": {"type": "date", "sql": "a.created_at"},
+            "updated_at": {"type": "date", "sql": "a.updated_at"},
+            "categories": {"type": "text", "sql": "c.name"},
+            "category": {"type": "text", "sql": "c.name"},
+            "category_name": {"type": "text", "sql": "c.name"},
+            "name": {"type": "text", "sql": "COALESCE(a.base_asset, a.symbol)"},
+        }
+
+    def _assets_order_sql(model: Optional[List[Dict[str, Any]]]) -> str:
         allowed_sort = {
             "id": {"sql": "a.id"},
             "exchange_id": {"sql": "a.exchange_id"},
@@ -3219,24 +3235,10 @@ def list_assets_server_side(
             return "ORDER BY a.updated_at DESC, a.id ASC"
         return "ORDER BY " + ", ".join(order_parts)
 
-    owns_conn = conn is None
-    connection = conn or open_db_connection(read_only=True)
-    try:
-        allowed_filters = {
-            "id": {"type": "number", "sql": "a.id"},
-            "exchange_id": {"type": "text", "sql": "a.exchange_id"},
-            "symbol": {"type": "text", "sql": "a.symbol"},
-            "base_asset": {"type": "text", "sql": "a.base_asset"},
-            "quote_asset": {"type": "text", "sql": "a.quote_asset"},
-            "status": {"type": "text", "sql": "a.status"},
-            "created_at": {"type": "date", "sql": "a.created_at"},
-            "updated_at": {"type": "date", "sql": "a.updated_at"},
-            "categories": {"type": "text", "sql": "c.name"},
-            "category": {"type": "text", "sql": "c.name"},
-            "category_name": {"type": "text", "sql": "c.name"},
-            "name": {"type": "text", "sql": "COALESCE(a.base_asset, a.symbol)"},
-        }
-
+    def _assets_where_and_params(
+        *,
+        allowed_filters: Dict[str, Dict[str, str]],
+    ) -> Tuple[str, List[Any]]:
         where_parts: list[str] = ["a.exchange_id = %s"]
         params: list[Any] = [ex_id]
 
@@ -3267,7 +3269,14 @@ def list_assets_server_side(
             params.extend(filt_params)
 
         where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
-        order_sql = _order_sql(sort_model)
+        return where_clause, params
+
+    owns_conn = conn is None
+    connection = conn or open_db_connection(read_only=True)
+    try:
+        allowed_filters = _assets_allowed_filters()
+        where_clause, params = _assets_where_and_params(allowed_filters=allowed_filters)
+        order_sql = _assets_order_sql(sort_model)
 
         page_val = max(1, int(page or 1))
         size_val = max(1, min(int(page_size or 200), 500))
@@ -3331,6 +3340,133 @@ def list_assets_server_side(
                 connection.close()
             except Exception:
                 pass
+
+
+def debug_assets_server_side_query(
+    *,
+    user_id: str,
+    exchange_id: str,
+    page: int,
+    page_size: int,
+    sort_model: Optional[List[Dict[str, Any]]] = None,
+    filter_model: Optional[Dict[str, Any]] = None,
+    category_id: Optional[int] = None,
+    category_name: Optional[str] = None,
+    search_text: Optional[str] = None,
+    status: str = "all",
+) -> Dict[str, Any]:
+    """Return debug information for the Assets server-side query.
+
+    This is used by the Streamlit UI to display the translated filter/sort/paging
+    inputs. It does not execute any queries.
+    """
+
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    ex_id = (exchange_id or "").strip()
+    st_norm = (status or "").strip().lower() or "all"
+    if st_norm not in {"active", "disabled", "all"}:
+        st_norm = "all"
+
+    page_val = max(1, int(page or 1))
+    size_val = max(1, min(int(page_size or 200), 500))
+    offset_val = (page_val - 1) * size_val
+
+    allowed_filters = {
+        "id": {"type": "number", "sql": "a.id"},
+        "exchange_id": {"type": "text", "sql": "a.exchange_id"},
+        "symbol": {"type": "text", "sql": "a.symbol"},
+        "base_asset": {"type": "text", "sql": "a.base_asset"},
+        "quote_asset": {"type": "text", "sql": "a.quote_asset"},
+        "status": {"type": "text", "sql": "a.status"},
+        "created_at": {"type": "date", "sql": "a.created_at"},
+        "updated_at": {"type": "date", "sql": "a.updated_at"},
+        "categories": {"type": "text", "sql": "c.name"},
+        "category": {"type": "text", "sql": "c.name"},
+        "category_name": {"type": "text", "sql": "c.name"},
+        "name": {"type": "text", "sql": "COALESCE(a.base_asset, a.symbol)"},
+    }
+
+    where_parts: list[str] = []
+    where_params: list[Any] = []
+
+    if ex_id:
+        where_parts.append("a.exchange_id = %s")
+        where_params.append(ex_id)
+
+    if st_norm != "all":
+        where_parts.append("a.status = %s")
+        where_params.append(st_norm)
+
+    if category_id is not None:
+        where_parts.append("m.category_id = %s")
+        where_params.append(int(category_id))
+
+    if category_name:
+        where_parts.append("LOWER(c.name) = LOWER(%s)")
+        where_params.append(str(category_name))
+
+    if search_text:
+        s = str(search_text).strip()
+        if s:
+            like = f"%{s}%"
+            where_parts.append("(a.symbol ILIKE %s OR a.base_asset ILIKE %s OR a.quote_asset ILIKE %s OR c.name ILIKE %s)")
+            where_params.extend([like, like, like, like])
+
+    filt_sql, filt_params = translate_filter_model(filter_model, allowed_filters)
+    if filt_sql:
+        where_parts.append(f"({filt_sql})")
+        where_params.extend(filt_params)
+
+    where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+
+    allowed_sort = {
+        "id": {"sql": "a.id"},
+        "exchange_id": {"sql": "a.exchange_id"},
+        "symbol": {"sql": "a.symbol"},
+        "base_asset": {"sql": "a.base_asset"},
+        "quote_asset": {"sql": "a.quote_asset"},
+        "status": {"sql": "a.status"},
+        "created_at": {"sql": "a.created_at"},
+        "updated_at": {"sql": "a.updated_at"},
+        "categories": {"sql": "categories_csv"},
+    }
+
+    order_parts: list[str] = []
+    if isinstance(sort_model, list):
+        for item in sort_model:
+            if not isinstance(item, dict):
+                continue
+            col = item.get("colId") or item.get("field")
+            if col not in allowed_sort:
+                continue
+            sql_expr = allowed_sort[col].get("sql")
+            if not sql_expr:
+                continue
+            direction = str(item.get("sort") or "desc").lower()
+            if direction not in {"asc", "desc"}:
+                direction = "desc"
+            order_parts.append(f"{sql_expr} {direction.upper()}")
+    order_sql = "ORDER BY a.updated_at DESC, a.id ASC" if not order_parts else "ORDER BY " + ", ".join(order_parts)
+
+    return {
+        "user_id": uid,
+        "exchange_id": ex_id,
+        "page": page_val,
+        "page_size": size_val,
+        "offset": offset_val,
+        "limit": size_val,
+        "where_sql": where_clause.strip(),
+        "where_params": list(where_params),
+        "order_sql": order_sql,
+        "raw": {
+            "filter_model": filter_model,
+            "sort_model": sort_model,
+            "category_id": category_id,
+            "category_name": category_name,
+            "search_text": search_text,
+            "status": st_norm,
+        },
+    }
 
 
 def list_categories(user_id: str, exchange_id: str) -> List[Dict[str, Any]]:

@@ -62,7 +62,7 @@ from project_dragon.config_dragon import (
     dragon_config_example,
 )
 from project_dragon.crypto import CryptoConfigError, decrypt_str, mask_api_key
-from project_dragon.candle_cache import get_candles_analysis_window
+from project_dragon.candle_cache import get_run_details_candles_analysis_window
 from project_dragon.data_online import get_candles_with_cache, get_woox_market_catalog, load_ccxt_candles
 from project_dragon.domain import BacktestResult, Candle, Trade
 from project_dragon.engine import BacktestConfig, BacktestEngine
@@ -116,6 +116,7 @@ from project_dragon.storage import (
     link_bot_to_run,
     list_assets,
     list_assets_server_side,
+    debug_assets_server_side_query,
     list_asset_symbols,
     list_bot_events,
     list_bot_fills,
@@ -2183,19 +2184,22 @@ def run_single_backtest(
             timeframe = data_settings.timeframe or "1h"
             market_type = (data_settings.market_type or "unknown")
             limit = analysis_info.get("analysis_limit") or params.get("limit")
-            since = analysis_info.get("analysis_start_ms") if analysis_info.get("analysis_start_ms") is not None else params.get("since")
-            until = analysis_info.get("analysis_end_ms") if analysis_info.get("analysis_end_ms") is not None else params.get("until")
-            range_mode = analysis_info.get("effective_range_mode") or data_settings.range_mode
-            candles = get_candles_with_cache(
-                exchange_id=exchange_id,
-                symbol=symbol,
-                timeframe=timeframe,
-                limit=limit,
-                since=since,
-                until=until,
-                range_mode=range_mode,
-                market_type=market_type,
-            )
+            try:
+                _analysis_start, _display_start, _display_end, candles, _candles_display = get_run_details_candles_analysis_window(
+                    data_settings=data_settings,
+                    run_context=analysis_info,
+                    fetch_fn=get_candles_with_cache,
+                )
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "database is locked" in msg or "locked" in msg:
+                    _analysis_start, _display_start, _display_end, candles, _candles_display = get_run_details_candles_analysis_window(
+                        data_settings=data_settings,
+                        run_context=analysis_info,
+                        fetch_fn=load_ccxt_candles,
+                    )
+                else:
+                    raise
             label = (
                 f"Crypto (CCXT) – {exchange_id} "
                 f"{symbol} {timeframe}, {len(candles)} candles"
@@ -6678,17 +6682,17 @@ def render_run_detail_from_db(
                         if data_settings is not None and str(data_settings.data_source or "").lower() != "synthetic":
                             analysis_info = dict(rc) if isinstance(rc, dict) else {}
                             try:
-                                _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_candles_analysis_window(
+                                _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_run_details_candles_analysis_window(
                                     data_settings=data_settings,
-                                    analysis_info=analysis_info,
+                                    run_context=analysis_info,
                                     fetch_fn=get_candles_with_cache,
                                 )
                             except Exception as exc:
                                 msg = str(exc).lower()
                                 if "database is locked" in msg or "locked" in msg:
-                                    _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_candles_analysis_window(
+                                    _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_run_details_candles_analysis_window(
                                         data_settings=data_settings,
-                                        analysis_info=analysis_info,
+                                        run_context=analysis_info,
                                         fetch_fn=load_ccxt_candles,
                                     )
                                 else:
@@ -19015,7 +19019,7 @@ def main() -> None:
 
             # Exchange selector (simple): default to CCXT 'woo' but include any seen exchanges.
             try:
-                with open_db_connection() as _conn:
+                with open_db_connection(read_only=True) as _conn:
                     ex_rows = _conn.execute("SELECT DISTINCT exchange_id FROM assets ORDER BY exchange_id").fetchall()
                 exchange_seen = [str(r[0]) for r in ex_rows or [] if r and str(r[0] or "").strip()]
             except Exception:
@@ -19184,6 +19188,21 @@ def main() -> None:
                             )
 
                         if st.checkbox("Show assets grid debug", value=False, key="assets_debug_grid"):
+                            debug_info = {}
+                            try:
+                                debug_info = debug_assets_server_side_query(
+                                    user_id=str(user_id or "").strip() or "admin@local",
+                                    exchange_id=exchange_id_assets,
+                                    page=page,
+                                    page_size=page_size,
+                                    filter_model=st.session_state.get("assets_filter_model"),
+                                    sort_model=st.session_state.get("assets_sort_model"),
+                                    category_name=category_filter,
+                                    search_text=search_text,
+                                    status="all",
+                                )
+                            except Exception:
+                                debug_info = {}
                             st.json(
                                 {
                                     "page": page,
@@ -19193,6 +19212,7 @@ def main() -> None:
                                     "search_text": search_text,
                                     "filter_model": st.session_state.get("assets_filter_model"),
                                     "sort_model": st.session_state.get("assets_sort_model"),
+                                    "translated": debug_info,
                                 }
                             )
                     else:

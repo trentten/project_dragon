@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import threading
+import queue
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List, Callable
@@ -18,8 +19,13 @@ _CANDLE_CACHE_MAX_ITEMS = int(os.environ.get("DRAGON_CANDLE_CACHE_MAX_ITEMS", "6
 _CANDLE_CACHE_MAX_MB = float(os.environ.get("DRAGON_CANDLE_CACHE_MB", "256") or 256)
 _CANDLE_CACHE_CHUNK_SEC = int(os.environ.get("DRAGON_CANDLE_CACHE_CHUNK_SEC", "21600") or 21600)  # 6h
 _CANDLE_CACHE_PREFETCH = int(os.environ.get("DRAGON_CANDLE_CACHE_PREFETCH", "1") or 1)
+_CANDLE_CACHE_PREFETCH_QUEUE_SIZE = int(os.environ.get("DRAGON_CANDLE_CACHE_PREFETCH_QUEUE_SIZE", "64") or 64)
 
 _BYTES_PER_CANDLE_EST = 80  # rough estimate; keeps memory bounded without heavy introspection
+
+_PREFETCH_Q: "queue.Queue[tuple[Any, Dict[str, Any], str]]" = queue.Queue(maxsize=max(1, _CANDLE_CACHE_PREFETCH_QUEUE_SIZE))
+_PREFETCH_WORKER_STARTED = False
+_PREFETCH_WORKER_LOCK = threading.Lock()
 
 
 class LruCandleCache:
@@ -256,19 +262,87 @@ def get_candles_analysis_window(
     return analysis_start_ms, display_start_ms, display_end_ms, list(candles_analysis), list(candles_display)
 
 
+def _ensure_prefetch_worker() -> None:
+    global _PREFETCH_WORKER_STARTED
+    if _PREFETCH_WORKER_STARTED:
+        return
+    with _PREFETCH_WORKER_LOCK:
+        if _PREFETCH_WORKER_STARTED:
+            return
+
+        def _loop() -> None:
+            while True:
+                ds, info, reason = _PREFETCH_Q.get()
+                try:
+                    get_candles_analysis_window(
+                        data_settings=ds,
+                        analysis_info=info or {},
+                        allow_cache=True,
+                    )
+                except Exception as exc:
+                    logger.debug("candle_cache prefetch worker skipped (%s): %s", str(reason or ""), str(exc))
+                finally:
+                    try:
+                        _PREFETCH_Q.task_done()
+                    except Exception:
+                        pass
+
+        t = threading.Thread(target=_loop, name="dragon-candle-prefetch", daemon=True)
+        t.start()
+        _PREFETCH_WORKER_STARTED = True
+
+
+def enqueue_prefetch_analysis_window(
+    *,
+    data_settings: Any,
+    analysis_info: Optional[Dict[str, Any]] = None,
+    reason: str = "",
+) -> None:
+    """Best-effort non-blocking prefetch.
+
+    Drops tasks if prefetch is disabled or the queue is full.
+    """
+
+    if int(_CANDLE_CACHE_PREFETCH or 0) != 1:
+        return
+    try:
+        _ensure_prefetch_worker()
+        _PREFETCH_Q.put_nowait((data_settings, dict(analysis_info or {}), str(reason or "")))
+    except queue.Full:
+        logger.debug("candle_cache prefetch queue full (%s)", str(reason or ""))
+    except Exception as exc:
+        logger.debug("candle_cache prefetch enqueue failed (%s): %s", str(reason or ""), str(exc))
+
+
+def get_run_details_candles_analysis_window(
+    *,
+    data_settings: Any,
+    run_context: Optional[Dict[str, Any]] = None,
+    fetch_fn: Optional[Callable[..., List[Candle]]] = None,
+    cache: Optional[LruCandleCache] = None,
+    chunk_sec: Optional[int] = None,
+    allow_cache: bool = True,
+) -> Tuple[Optional[int], Optional[int], Optional[int], List[Candle], List[Candle]]:
+    """Convenience wrapper for run-details pages.
+
+    Uses the run's persisted `run_context` as `analysis_info` so warmup windows are respected.
+    """
+
+    return get_candles_analysis_window(
+        data_settings=data_settings,
+        analysis_info=dict(run_context or {}),
+        fetch_fn=fetch_fn,
+        cache=cache,
+        chunk_sec=chunk_sec,
+        allow_cache=allow_cache,
+    )
+
+
 def prefetch_analysis_window(
     *,
     data_settings: Any,
     analysis_info: Optional[Dict[str, Any]] = None,
     reason: str = "",
 ) -> None:
-    if int(_CANDLE_CACHE_PREFETCH or 0) != 1:
-        return
-    try:
-        get_candles_analysis_window(
-            data_settings=data_settings,
-            analysis_info=analysis_info,
-            allow_cache=True,
-        )
-    except Exception as exc:
-        logger.debug("candle_cache prefetch skipped (%s): %s", str(reason or ""), str(exc))
+    # Back-compat shim: enqueue prefetch to avoid blocking.
+    enqueue_prefetch_analysis_window(data_settings=data_settings, analysis_info=analysis_info, reason=reason)

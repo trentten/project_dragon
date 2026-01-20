@@ -20,6 +20,18 @@ B) Dev convenience (optional): auto-migrate in app runtime
 UI performance:
 - Runs grids use server-side paging; grid filter/sort re-queries Postgres and only returns the current page.
 
+Candle cache (P1 performance):
+- Worker-local in-memory LRU cache reduces repeated candle loads.
+- Range requests are keyed by chunked time windows to avoid unique per-run keys.
+
+Env knobs:
+- `DRAGON_CANDLE_CACHE_MAX_ITEMS` (default `64`)
+- `DRAGON_CANDLE_CACHE_MB` (default `256`)
+- `DRAGON_CANDLE_CACHE_CHUNK_SEC` (default `21600` = 6h)
+- `DRAGON_CANDLE_CACHE_PREFETCH` (default `1`)
+- `DRAGON_CANDLE_CACHE_PREFETCH_QUEUE_SIZE` (default `64`)
+- `DRAGON_CANDLE_CACHE_PREFETCH_TOP_N` (default `2`)
+
 Tests:
 - Codespaces/dev bringup:
 	docker compose -f deploy/portainer/docker-compose.yml -f deploy/portainer/docker-compose.dev.yml up -d
