@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import List, Optional
 
 from .broker_sim import BrokerSim
 from .config_dragon import DragonAlgoConfig, StopLossMode, TakeProfitMode
 from .domain import Candle, OrderStatus, PositionSide, Side
-from .indicators import bollinger_bands, macd, moving_average, rsi
+from .indicators import bollinger_bands, htf_ma_mapping, macd, moving_average, resample_last_close_series, rsi
 
 
 @dataclass
@@ -185,18 +186,10 @@ class DragonDcaAtrStrategy:
     def _resample_closes(self, interval_min: int) -> List[float]:
         if not self.state.price_history:
             return []
-        closes = [c.close for c in self.state.price_history]
-        base = self.state.base_interval_min or 1.0
-        step = max(1, int(round(max(interval_min, 1) / base)))
-        if step <= 1:
-            return closes
-        resampled: List[float] = []
-        for idx in range(step - 1, len(closes), step):
-            resampled.append(closes[idx])
-        last_close = closes[-1]
-        if not resampled or resampled[-1] != last_close:
-            resampled.append(last_close)
-        return resampled
+        timestamps = [c.timestamp for c in self.state.price_history]
+        closes = [float(c.close) for c in self.state.price_history]
+        series = resample_last_close_series(timestamps, closes, int(interval_min or 0))
+        return [float(v) for v in series.values]
 
     def _resample_candles(self, interval_min: int) -> List[Candle]:
         history = self.state.price_history
@@ -226,11 +219,28 @@ class DragonDcaAtrStrategy:
         return resampled
 
     def _compute_indicator_context(self, candle: Candle) -> Optional[IndicatorContext]:
-        trend_series = self._resample_closes(self.config.trend.ma_interval_min)
-        if len(trend_series) < self.config.trend.ma_len:
+        try:
+            ma_len = int(self.config.trend.ma_len or 0)
+        except (TypeError, ValueError):
+            ma_len = 0
+        if ma_len <= 0:
             return None
-        trend_ma = moving_average(trend_series, self.config.trend.ma_len, self.config.trend.ma_type)
-        if trend_ma is None:
+        timestamps = [c.timestamp for c in self.state.price_history]
+        closes = [float(c.close) for c in self.state.price_history]
+        _, _, _, mapped_ma = htf_ma_mapping(
+            timestamps,
+            closes,
+            int(self.config.trend.ma_interval_min or 1),
+            ma_len,
+            str(self.config.trend.ma_type or "sma"),
+        )
+        if mapped_ma.empty:
+            return None
+        try:
+            trend_ma = float(mapped_ma.iloc[-1])
+        except Exception:
+            return None
+        if math.isnan(trend_ma):
             return None
         trend_long = candle.close > trend_ma
         trend_short = candle.close < trend_ma

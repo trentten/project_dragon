@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 import math
 from typing import Optional, Sequence, Tuple
+
+import pandas as pd
 
 
 def moving_average(values: Sequence[float], period: int, ma_type: str = "sma") -> Optional[float]:
@@ -15,6 +18,85 @@ def moving_average(values: Sequence[float], period: int, ma_type: str = "sma") -
             ema_val = alpha * price + (1 - alpha) * ema_val
         return ema_val
     return sum(window) / period
+
+
+def _to_utc_index(timestamps: Sequence[datetime]) -> pd.DatetimeIndex:
+    if timestamps is None:
+        return pd.DatetimeIndex([])
+    try:
+        if len(timestamps) == 0:
+            return pd.DatetimeIndex([])
+    except Exception:
+        return pd.DatetimeIndex([])
+    return pd.to_datetime(list(timestamps), utc=True)
+
+
+def _infer_base_interval_min(index: pd.DatetimeIndex) -> Optional[float]:
+    if index is None or len(index) < 2:
+        return None
+    try:
+        diffs = index.to_series().diff().dt.total_seconds() / 60.0
+        diffs = diffs[diffs > 0]
+        if diffs.empty:
+            return None
+        return float(diffs.iloc[0])
+    except Exception:
+        return None
+
+
+def resample_last_close_series(
+    timestamps: Sequence[datetime],
+    closes: Sequence[float],
+    interval_min: int,
+) -> pd.Series:
+    if timestamps is None or closes is None:
+        return pd.Series(dtype=float)
+    try:
+        if len(timestamps) == 0 or len(closes) == 0:
+            return pd.Series(dtype=float)
+    except Exception:
+        return pd.Series(dtype=float)
+    base_index = _to_utc_index(timestamps)
+    base_series = pd.Series(list(closes), index=base_index).sort_index()
+    try:
+        interval_val = int(interval_min or 0)
+    except (TypeError, ValueError):
+        interval_val = 0
+    if interval_val <= 0:
+        return base_series
+
+    base_min = _infer_base_interval_min(base_series.index)
+    if base_min is not None and interval_val <= base_min + 1e-9:
+        return base_series
+
+    rule = f"{interval_val}min"
+    return base_series.resample(rule, label="right", closed="right").last().dropna()
+
+
+def htf_ma_mapping(
+    timestamps: Sequence[datetime],
+    closes: Sequence[float],
+    interval_min: int,
+    period: int,
+    ma_type: str = "sma",
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    base_series = pd.Series(list(closes), index=_to_utc_index(timestamps)).sort_index()
+    htf_closes = resample_last_close_series(base_series.index, base_series.values, interval_min)
+
+    if htf_closes.empty:
+        empty = pd.Series(dtype=float)
+        mapped_empty = pd.Series(index=base_series.index, dtype=float)
+        return base_series, htf_closes, empty, mapped_empty
+
+    values = [float(v) for v in htf_closes.values]
+    ma_values: list[float] = []
+    for i in range(len(values)):
+        ma_val = moving_average(values[: i + 1], period, ma_type)
+        ma_values.append(float(ma_val) if ma_val is not None else math.nan)
+
+    htf_ma = pd.Series(ma_values, index=htf_closes.index)
+    mapped_ma = htf_ma.reindex(base_series.index, method="ffill")
+    return base_series, htf_closes, htf_ma, mapped_ma
 
 
 def bollinger_bands(

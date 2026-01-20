@@ -65,6 +65,7 @@ from project_dragon.crypto import CryptoConfigError, decrypt_str, mask_api_key
 from project_dragon.candle_cache import get_run_details_candles_analysis_window
 from project_dragon.data_online import get_candles_with_cache, get_woox_market_catalog, load_ccxt_candles
 from project_dragon.domain import BacktestResult, Candle, Trade
+from project_dragon.indicators import htf_ma_mapping
 from project_dragon.engine import BacktestConfig, BacktestEngine
 from project_dragon.backtest_core import compute_analysis_window
 from project_dragon.live.trade_config import (
@@ -1058,100 +1059,39 @@ def _estimate_warmup_bars_for_trend_ma(timeframe: str, ma_interval_min: int, ma_
 def _cached_strategy_trend_ma_overlays(
     scope_key: str,
     timeframe: str,
-    ts_ns: Tuple[int, ...],
-    closes: Tuple[float, ...],
+    calc_ts_ns: Tuple[int, ...],
+    calc_closes: Tuple[float, ...],
+    display_ts_ns: Tuple[int, ...],
     ma_lens: Tuple[int, ...],
     ma_interval_min: int,
     ma_type: str,
 ) -> Dict[int, List[float]]:
-    """Compute MA overlays exactly like DragonDcaAtrStrategy trend MA.
-
-    Strategy behavior summary:
-    - Resamples closes by selecting every `step`th close (idx = step-1, 2*step-1, ...) and
-      then appending the current close if it's not already the last sampled close.
-    - Computes MA on the last `ma_len` values of that resampled list.
-    """
+    """Compute MA overlays like DragonDcaAtrStrategy trend MA (HTF close -> MA -> ffill to base)."""
 
     out: Dict[int, List[float]] = {}
-    n = len(closes)
-    if n == 0 or not ma_lens:
+    if not calc_closes or not ma_lens:
         return out
 
-    # Derive base interval minutes from timestamps (similar to strategy base_interval_min).
-    base_min = 1.0
-    try:
-        for a, b in zip(ts_ns[:-1], ts_ns[1:]):
-            dt_ns = int(b) - int(a)
-            if dt_ns > 0:
-                base_min = (dt_ns / 1e9) / 60.0
-                break
-    except Exception:
-        base_min = 1.0
-    if base_min <= 0:
-        base_min = 1.0
-
-    step = max(1, int(round(max(int(ma_interval_min), 1) / base_min)))
-
-    # Build the fixed boundary samples (step-1, 2*step-1, ...). We'll use prefix sums for SMA.
-    boundary_indices = list(range(step - 1, n, step)) if step > 1 else list(range(n))
-    boundary_closes = [float(closes[i]) for i in boundary_indices] if boundary_indices else []
-    prefix = [0.0]
-    for v in boundary_closes:
-        prefix.append(prefix[-1] + float(v))
-
-    def _sum_last(m: int, k: int) -> float:
-        # sum of last k values from first m boundary samples
-        return prefix[m] - prefix[max(0, m - k)]
-
-    def _ema_window(window: List[float], period: int) -> float:
-        alpha = 2.0 / (period + 1.0)
-        ema_val = window[0]
-        for price in window[1:]:
-            ema_val = alpha * price + (1 - alpha) * ema_val
-        return float(ema_val)
-
-    ma_type_l = (ma_type or "sma").strip().lower()
+    calc_ts = pd.to_datetime(list(calc_ts_ns), utc=True)
+    display_ts = pd.to_datetime(list(display_ts_ns), utc=True)
+    calc_series = pd.Series(list(calc_closes), index=calc_ts).sort_index()
 
     for period in ma_lens:
         p = int(period)
         if p <= 0:
             continue
-        series: List[float] = [math.nan] * n
-        for i in range(n):
-            # boundaries completed up to i
-            if step <= 1:
-                m = i + 1
-                is_boundary = True
-            else:
-                if i < (step - 1):
-                    m = 0
-                    is_boundary = False
-                else:
-                    m = ((i - (step - 1)) // step) + 1
-                    is_boundary = ((i - (step - 1)) % step) == 0
-
-            if is_boundary:
-                # Full-window behavior (matches strategy readiness: indicators only become valid once enough history exists).
-                if m < p:
-                    continue
-                if ma_type_l.startswith("ema"):
-                    window = boundary_closes[m - p : m]
-                    if len(window) == p:
-                        series[i] = _ema_window(window, p)
-                else:
-                    series[i] = _sum_last(m, p) / float(p)
-            else:
-                # resample_closes appends the current close to the boundary list
-                if (m + 1) < p:
-                    continue
-                if ma_type_l.startswith("ema"):
-                    # Take last (p-1) boundary closes plus the current close.
-                    window = boundary_closes[m - max(0, p - 1) : m] + [float(closes[i])]
-                    if len(window) == p:
-                        series[i] = _ema_window(window, p)
-                else:
-                    series[i] = (_sum_last(m, max(0, p - 1)) + float(closes[i])) / float(p)
-        out[p] = series
+        _, _, _, mapped_ma = htf_ma_mapping(
+            calc_series.index,
+            calc_series.values,
+            int(ma_interval_min or 1),
+            p,
+            str(ma_type or "sma"),
+        )
+        if mapped_ma.empty:
+            out[p] = [math.nan] * len(display_ts)
+            continue
+        mapped_display = mapped_ma.reindex(display_ts, method="ffill")
+        out[p] = [float(v) if pd.notna(v) else math.nan for v in mapped_display.values]
 
     return out
 
@@ -1169,19 +1109,21 @@ def _add_ma_overlays_to_candles_fig(
     ma_type: str,
     warmup_ts: Optional[pd.Series] = None,
     warmup_closes: Optional[pd.Series] = None,
+    ma_calc_ts: Optional[pd.Series] = None,
+    ma_calc_closes: Optional[pd.Series] = None,
 ) -> None:
     if not ma_periods:
         return
 
-    # Combine warmup + display series for MA computation, then slice back to the displayed segment.
+    # Combine warmup + calculation series for MA computation.
+    base_ts = pd.to_datetime(ma_calc_ts if ma_calc_ts is not None else ts, utc=True)
+    base_closes = pd.to_numeric(ma_calc_closes if ma_calc_closes is not None else closes, errors="coerce")
     if warmup_ts is not None and warmup_closes is not None and len(warmup_ts) and len(warmup_closes):
-        ts_all = pd.concat([pd.to_datetime(warmup_ts, utc=True), pd.to_datetime(ts, utc=True)], ignore_index=True)
-        closes_all = pd.concat([pd.to_numeric(warmup_closes, errors="coerce"), pd.to_numeric(closes, errors="coerce")], ignore_index=True)
-        display_len = int(len(ts))
+        ts_all = pd.concat([pd.to_datetime(warmup_ts, utc=True), base_ts], ignore_index=True)
+        closes_all = pd.concat([pd.to_numeric(warmup_closes, errors="coerce"), base_closes], ignore_index=True)
     else:
-        ts_all = pd.to_datetime(ts, utc=True)
-        closes_all = pd.to_numeric(closes, errors="coerce")
-        display_len = int(len(ts_all))
+        ts_all = base_ts
+        closes_all = base_closes
 
     try:
         close_tuple = tuple(float(v) for v in closes_all.tolist())
@@ -1190,6 +1132,7 @@ def _add_ma_overlays_to_candles_fig(
     try:
         # Use int64 nanoseconds for stable hashing in cache.
         ts_ns_tuple = tuple(int(v) for v in pd.to_datetime(ts_all, utc=True).astype("int64").tolist())
+        display_ns_tuple = tuple(int(v) for v in pd.to_datetime(ts, utc=True).astype("int64").tolist())
     except Exception:
         return
     ma_periods_tuple = tuple(int(p) for p in ma_periods if int(p) > 0)
@@ -1200,6 +1143,7 @@ def _add_ma_overlays_to_candles_fig(
         str(timeframe or ""),
         ts_ns_tuple,
         close_tuple,
+        display_ns_tuple,
         ma_periods_tuple,
         int(ma_interval_min),
         str(ma_type or "sma"),
@@ -1208,9 +1152,7 @@ def _add_ma_overlays_to_candles_fig(
         y_full = series_map.get(int(period))
         if not y_full:
             continue
-        y = y_full[-display_len:]
-        if not y:
-            continue
+        y = y_full
         fig.add_trace(
             go.Scatter(
                 x=x,
@@ -4870,6 +4812,8 @@ def build_price_orders_chart(
     timeframe: str = "",
     warmup_ts: Optional[pd.Series] = None,
     warmup_closes: Optional[pd.Series] = None,
+    ma_calc_ts: Optional[pd.Series] = None,
+    ma_calc_closes: Optional[pd.Series] = None,
 ) -> Optional[go.Figure]:
     if not result.candles:
         return None
@@ -4941,6 +4885,8 @@ def build_price_orders_chart(
                 ma_type=str(ma_type or "sma"),
                 warmup_ts=warmup_ts,
                 warmup_closes=warmup_closes,
+                ma_calc_ts=ma_calc_ts,
+                ma_calc_closes=ma_calc_closes,
             )
     except Exception:
         pass
@@ -5051,6 +4997,16 @@ def render_run_charts_from_result(
         except Exception:
             result_for_charts = result
 
+    ma_calc_ts = None
+    ma_calc_closes = None
+    try:
+        if result.candles:
+            ma_calc_ts = pd.Series([getattr(c, "timestamp", None) for c in result.candles])
+            ma_calc_closes = pd.Series([getattr(c, "close", None) for c in result.candles])
+    except Exception:
+        ma_calc_ts = None
+        ma_calc_closes = None
+
     equity_fig = build_equity_chart(result_for_charts)
     price_fig = build_price_orders_chart(
         result_for_charts,
@@ -5061,6 +5017,8 @@ def render_run_charts_from_result(
         timeframe=timeframe,
         warmup_ts=warmup_ts,
         warmup_closes=warmup_closes,
+        ma_calc_ts=ma_calc_ts,
+        ma_calc_closes=ma_calc_closes,
     )
 
     if equity_fig:
@@ -6717,6 +6675,16 @@ def render_run_detail_from_db(
                     warmup_ts = None
                     warmup_closes = None
                 eq_fig = build_equity_chart(result_for_charts)
+                ma_calc_ts = None
+                ma_calc_closes = None
+                try:
+                    if result.candles:
+                        ma_calc_ts = pd.Series([getattr(c, "timestamp", None) for c in result.candles])
+                        ma_calc_closes = pd.Series([getattr(c, "close", None) for c in result.candles])
+                except Exception:
+                    ma_calc_ts = None
+                    ma_calc_closes = None
+
                 pr_fig = build_price_orders_chart(
                     result_for_charts,
                     ma_periods=ma_periods,
@@ -6726,11 +6694,57 @@ def render_run_detail_from_db(
                     timeframe=tf_for_ma,
                     warmup_ts=warmup_ts,
                     warmup_closes=warmup_closes,
+                    ma_calc_ts=ma_calc_ts,
+                    ma_calc_closes=ma_calc_closes,
                 )
                 if eq_fig is not None:
                     eq_fig.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10))
                 if pr_fig is not None:
                     pr_fig.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10))
+
+                debug_ma = st.checkbox(
+                    "Debug HTF MA (resample + ffill)",
+                    value=False,
+                    key=f"run_details_debug_ma_{run_id_for_key}",
+                    help="Print the last 10 base candles, HTF closes, HTF MA values, and mapped MA values.",
+                )
+                if debug_ma and result is not None and ma_periods:
+                    try:
+                        period = int(ma_periods[0])
+                    except Exception:
+                        period = 0
+                    if period > 0 and result.candles:
+                        base_ts = [getattr(c, "timestamp", None) for c in result.candles]
+                        base_closes = [getattr(c, "close", None) for c in result.candles]
+                        _, htf_closes, htf_ma, mapped_ma = htf_ma_mapping(
+                            base_ts,
+                            base_closes,
+                            int(ma_interval_min or 1),
+                            period,
+                            str(ma_type or "sma"),
+                        )
+
+                        def _fmt_tail(series: pd.Series, label: str) -> list[str]:
+                            out = [label]
+                            tail = series.tail(10)
+                            for idx, val in tail.items():
+                                ts = pd.to_datetime(idx, utc=True)
+                                if pd.isna(val):
+                                    out.append(f"  {ts.isoformat()} → NaN")
+                                else:
+                                    out.append(f"  {ts.isoformat()} → {float(val):.6f}")
+                            return out
+
+                        debug_lines: list[str] = []
+                        base_series = pd.Series(base_closes, index=pd.to_datetime(base_ts, utc=True))
+                        debug_lines.extend(_fmt_tail(base_series, "Base candles (last 10: ts → close)"))
+                        debug_lines.append("")
+                        debug_lines.extend(_fmt_tail(htf_closes, "HTF closes (last 10: ts → close)"))
+                        debug_lines.append("")
+                        debug_lines.extend(_fmt_tail(htf_ma, "HTF MA (last 10: ts → MA)"))
+                        debug_lines.append("")
+                        debug_lines.extend(_fmt_tail(mapped_ma, "Mapped MA on base (last 10: ts → MA)"))
+                        st.code("\n".join(debug_lines))
 
                 render_card(
                     "Equity curve",
