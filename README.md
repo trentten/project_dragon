@@ -6,15 +6,29 @@ Setup:
 - Install runtime dependencies (or reinstall after updates): pip install -r requirements.txt
 
 Postgres (required):
-- Start Postgres (local dev): docker compose up -d postgres
 - Set DRAGON_DATABASE_URL (example): postgresql://dragon:dragon@localhost:5432/dragon
-- Migrations: docker compose up -d will auto-run migrations for the app containers.
+
+Migrations (two modes):
+A) Recommended (default): migrate-once using db_migrate service
+- docker compose -f deploy/portainer/docker-compose.yml up -d
+- UI/workers never run DDL at runtime.
+
+B) Dev convenience (optional): auto-migrate in app runtime
+- Set DRAGON_ENV=dev and DRAGON_AUTO_MIGRATE=1
+- Intended for local dev only; ignored in prod.
+
+UI performance:
+- Runs grids use server-side paging; grid filter/sort re-queries Postgres and only returns the current page.
 
 Tests:
-- PYTHONPATH=src pytest -q
+- Codespaces/dev bringup:
+	docker compose -f deploy/portainer/docker-compose.yml -f deploy/portainer/docker-compose.dev.yml up -d
+- Run tests on host (with dev override exposing Postgres on 127.0.0.1:5432):
+	export DRAGON_DATABASE_URL="postgresql://dragon:${DRAGON_POSTGRES_PASSWORD}@127.0.0.1:5432/dragon"
+	PYTHONPATH=src pytest -q
 
 Manual migrations (if needed):
-- docker compose exec dragon_ui bash -lc 'python -m project_dragon.db_migrate'
+- docker compose -f deploy/portainer/docker-compose.yml run --rm db_migrate
 
 Live dry-run checklist (WooX):
 - Set WOOX_API_KEY/SECRET in your env (or accept stub mode for offline checks).

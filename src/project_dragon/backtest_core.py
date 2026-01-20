@@ -21,6 +21,7 @@ from project_dragon.config_dragon import (
     TakeProfitMode,
     TrendFilterConfig,
 )
+from project_dragon.candle_cache import get_candles_analysis_window
 from project_dragon.data_online import get_candles_with_cache, load_ccxt_candles
 from project_dragon.domain import Candle
 from project_dragon.engine import BacktestConfig, BacktestEngine
@@ -69,6 +70,149 @@ def timeframe_to_minutes(tf: str) -> int:
         return int(float(num) * mult)
     except Exception:
         return 0
+
+
+def timeframe_to_seconds(tf: str) -> int:
+    return int(max(1, timeframe_to_minutes(tf)) * 60)
+
+
+def estimate_indicator_warmup_seconds(cfg: DragonAlgoConfig, base_timeframe: str) -> int:
+    """Estimate warmup seconds required for multi-timeframe indicators.
+
+    This uses the *indicator* timeframe for warmup, not the base timeframe.
+    """
+
+    base_sec = timeframe_to_seconds(base_timeframe)
+    if base_sec <= 0:
+        base_sec = 60
+
+    def _sec_for(interval_min: int, length: int, *, mult: float = 1.0) -> int:
+        try:
+            interval_s = int(max(1, int(interval_min))) * 60
+        except Exception:
+            interval_s = 60
+        try:
+            ln = int(max(1, int(length)))
+        except Exception:
+            ln = 1
+        seconds = int(math.ceil(float(ln) * float(interval_s) * float(mult)))
+        # Always ensure at least one base bar extra for stability.
+        return max(int(base_sec), int(seconds) + int(base_sec))
+
+    warmup_s: list[int] = []
+
+    # Trend MA (multi-timeframe)
+    try:
+        ma_type = str(cfg.trend.ma_type or "sma").lower()
+        ma_mult = 2.0 if ma_type.startswith("ema") else 1.0
+        warmup_s.append(_sec_for(cfg.trend.ma_interval_min, cfg.trend.ma_len, mult=ma_mult))
+    except Exception:
+        pass
+
+    # Bollinger Bands
+    try:
+        bb_mult = 2.0 if str(cfg.bbands.ma_type or "sma").lower().startswith("ema") else 1.0
+        warmup_s.append(_sec_for(cfg.bbands.interval_min, cfg.bbands.length, mult=bb_mult))
+    except Exception:
+        pass
+
+    # MACD (EMA-based): use slow + signal
+    try:
+        macd_len = int(getattr(cfg.macd, "slow", 26) or 26) + int(getattr(cfg.macd, "signal", 9) or 9)
+        warmup_s.append(_sec_for(cfg.macd.interval_min, macd_len, mult=2.0))
+    except Exception:
+        pass
+
+    # RSI
+    try:
+        warmup_s.append(_sec_for(cfg.rsi.interval_min, int(getattr(cfg.rsi, "length", 14) or 14) + 1, mult=1.0))
+    except Exception:
+        pass
+
+    # ATR (base timeframe)
+    try:
+        atr_len = int(getattr(cfg.exits, "atr_period", 0) or 0)
+    except Exception:
+        atr_len = 0
+    if atr_len > 0:
+        warmup_s.append(_sec_for(timeframe_to_minutes(base_timeframe), atr_len + 1, mult=1.0))
+
+    # Entry MA gate (base timeframe)
+    try:
+        g = cfg.general
+        g_len = int(getattr(g, "ma_length", 0) or 0)
+        if g_len > 0:
+            g_mult = 2.0 if str(getattr(g, "ma_type", "sma") or "sma").lower().startswith("ema") else 1.0
+            warmup_s.append(_sec_for(timeframe_to_minutes(base_timeframe), g_len, mult=g_mult))
+    except Exception:
+        pass
+
+    return int(max(warmup_s) if warmup_s else 0)
+
+
+def compute_analysis_window(cfg: DragonAlgoConfig, data_settings: DataSettings) -> Dict[str, Any]:
+    """Derive analysis vs display windows for multi-timeframe indicators."""
+
+    params = data_settings.range_params or {}
+    range_mode = str(data_settings.range_mode or "bars").lower()
+    base_tf = str(data_settings.timeframe or "1h")
+    base_sec = timeframe_to_seconds(base_tf)
+    warmup_seconds = estimate_indicator_warmup_seconds(cfg, base_tf)
+    warmup_bars = int(math.ceil(float(warmup_seconds) / float(base_sec))) if base_sec > 0 else 0
+
+    def _to_ms(v: Any) -> Optional[int]:
+        dt = _normalize_timestamp(v)
+        if dt is None:
+            return None
+        return int(dt.timestamp() * 1000)
+
+    display_start_ms = _to_ms(params.get("since"))
+    display_end_ms = _to_ms(params.get("until"))
+    display_limit = None
+    analysis_limit = None
+
+    if range_mode == "bars" and display_start_ms is None and display_end_ms is None:
+        try:
+            display_limit = int(params.get("limit")) if params.get("limit") is not None else None
+        except Exception:
+            display_limit = None
+        if display_limit is not None and warmup_bars > 0:
+            analysis_limit = int(display_limit) + int(warmup_bars)
+    else:
+        # Explicit range: compute analysis_start from display_start.
+        if display_start_ms is not None and warmup_seconds > 0:
+            analysis_limit = None
+
+    analysis_start_ms = None
+    if display_start_ms is not None and warmup_seconds > 0:
+        analysis_start_ms = int(display_start_ms) - int(warmup_seconds * 1000)
+        if analysis_start_ms < 0:
+            analysis_start_ms = 0
+    analysis_end_ms = display_end_ms
+
+    effective_range_mode = "range" if (display_start_ms is not None or display_end_ms is not None) else range_mode
+
+    return {
+        "range_mode": range_mode,
+        "effective_range_mode": effective_range_mode,
+        "display_start_ms": display_start_ms,
+        "display_end_ms": display_end_ms,
+        "display_limit": display_limit,
+        "analysis_start_ms": analysis_start_ms,
+        "analysis_end_ms": analysis_end_ms,
+        "analysis_limit": analysis_limit,
+        "warmup_seconds": int(warmup_seconds),
+        "warmup_bars": int(warmup_bars),
+        "base_timeframe_sec": int(base_sec),
+    }
+
+
+def compute_analysis_window_from_snapshot(
+    config_snapshot: Dict[str, Any],
+    data_settings: DataSettings,
+) -> Dict[str, Any]:
+    cfg = dragon_config_from_snapshot(config_snapshot)
+    return compute_analysis_window(cfg, data_settings)
 
 
 def _normalize_timestamp(value: Any) -> Optional[datetime]:
@@ -275,31 +419,23 @@ def load_candles_for_settings(data_settings: DataSettings) -> Tuple[List[Candle]
     market_type = (ds.market_type or "unknown")
 
     try:
-        candles = get_candles_with_cache(
-            exchange_id=exchange_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=params.get("limit"),
-            since=params.get("since"),
-            until=params.get("until"),
-            range_mode=range_mode,
-            market_type=market_type,
+        _analysis_start, _display_start, _display_end, _candles_analysis, candles_display = get_candles_analysis_window(
+            data_settings=ds,
+            analysis_info=None,
+            fetch_fn=get_candles_with_cache,
         )
+        candles = list(candles_display)
     except Exception as exc:
         # Best-effort fallback: skip caching when DB is locked.
         # This covers both read/write contention and environments without a writable cache.
         msg = str(exc).lower()
         if "database is locked" in msg or "locked" in msg:
-            candles = load_ccxt_candles(
-                exchange_id,
-                symbol,
-                timeframe,
-                limit=params.get("limit"),
-                since=params.get("since"),
-                until=params.get("until"),
-                range_mode=range_mode,
-                market_type=market_type,
+            _analysis_start, _display_start, _display_end, _candles_analysis, candles_display = get_candles_analysis_window(
+                data_settings=ds,
+                analysis_info=None,
+                fetch_fn=load_ccxt_candles,
             )
+            candles = list(candles_display)
         else:
             raise
 
@@ -320,6 +456,8 @@ def run_single_backtest(
 
     cfg = dragon_config_from_snapshot(config_snapshot)
 
+    analysis_info = compute_analysis_window(cfg, data_settings)
+
     if candles_override is not None:
         candles = list(candles_override)
         label = str(label_override or "")
@@ -338,67 +476,66 @@ def run_single_backtest(
         storage_symbol = storage_symbol or (data_settings.symbol or "BTC/USDT")
         storage_timeframe = storage_timeframe or (data_settings.timeframe or "1h")
     else:
-        candles, label, storage_symbol, storage_timeframe = load_candles_for_settings(data_settings)
+        # Fetch analysis window (display + warmup) so multi-timeframe indicators are ready from the first displayed bar.
+        if str(data_settings.data_source).lower() == "synthetic":
+            count = int((data_settings.range_params or {}).get("count", 300))
+            candles = generate_dummy_candles(n=count)
+            label = f"Synthetic – {len(candles)} candles"
+            storage_symbol = "SYNTH"
+            storage_timeframe = "synthetic"
+        else:
+            params = data_settings.range_params or {}
+            exchange_id = data_settings.exchange_id or "binance"
+            symbol = data_settings.symbol or "BTC/USDT"
+            timeframe = data_settings.timeframe or "1h"
+            market_type = (data_settings.market_type or "unknown")
+
+            try:
+                _analysis_start, _display_start, _display_end, candles, _candles_display = get_candles_analysis_window(
+                    data_settings=data_settings,
+                    analysis_info=analysis_info,
+                    fetch_fn=get_candles_with_cache,
+                )
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "database is locked" in msg or "locked" in msg:
+                    _analysis_start, _display_start, _display_end, candles, _candles_display = get_candles_analysis_window(
+                        data_settings=data_settings,
+                        analysis_info=analysis_info,
+                        fetch_fn=load_ccxt_candles,
+                    )
+                else:
+                    raise
+
+            label = f"Crypto (CCXT) – {exchange_id} {symbol} {timeframe}, {len(candles)} candles"
+            storage_symbol = symbol
+            storage_timeframe = timeframe
 
     warmup_candles: List[Candle] = []
+    candles_main: List[Candle] = []
     try:
-        if str(data_settings.data_source).lower() != "synthetic" and candles:
-            tf = str(data_settings.timeframe or "")
-            base_min = timeframe_to_minutes(tf) or 1
-
-            def _bars_needed(interval_min: int, length: int) -> int:
-                step = max(1, int(round(max(int(interval_min or 1), 1) / float(base_min))))
-                return step * max(int(length or 1), 1)
-
-            max_req = max(
-                _bars_needed(cfg.trend.ma_interval_min, int(getattr(cfg.trend, "ma_len", 1) or 1)),
-                _bars_needed(cfg.bbands.interval_min, int(getattr(cfg.bbands, "length", 1) or 1)),
-                _bars_needed(
-                    cfg.macd.interval_min,
-                    int(getattr(cfg.macd, "slow", 26) or 26) + int(getattr(cfg.macd, "signal", 9) or 9),
-                ),
-                _bars_needed(cfg.rsi.interval_min, int(getattr(cfg.rsi, "length", 14) or 14) + 1),
-                _bars_needed(cfg.trend.ma_interval_min, int(getattr(cfg.exits, "atr_period", 14) or 14) + 1),
-            )
-            warmup_bars = max(int(max_req), 0)
-
-            if warmup_bars > 0:
-                first_ts = getattr(candles[0], "timestamp", None)
-                first_dt = _normalize_timestamp(first_ts)
-                if first_dt is not None:
-                    first_ms = int(first_dt.timestamp() * 1000)
-                    ms_per_bar = max(int(base_min) * 60_000, 60_000)
-                    slack_bars = max(10, int(round(float(warmup_bars) * 0.10)))
-                    since_ms = max(0, int(first_ms) - int((warmup_bars + slack_bars) * ms_per_bar))
-                    until_ms = max(0, int(first_ms) - 1)
-
-                    # Direct fetch (no cache) to avoid compounding cache contention.
-                    exchange_id = data_settings.exchange_id or "binance"
-                    symbol = data_settings.symbol or "BTC/USDT"
-                    market_type = (data_settings.market_type or "unknown")
-                    warm_limit = min(max(int(warmup_bars) + int(slack_bars) + 10, 0), 250_000)
-                    warmup_candles = load_ccxt_candles(
-                        exchange_id,
-                        symbol,
-                        tf,
-                        limit=warm_limit,
-                        since=int(since_ms),
-                        until=int(until_ms),
-                        range_mode="range",
-                        market_type=market_type,
-                    )
-                    if warmup_candles:
-                        trimmed = []
-                        for c in warmup_candles:
-                            try:
-                                ts_ms = int(c.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                            except Exception:
-                                continue
-                            if ts_ms < first_ms:
-                                trimmed.append(c)
-                        warmup_candles = trimmed[-warmup_bars:] if len(trimmed) > warmup_bars else trimmed
+        display_start_ms = analysis_info.get("display_start_ms")
+        display_end_ms = analysis_info.get("display_end_ms")
+        display_limit = analysis_info.get("display_limit")
+        if display_start_ms is not None:
+            for c in candles:
+                ts = _normalize_timestamp(getattr(c, "timestamp", None))
+                if ts is None:
+                    continue
+                ts_ms = int(ts.timestamp() * 1000)
+                if ts_ms < int(display_start_ms):
+                    warmup_candles.append(c)
+                else:
+                    if display_end_ms is None or ts_ms <= int(display_end_ms):
+                        candles_main.append(c)
+        elif display_limit is not None and display_limit > 0:
+            candles_main = list(candles)[-int(display_limit):]
+            warmup_candles = list(candles)[: max(0, len(candles) - len(candles_main))]
+        if not candles_main:
+            candles_main = list(candles)
     except Exception:
         warmup_candles = []
+        candles_main = list(candles)
 
     engine = BacktestEngine(BacktestConfig(initial_balance=data_settings.initial_balance, fee_rate=data_settings.fee_rate))
     strategy = DragonDcaAtrStrategy(config=cfg)
@@ -408,9 +545,37 @@ def run_single_backtest(
         except Exception:
             pass
 
-    result = engine.run(candles, strategy)
+    result = engine.run(candles_main, strategy)
     if not getattr(result, "candles", None):
-        result.candles = candles
+        result.candles = candles_main
+
+    # Persist analysis vs display window info for chart overlays.
+    try:
+        result.run_context = {
+            **(result.run_context or {}),
+            "display_start_ms": analysis_info.get("display_start_ms"),
+            "display_end_ms": analysis_info.get("display_end_ms"),
+            "display_limit": analysis_info.get("display_limit"),
+            "analysis_start_ms": analysis_info.get("analysis_start_ms"),
+            "analysis_end_ms": analysis_info.get("analysis_end_ms"),
+            "analysis_limit": analysis_info.get("analysis_limit"),
+            "warmup_seconds": analysis_info.get("warmup_seconds"),
+            "warmup_bars": analysis_info.get("warmup_bars"),
+            "base_timeframe_sec": analysis_info.get("base_timeframe_sec"),
+            "analysis_range_mode": analysis_info.get("effective_range_mode"),
+            "data_settings": {
+                "data_source": getattr(data_settings, "data_source", None),
+                "exchange_id": getattr(data_settings, "exchange_id", None),
+                "market_type": getattr(data_settings, "market_type", None),
+                "symbol": getattr(data_settings, "symbol", None),
+                "timeframe": getattr(data_settings, "timeframe", None),
+                "range_mode": getattr(data_settings, "range_mode", None),
+                "range_params": dict(getattr(data_settings, "range_params", None) or {}),
+            },
+        }
+    except Exception:
+        pass
+
 
     # Store config snapshot; preserve additional keys (e.g. _futures) if present.
     cfg_for_storage: Any = cfg

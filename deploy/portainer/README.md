@@ -26,9 +26,13 @@ The compose file sets:
 Containers should always use @postgres:5432. Host shell uses @127.0.0.1:5432 only when the dev override is enabled.
 
 ## Migrations
-- Stack startup runs migrations automatically before services start.
+- Stack startup runs migrations via the one-shot db_migrate service before UI/workers start.
 - Manual run (if needed):
-  - docker compose exec dragon_ui bash -lc 'python -m project_dragon.db_migrate'
+  - docker compose -f docker-compose.yml run --rm db_migrate
+
+## Dev auto-migrate (optional)
+- Set DRAGON_ENV=dev and DRAGON_AUTO_MIGRATE=1 to allow runtime auto-migration in dev.
+- In prod (DRAGON_ENV=prod), auto-migrate is hard-disabled.
 
 ## Persistent data (QNAP bind mounts)
 This compose uses:

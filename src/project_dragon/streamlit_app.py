@@ -62,9 +62,11 @@ from project_dragon.config_dragon import (
     dragon_config_example,
 )
 from project_dragon.crypto import CryptoConfigError, decrypt_str, mask_api_key
+from project_dragon.candle_cache import get_candles_analysis_window
 from project_dragon.data_online import get_candles_with_cache, get_woox_market_catalog, load_ccxt_candles
 from project_dragon.domain import BacktestResult, Candle, Trade
 from project_dragon.engine import BacktestConfig, BacktestEngine
+from project_dragon.backtest_core import compute_analysis_window
 from project_dragon.live.trade_config import (
     derive_primary_position_side_from_allow_flags,
     normalize_primary_position_side,
@@ -106,12 +108,15 @@ from project_dragon.storage import (
     get_sweep_parent_jobs_by_sweep,
     set_job_pause_requested,
     set_job_cancel_requested,
+    execute_fetchall,
     get_job,
     get_or_create_user_id,
     get_user_setting,
     init_db,
     link_bot_to_run,
     list_assets,
+    list_assets_server_side,
+    list_asset_symbols,
     list_bot_events,
     list_bot_fills,
     list_bots,
@@ -120,6 +125,7 @@ from project_dragon.storage import (
     list_categories,
     list_credentials,
     list_jobs,
+    list_runs_server_side,
     list_runs_for_sweep,
     list_sweeps,
     list_sweeps_with_run_counts,
@@ -154,6 +160,10 @@ from project_dragon.storage import (
     load_backtest_runs_explorer_rows,
     get_runs_explorer_rows,
     list_backtest_run_strategies,
+    list_backtest_run_symbols,
+    list_backtest_run_timeframes,
+    list_backtest_run_strategies_filtered,
+    get_runs_numeric_bounds,
     set_user_run_shortlists,
     sync_symbol_icons_from_spothq_pack,
 )
@@ -947,6 +957,26 @@ def _aggrid_dark_custom_css() -> dict:
         ".ag-center-aligned-cell": {"justify-content": "center"},
     }
 
+
+def _extract_aggrid_models(grid: Any) -> tuple[Optional[dict], Optional[list]]:
+    try:
+        if isinstance(grid, dict):
+            state = grid.get("grid_state") or grid.get("gridState")
+            if isinstance(state, dict):
+                filt = state.get("filterModel") or state.get("filter_model")
+                sort = state.get("sortModel") or state.get("sort_model")
+                if filt or sort:
+                    return filt if isinstance(filt, dict) else None, sort if isinstance(sort, list) else None
+            opts = grid.get("gridOptions") or grid.get("grid_options")
+            if isinstance(opts, dict):
+                filt = opts.get("filterModel") or opts.get("filter_model")
+                sort = opts.get("sortModel") or opts.get("sort_model")
+                if filt or sort:
+                    return filt if isinstance(filt, dict) else None, sort if isinstance(sort, list) else None
+    except Exception:
+        pass
+    return None, None
+
 def _extract_ma_periods_from_config_dict(config_dict: Optional[Dict[str, Any]]) -> List[int]:
     if not isinstance(config_dict, dict):
         return []
@@ -1610,21 +1640,7 @@ def init_state_defaults(settings: Dict[str, Any]) -> None:
 
         st.session_state[schema_key] = 2
 
-    # --- Results / Sweeps filters ---------------------------------------
-    # Migrate old keys to the new required names.
-    if "results_show_all_runs" not in st.session_state and "results_show_all" in st.session_state:
-        st.session_state["results_show_all_runs"] = bool(st.session_state.get("results_show_all"))
-    # Default OFF: match Results/Sweeps UX expectation (apply minimum filters by default).
-    _seed("results_show_all_runs", False)
 
-
-    if "sweeps_show_all_runs" not in st.session_state and "sweeps_show_all" in st.session_state:
-        st.session_state["sweeps_show_all_runs"] = bool(st.session_state.get("sweeps_show_all"))
-    # Default OFF: match Results/Sweeps UX expectation (apply minimum filters by default).
-    _seed("sweeps_show_all_runs", False)
-
-    # Runs Explorer should mirror Results/Sweeps.
-    _seed("runs_explorer_show_all_runs", False)
 
 
 def _reset_backtest_ui_state() -> None:
@@ -1665,6 +1681,323 @@ def _perf_reset() -> None:
         st.session_state["_perf_records"] = []
     except Exception:
         pass
+
+
+def _runs_global_filters_to_extra_where(global_filters: Dict[str, Any]) -> Dict[str, Any]:
+    gf = global_filters or {}
+    if not bool(gf.get("enabled", True)):
+        return {}
+    extra: Dict[str, Any] = {}
+
+    preset = str(gf.get("created_at_preset") or "").strip()
+    start_dt: Optional[datetime] = None
+    end_dt: Optional[datetime] = None
+    if preset and preset != "All Time":
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        if preset == "Last Week":
+            start_d = today - timedelta(days=7)
+        elif preset == "Last Month":
+            start_d = today - timedelta(days=30)
+        elif preset == "Last 3 Months":
+            start_d = today - timedelta(days=90)
+        elif preset == "Last 6 Months":
+            start_d = today - timedelta(days=180)
+        else:
+            start_d = None
+        if start_d is not None:
+            start_dt = datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc)
+            end_dt = datetime.combine(today, datetime.max.time(), tzinfo=timezone.utc)
+
+    if start_dt is None or end_dt is None:
+        dr = gf.get("date_range")
+        if isinstance(dr, (list, tuple)) and len(dr) == 2 and dr[0] and dr[1]:
+            try:
+                start_d = dr[0]
+                end_d = dr[1]
+                start_dt = datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc)
+                end_dt = datetime.combine(end_d, datetime.max.time(), tzinfo=timezone.utc)
+            except Exception:
+                start_dt = None
+                end_dt = None
+
+    if start_dt is not None:
+        extra["created_at_from"] = start_dt.isoformat()
+    if end_dt is not None:
+        extra["created_at_to"] = end_dt.isoformat()
+
+    symbols = gf.get("symbols")
+    if isinstance(symbols, (list, tuple)) and symbols:
+        extra["symbol"] = [str(s).strip() for s in symbols if str(s).strip()]
+
+    strategies = gf.get("strategies")
+    if isinstance(strategies, (list, tuple)) and strategies:
+        extra["strategy_name"] = [str(s).strip() for s in strategies if str(s).strip()]
+
+    timeframes = gf.get("timeframes")
+    if isinstance(timeframes, (list, tuple)) and timeframes:
+        extra["timeframe"] = [str(s).strip() for s in timeframes if str(s).strip()]
+
+    market_types = gf.get("market_types")
+    if isinstance(market_types, (list, tuple)) and market_types:
+        extra["market_type"] = [str(s).strip() for s in market_types if str(s).strip()]
+
+    if bool(gf.get("profitable_only", False)):
+        extra["net_return_pct_gt"] = 0.0
+
+    return extra
+
+
+def _runs_server_filter_controls(
+    prefix: str,
+    *,
+    include_run_type: bool,
+    on_change: Optional[Callable[[], None]] = None,
+    symbol_options: Optional[List[str]] = None,
+    strategy_options: Optional[List[str]] = None,
+    timeframe_options: Optional[List[str]] = None,
+    bounds: Optional[Dict[str, Optional[float]]] = None,
+) -> Dict[str, Any]:
+    def _kw() -> Dict[str, Any]:
+        return {"on_change": on_change} if on_change else {}
+
+    with st.container(border=True):
+        st.markdown("#### Filters")
+        row1 = st.columns(4)
+        search = row1[0].text_input(
+            "Search",
+            help="Matches run id, symbol, strategy, or sweep name",
+            key=f"{prefix}_search",
+            **_kw(),
+        )
+
+        symbol_vals: List[str] = []
+        if isinstance(symbol_options, list) and symbol_options:
+            symbol_vals = row1[1].multiselect(
+                "Symbol",
+                options=symbol_options,
+                default=st.session_state.get(f"{prefix}_symbol_multi", []),
+                key=f"{prefix}_symbol_multi",
+            )
+        else:
+            _ = row1[1].text_input("Symbol contains", key=f"{prefix}_symbol_contains", **_kw())
+
+        strategy_vals: List[str] = []
+        if isinstance(strategy_options, list) and strategy_options:
+            strategy_vals = row1[2].multiselect(
+                "Strategy",
+                options=strategy_options,
+                default=st.session_state.get(f"{prefix}_strategy_multi", []),
+                key=f"{prefix}_strategy_multi",
+            )
+        else:
+            _ = row1[2].text_input("Strategy contains", key=f"{prefix}_strategy_contains", **_kw())
+
+        timeframe_vals: List[str] = []
+        if isinstance(timeframe_options, list) and timeframe_options:
+            timeframe_vals = row1[3].multiselect(
+                "Timeframe",
+                options=timeframe_options,
+                default=st.session_state.get(f"{prefix}_timeframe_multi", []),
+                key=f"{prefix}_timeframe_multi",
+            )
+        else:
+            _ = row1[3].text_input("Timeframe contains", key=f"{prefix}_timeframe_contains", **_kw())
+
+        row2 = st.columns(4)
+        sweep = row2[0].text_input("Sweep name contains", key=f"{prefix}_sweep_contains", **_kw())
+
+        bounds = bounds or {}
+        np_min_bound = bounds.get("net_profit_min")
+        np_max_bound = bounds.get("net_profit_max")
+        if np_min_bound is not None and np_max_bound is not None:
+            net_profit_range = row2[1].slider(
+                "Net profit",
+                min_value=float(np_min_bound),
+                max_value=float(np_max_bound),
+                value=(float(np_min_bound), float(np_max_bound)),
+                key=f"{prefix}_net_profit_range",
+            )
+        else:
+            net_profit_range = None
+            _ = row2[1].text_input("Net profit min", key=f"{prefix}_net_profit_min", **_kw())
+            _ = row2[2].text_input("Net profit max", key=f"{prefix}_net_profit_max", **_kw())
+
+        nr_min_bound = bounds.get("net_return_pct_min")
+        nr_max_bound = bounds.get("net_return_pct_max")
+        if nr_min_bound is not None and nr_max_bound is not None:
+            net_return_range = row2[2].slider(
+                "Net return %",
+                min_value=float(nr_min_bound * 100.0),
+                max_value=float(nr_max_bound * 100.0),
+                value=(float(nr_min_bound * 100.0), float(nr_max_bound * 100.0)),
+                key=f"{prefix}_net_return_range",
+            )
+        else:
+            net_return_range = None
+            _ = row2[2].text_input("Net return % (min)", key=f"{prefix}_net_ret_min", **_kw())
+            _ = row2[3].text_input("Net return % (max)", key=f"{prefix}_net_ret_max", **_kw())
+
+        max_dd_max = row2[3].text_input("Max DD % (max)", key=f"{prefix}_max_dd_max", **_kw())
+
+        row3 = st.columns(4)
+        roi_min = row3[0].text_input("ROI % (min)", key=f"{prefix}_roi_min", **_kw())
+        roi_max = row3[1].text_input("ROI % (max)", key=f"{prefix}_roi_max", **_kw())
+        duration_min = row3[2].text_input("Duration min (hrs)", key=f"{prefix}_duration_min", **_kw())
+        duration_max = row3[3].text_input("Duration max (hrs)", key=f"{prefix}_duration_max", **_kw())
+
+        run_type = "All"
+        if include_run_type:
+            run_type = st.radio(
+                "Run type",
+                options=["All", "Single", "Sweep"],
+                index=["All", "Single", "Sweep"].index(
+                    str(st.session_state.get(f"{prefix}_run_type", "All") or "All")
+                    if str(st.session_state.get(f"{prefix}_run_type", "All") or "All") in {"All", "Single", "Sweep"}
+                    else "All"
+                ),
+                key=f"{prefix}_run_type",
+                horizontal=True,
+            )
+
+        def _clear_filters() -> None:
+            for key_suffix in (
+                "search",
+                "symbol_contains",
+                "symbol_multi",
+                "strategy_contains",
+                "strategy_multi",
+                "timeframe_contains",
+                "timeframe_multi",
+                "sweep_contains",
+                "net_profit_min",
+                "net_profit_max",
+                "net_profit_range",
+                "max_dd_max",
+                "net_ret_min",
+                "net_ret_max",
+                "net_return_range",
+                "roi_min",
+                "roi_max",
+                "duration_min",
+                "duration_max",
+                "run_type",
+            ):
+                st.session_state.pop(f"{prefix}_{key_suffix}", None)
+            st.session_state.pop(f"{prefix}_filter_model", None)
+            st.session_state.pop(f"{prefix}_sort_model", None)
+            if on_change:
+                on_change()
+
+        reset_cols = st.columns([1, 3])
+        with reset_cols[0]:
+            st.button("Clear filters", key=f"{prefix}_clear_filters", on_click=_clear_filters)
+
+    def _as_float(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    extra: Dict[str, Any] = {}
+    if str(search or "").strip():
+        extra["search"] = str(search).strip()
+    symbol_text = str(st.session_state.get(f"{prefix}_symbol_contains", "") or "").strip()
+    if symbol_text:
+        extra["symbol_contains"] = symbol_text
+    if symbol_vals:
+        extra["symbol"] = symbol_vals
+
+    strategy_text = str(st.session_state.get(f"{prefix}_strategy_contains", "") or "").strip()
+    if strategy_text:
+        extra["strategy_contains"] = strategy_text
+    if strategy_vals:
+        extra["strategy_name"] = strategy_vals
+
+    timeframe_text = str(st.session_state.get(f"{prefix}_timeframe_contains", "") or "").strip()
+    if timeframe_text:
+        extra["timeframe_contains"] = timeframe_text
+    if timeframe_vals:
+        extra["timeframe"] = timeframe_vals
+    if str(sweep or "").strip():
+        extra["sweep_name_contains"] = str(sweep).strip()
+
+    if include_run_type:
+        if str(run_type).lower() == "single":
+            extra["run_type"] = "single"
+        elif str(run_type).lower() == "sweep":
+            extra["run_type"] = "sweep"
+
+    if isinstance(net_profit_range, tuple) and len(net_profit_range) == 2:
+        try:
+            lo, hi = float(net_profit_range[0]), float(net_profit_range[1])
+            base_lo = float(np_min_bound) if np_min_bound is not None else None
+            base_hi = float(np_max_bound) if np_max_bound is not None else None
+            if base_lo is None or base_hi is None or abs(lo - base_lo) > 1e-9 or abs(hi - base_hi) > 1e-9:
+                extra["net_profit_min"] = lo
+                extra["net_profit_max"] = hi
+        except Exception:
+            pass
+    else:
+        np_min = _as_float(st.session_state.get(f"{prefix}_net_profit_min"))
+        if np_min is not None:
+            extra["net_profit_min"] = np_min
+        np_max = _as_float(st.session_state.get(f"{prefix}_net_profit_max"))
+        if np_max is not None:
+            extra["net_profit_max"] = np_max
+
+    dd_max = _as_float(max_dd_max)
+    if dd_max is not None:
+        extra["max_drawdown_pct_max"] = dd_max / 100.0
+
+    if isinstance(net_return_range, tuple) and len(net_return_range) == 2:
+        try:
+            lo, hi = float(net_return_range[0]), float(net_return_range[1])
+            base_lo = float(nr_min_bound * 100.0) if nr_min_bound is not None else None
+            base_hi = float(nr_max_bound * 100.0) if nr_max_bound is not None else None
+            if base_lo is None or base_hi is None or abs(lo - base_lo) > 1e-9 or abs(hi - base_hi) > 1e-9:
+                extra["net_return_pct_min"] = lo / 100.0
+                extra["net_return_pct_max"] = hi / 100.0
+        except Exception:
+            pass
+    else:
+        nr_min = _as_float(st.session_state.get(f"{prefix}_net_ret_min"))
+        if nr_min is not None:
+            extra["net_return_pct_min"] = nr_min / 100.0
+        nr_max = _as_float(st.session_state.get(f"{prefix}_net_ret_max"))
+        if nr_max is not None:
+            extra["net_return_pct_max"] = nr_max / 100.0
+
+    rmin = _as_float(roi_min)
+    if rmin is not None:
+        extra["roi_pct_on_margin_min"] = rmin
+    rmax = _as_float(roi_max)
+    if rmax is not None:
+        extra["roi_pct_on_margin_max"] = rmax
+
+    dmin = _as_float(duration_min)
+    if dmin is not None:
+        extra["duration_min_hours"] = dmin
+    dmax = _as_float(duration_max)
+    if dmax is not None:
+        extra["duration_max_hours"] = dmax
+
+    return extra
+
+
+def _safe_json_for_display(payload: Any) -> Any:
+    try:
+        return json.loads(json.dumps(payload, default=str))
+    except Exception:
+        try:
+            return {"value": str(payload)}
+        except Exception:
+            return ""
 
 
 @contextmanager
@@ -1834,8 +2167,41 @@ def run_single_backtest(
     candles_override: Optional[List[Candle]] = None,
     metadata_override: Optional[Tuple[str, str, str]] = None,
 ) -> BacktestArtifacts:
+    analysis_info = compute_analysis_window(config, data_settings)
+
     if candles_override is None:
-        candles, label, storage_symbol, storage_timeframe = load_candles_for_settings(data_settings)
+        if data_settings.data_source == "synthetic":
+            count = int(data_settings.range_params.get("count", 300))
+            candles = generate_dummy_candles(n=count)
+            label = f"Synthetic – {len(candles)} candles"
+            storage_symbol = "SYNTH"
+            storage_timeframe = "synthetic"
+        else:
+            params = data_settings.range_params or {}
+            exchange_id = data_settings.exchange_id or "binance"
+            symbol = data_settings.symbol or "BTC/USDT"
+            timeframe = data_settings.timeframe or "1h"
+            market_type = (data_settings.market_type or "unknown")
+            limit = analysis_info.get("analysis_limit") or params.get("limit")
+            since = analysis_info.get("analysis_start_ms") if analysis_info.get("analysis_start_ms") is not None else params.get("since")
+            until = analysis_info.get("analysis_end_ms") if analysis_info.get("analysis_end_ms") is not None else params.get("until")
+            range_mode = analysis_info.get("effective_range_mode") or data_settings.range_mode
+            candles = get_candles_with_cache(
+                exchange_id=exchange_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit,
+                since=since,
+                until=until,
+                range_mode=range_mode,
+                market_type=market_type,
+            )
+            label = (
+                f"Crypto (CCXT) – {exchange_id} "
+                f"{symbol} {timeframe}, {len(candles)} candles"
+            )
+            storage_symbol = symbol
+            storage_timeframe = timeframe
     else:
         candles = candles_override
         if metadata_override:
@@ -1846,79 +2212,30 @@ def run_single_backtest(
             storage_timeframe = data_settings.timeframe or "synthetic"
 
     warmup_candles: List[Candle] = []
-    candles_main: List[Candle] = candles
+    candles_main: List[Candle] = []
     try:
-        if candles_override is None and data_settings.data_source != "synthetic" and candles_main:
-            tf = str(data_settings.timeframe or "")
-            base_min = timeframe_to_minutes(tf) or 1
-
-            def _bars_needed(interval_min: int, length: int) -> int:
-                step = max(1, int(round(max(int(interval_min or 1), 1) / float(base_min))))
-                return step * max(int(length or 1), 1)
-
-            # Match DragonDcaAtrStrategy history requirements (+ ATR).
-            max_req = max(
-                _bars_needed(config.trend.ma_interval_min, int(getattr(config.trend, "ma_len", 1) or 1)),
-                _bars_needed(config.bbands.interval_min, int(getattr(config.bbands, "length", 1) or 1)),
-                _bars_needed(
-                    config.macd.interval_min,
-                    int(getattr(config.macd, "slow", 26) or 26) + int(getattr(config.macd, "signal", 9) or 9),
-                ),
-                _bars_needed(config.rsi.interval_min, int(getattr(config.rsi, "length", 14) or 14) + 1),
-                _bars_needed(config.trend.ma_interval_min, int(getattr(config.exits, "tp_atr_period", 1) or 1) + 1),
-            )
-            warmup_bars = max(int(max_req), 0)
-
-            if warmup_bars > 0:
-                first_ts = getattr(candles_main[0], "timestamp", None)
-                if first_ts is not None:
-                    try:
-                        first_dt = _normalize_timestamp(first_ts) or first_ts.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        first_dt = None
-                    if first_dt is not None:
-                        first_ms = int(first_dt.timestamp() * 1000)
-                        ms_per_bar = max(int(base_min) * 60_000, 60_000)
-                        # Slack: exchanges sometimes have missing candles; fetching exactly N bars worth
-                        # of time can return <N rows. Fetch a bit more time, then take the last N rows.
-                        slack_bars = max(10, int(round(float(warmup_bars) * 0.10)))
-                        since_ms = max(0, int(first_ms) - int((warmup_bars + slack_bars) * ms_per_bar))
-                        until_ms = max(0, int(first_ms) - 1)
-
-                        exchange_id = data_settings.exchange_id or "binance"
-                        symbol = data_settings.symbol or "BTC/USDT"
-                        market_type = (data_settings.market_type or "unknown")
-
-                        # Cap extreme warmups to keep backtests usable; mirrors live worker posture.
-                        warm_limit = min(max(int(warmup_bars) + int(slack_bars) + 10, 0), 250_000)
-                        warmup_candles = get_candles_with_cache(
-                            exchange_id=exchange_id,
-                            symbol=symbol,
-                            timeframe=tf,
-                            limit=warm_limit if warm_limit > 0 else None,
-                            since=int(since_ms),
-                            until=int(until_ms),
-                            range_mode="range",
-                            market_type=market_type,
-                        )
-                        if warmup_candles:
-                            # Ensure we only feed candles strictly before the first main candle,
-                            # and keep the last `warmup_bars` to stabilize indicator windows.
-                            trimmed = []
-                            for c in warmup_candles:
-                                try:
-                                    ts_ms = int(c.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                                except Exception:
-                                    continue
-                                if ts_ms < first_ms:
-                                    trimmed.append(c)
-                            if len(trimmed) > warmup_bars:
-                                warmup_candles = trimmed[-warmup_bars:]
-                            else:
-                                warmup_candles = trimmed
+        display_start_ms = analysis_info.get("display_start_ms")
+        display_end_ms = analysis_info.get("display_end_ms")
+        display_limit = analysis_info.get("display_limit")
+        if display_start_ms is not None:
+            for c in candles:
+                ts = _normalize_timestamp(getattr(c, "timestamp", None))
+                if ts is None:
+                    continue
+                ts_ms = int(ts.timestamp() * 1000)
+                if ts_ms < int(display_start_ms):
+                    warmup_candles.append(c)
+                else:
+                    if display_end_ms is None or ts_ms <= int(display_end_ms):
+                        candles_main.append(c)
+        elif display_limit is not None and display_limit > 0:
+            candles_main = list(candles)[-int(display_limit):]
+            warmup_candles = list(candles)[: max(0, len(candles) - len(candles_main))]
+        if not candles_main:
+            candles_main = list(candles)
     except Exception:
         warmup_candles = []
-        candles_main = candles
+        candles_main = list(candles)
 
     engine = BacktestEngine(
         BacktestConfig(initial_balance=data_settings.initial_balance, fee_rate=data_settings.fee_rate)
@@ -1933,6 +2250,22 @@ def run_single_backtest(
     result = engine.run(candles_main, strategy)
     if not result.candles:
         result.candles = candles_main
+    try:
+        result.run_context = {
+            **(result.run_context or {}),
+            "display_start_ms": analysis_info.get("display_start_ms"),
+            "display_end_ms": analysis_info.get("display_end_ms"),
+            "display_limit": analysis_info.get("display_limit"),
+            "analysis_start_ms": analysis_info.get("analysis_start_ms"),
+            "analysis_end_ms": analysis_info.get("analysis_end_ms"),
+            "analysis_limit": analysis_info.get("analysis_limit"),
+            "warmup_seconds": analysis_info.get("warmup_seconds"),
+            "warmup_bars": analysis_info.get("warmup_bars"),
+            "base_timeframe_sec": analysis_info.get("base_timeframe_sec"),
+            "analysis_range_mode": analysis_info.get("effective_range_mode"),
+        }
+    except Exception:
+        pass
     return BacktestArtifacts(
         result=result,
         candles=candles_main,
@@ -6318,6 +6651,67 @@ def render_run_detail_from_db(
 
                 warmup_ts = None
                 warmup_closes = None
+                try:
+                    rc = result_for_charts.run_context if result_for_charts is not None else {}
+                    analysis_start_ms = rc.get("analysis_start_ms") if isinstance(rc, dict) else None
+                    display_start_ms = rc.get("display_start_ms") if isinstance(rc, dict) else None
+                    warmup_seconds = rc.get("warmup_seconds") if isinstance(rc, dict) else None
+                    if display_start_ms is None and result_for_charts is not None and result_for_charts.candles:
+                        try:
+                            first_ts = getattr(result_for_charts.candles[0], "timestamp", None)
+                            first_dt = _normalize_timestamp(first_ts)
+                            if first_dt is not None:
+                                display_start_ms = int(first_dt.timestamp() * 1000)
+                        except Exception:
+                            display_start_ms = None
+                    if analysis_start_ms is None and display_start_ms is not None and warmup_seconds:
+                        try:
+                            analysis_start_ms = max(0, int(display_start_ms) - int(float(warmup_seconds) * 1000))
+                        except Exception:
+                            analysis_start_ms = None
+                    if analysis_start_ms is not None and display_start_ms is not None:
+                        data_settings = None
+                        try:
+                            data_settings = _build_data_settings(hydrated)
+                        except Exception:
+                            data_settings = None
+                        if data_settings is not None and str(data_settings.data_source or "").lower() != "synthetic":
+                            analysis_info = dict(rc) if isinstance(rc, dict) else {}
+                            try:
+                                _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_candles_analysis_window(
+                                    data_settings=data_settings,
+                                    analysis_info=analysis_info,
+                                    fetch_fn=get_candles_with_cache,
+                                )
+                            except Exception as exc:
+                                msg = str(exc).lower()
+                                if "database is locked" in msg or "locked" in msg:
+                                    _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_candles_analysis_window(
+                                        data_settings=data_settings,
+                                        analysis_info=analysis_info,
+                                        fetch_fn=load_ccxt_candles,
+                                    )
+                                else:
+                                    raise
+
+                            warmup_ts_list: list[datetime] = []
+                            warmup_close_list: list[float] = []
+                            for c in candles_analysis or []:
+                                ts = _normalize_timestamp(getattr(c, "timestamp", None))
+                                if ts is None:
+                                    continue
+                                ts_ms = int(ts.timestamp() * 1000)
+                                if ts_ms >= int(display_start_ms):
+                                    continue
+                                warmup_ts_list.append(ts)
+                                warmup_close_list.append(float(getattr(c, "close", 0.0) or 0.0))
+
+                            if warmup_ts_list:
+                                warmup_ts = pd.Series(warmup_ts_list)
+                                warmup_closes = pd.Series(warmup_close_list)
+                except Exception:
+                    warmup_ts = None
+                    warmup_closes = None
                 eq_fig = build_equity_chart(result_for_charts)
                 pr_fig = build_price_orders_chart(
                     result_for_charts,
@@ -7498,18 +7892,63 @@ def main() -> None:
 
         gf = get_global_filters()
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### Global Filters")
+        header_cols = st.sidebar.columns([6, 1])
+        header_cols[0].markdown("### Global Filters")
+        enabled = header_cols[1].checkbox(
+            "Enabled",
+            value=bool(gf.get("enabled", True)),
+            key="gf_enabled",
+            label_visibility="collapsed",
+        )
 
         # Run creation window
-        preset_options = ["Last Week", "Last Month", "Last 3 Months", "Last 6 Months"]
-        preset_default = str(gf.get("created_at_preset") or "Last Month").strip() or "Last Month"
+        preset_options = ["All Time", "Last Week", "Last Month", "Last 3 Months", "Last 6 Months"]
+        preset_default = str(gf.get("created_at_preset") or "All Time").strip() or "All Time"
         if preset_default not in preset_options:
-            preset_default = "Last Month"
+            preset_default = "All Time"
+
+        # Auto-widen when the default time window yields no runs.
+        if preset_default != "All Time":
+            if not (gf.get("account_ids") or gf.get("exchanges") or gf.get("market_types") or gf.get("symbols") or gf.get("strategies") or gf.get("timeframes") or gf.get("date_range")):
+                try:
+                    start_dt = None
+                    end_dt = None
+                    now = datetime.now(timezone.utc)
+                    today = now.date()
+                    if preset_default == "Last Week":
+                        start_d = today - timedelta(days=7)
+                    elif preset_default == "Last Month":
+                        start_d = today - timedelta(days=30)
+                    elif preset_default == "Last 3 Months":
+                        start_d = today - timedelta(days=90)
+                    elif preset_default == "Last 6 Months":
+                        start_d = today - timedelta(days=180)
+                    else:
+                        start_d = None
+                    if start_d is not None:
+                        start_dt = datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc)
+                        end_dt = datetime.combine(today, datetime.max.time(), tzinfo=timezone.utc)
+                    if start_dt is not None and end_dt is not None:
+                        cur = _gf_conn.execute(
+                            "SELECT COUNT(1) FROM backtest_runs WHERE created_at >= ? AND created_at <= ?",
+                            (start_dt.isoformat(), end_dt.isoformat()),
+                        )
+                        row = cur.fetchone() if cur is not None else None
+                        if row and int(row[0] or 0) == 0:
+                            preset_default = "All Time"
+                except Exception:
+                    pass
         created_at_preset = st.sidebar.selectbox(
             "Created",
             options=preset_options,
             index=preset_options.index(preset_default),
             key="gf_created_at_preset",
+        )
+
+        profitable_only = st.sidebar.checkbox(
+            "Profitable Runs",
+            value=bool(gf.get("profitable_only", False)),
+            key="gf_profitable_only",
         )
 
         # Accounts
@@ -7600,13 +8039,15 @@ def main() -> None:
         )
 
         new_gf = {
-            "created_at_preset": str(created_at_preset or "").strip() or "Last Month",
+            "enabled": bool(enabled),
+            "created_at_preset": str(created_at_preset or "").strip() or "All Time",
             "account_ids": account_ids,
             "exchanges": [str(e).strip().lower() for e in exchanges if str(e).strip()],
             "market_types": [str(m).strip().upper() for m in market_types if str(m).strip()],
             "symbols": [str(s).strip().upper() for s in symbols if str(s).strip()],
             "strategies": [str(s).strip() for s in strategies if str(s).strip()],
             "timeframes": [str(t).strip() for t in timeframes if str(t).strip()],
+            "profitable_only": bool(profitable_only),
         }
         if new_gf != gf:
             set_global_filters(new_gf)
@@ -8624,15 +9065,6 @@ def main() -> None:
             st.subheader("Runs Explorer")
             st.caption("Compare run metrics and strategy config side-by-side (with diff highlighting).")
 
-            # Match Results/Sweeps: minimum filters apply by default.
-            show_all_runs_explorer = st.checkbox(
-                "Show all runs (ignore minimum filters)",
-                value=bool(st.session_state.get("runs_explorer_show_all_runs", False)),
-                key=_wkey("runs_explorer_show_all_runs"),
-                on_change=_sync_model_from_widget,
-                args=("runs_explorer_show_all_runs",),
-            )
-
             # Reuse global filter chips for consistency with Results.
             try:
                 render_active_filter_chips(get_global_filters())
@@ -9001,38 +9433,131 @@ def main() -> None:
             except Exception:
                 all_strategies = []
 
-            # Use the same global row limit as Results/Sweeps.
-            try:
-                results_grid_limit = int(settings.get("results_grid_limit", 2000))
-            except Exception:
-                results_grid_limit = 2000
-            results_grid_limit = max(1, min(10000, results_grid_limit))
+            def _reset_runs_explorer_page() -> None:
+                st.session_state["runs_explorer_page"] = 1
 
-            rows, total_count = get_runs_explorer_rows(
-                user_id=str(user_id or "").strip() or DEFAULT_USER_EMAIL,
-                filters=None,
-                limit=int(results_grid_limit),
-                offset=0,
+            if "runs_explorer_page" not in st.session_state:
+                st.session_state["runs_explorer_page"] = 1
+            if "runs_explorer_page_size" not in st.session_state:
+                st.session_state["runs_explorer_page_size"] = 100
+            if "runs_explorer_filter_model" not in st.session_state:
+                st.session_state["runs_explorer_filter_model"] = None
+            if "runs_explorer_sort_model" not in st.session_state:
+                st.session_state["runs_explorer_sort_model"] = None
+
+            page_size_options = [25, 50, 100, 200]
+            page_size = int(st.session_state.get("runs_explorer_page_size") or page_size_options[2])
+            if page_size not in page_size_options:
+                page_size_options.append(page_size)
+                page_size_options = sorted(set(page_size_options))
+            page = int(st.session_state.get("runs_explorer_page") or 1)
+
+            with open_db_connection() as _filter_conn:
+                options_extra = _runs_global_filters_to_extra_where(get_global_filters())
+                symbol_opts = list_backtest_run_symbols(
+                    _filter_conn,
+                    extra_where=options_extra if options_extra else None,
+                    user_id=user_id,
+                )
+                if not symbol_opts:
+                    symbol_opts = list_backtest_run_symbols(_filter_conn, extra_where=None, user_id=user_id)
+                tf_opts = list_backtest_run_timeframes(
+                    _filter_conn,
+                    extra_where=options_extra if options_extra else None,
+                    user_id=user_id,
+                )
+                if not tf_opts:
+                    tf_opts = list_backtest_run_timeframes(_filter_conn, extra_where=None, user_id=user_id)
+                strat_opts = list_backtest_run_strategies_filtered(
+                    _filter_conn,
+                    extra_where=options_extra if options_extra else None,
+                    user_id=user_id,
+                )
+                if not strat_opts:
+                    strat_opts = list_backtest_run_strategies_filtered(_filter_conn, extra_where=None, user_id=user_id)
+                bounds = get_runs_numeric_bounds(
+                    _filter_conn,
+                    extra_where=options_extra if options_extra else None,
+                    user_id=user_id,
+                )
+                if not any(v is not None for v in bounds.values()):
+                    bounds = get_runs_numeric_bounds(_filter_conn, extra_where=None, user_id=user_id)
+
+            ui_filters = _runs_server_filter_controls(
+                "runs_explorer",
+                include_run_type=True,
+                on_change=_reset_runs_explorer_page,
+                symbol_options=symbol_opts,
+                strategy_options=strat_opts,
+                timeframe_options=tf_opts,
+                bounds=bounds,
             )
 
-            # Apply minimum return filter unless "Show all" is enabled.
-            # (We do this before heavy config/metrics JSON parsing.)
-            if not bool(show_all_runs_explorer):
-                try:
-                    min_ret_pct = float(settings.get("min_net_return_pct", 20.0))
-                except Exception:
-                    min_ret_pct = 20.0
-                min_ret_frac = min_ret_pct / 100.0
-                try:
-                    rows = [
-                        r
-                        for r in (rows or [])
-                        if (_safe_float((r or {}).get("net_return_pct")) is not None)
-                        and (float(_safe_float((r or {}).get("net_return_pct")) or 0.0) >= float(min_ret_frac))
-                    ]
-                    total_count = int(len(rows))
-                except Exception:
-                    pass
+            runs_query_cols = [
+                "run_id",
+                "created_at",
+                "symbol",
+                "timeframe",
+                "strategy_name",
+                "strategy_version",
+                "market_type",
+                "config_json",
+                "metrics_json",
+                "metadata_json",
+                "start_time",
+                "end_time",
+                "net_profit",
+                "net_return_pct",
+                "roi_pct_on_margin",
+                "max_drawdown_pct",
+                "sharpe",
+                "sortino",
+                "win_rate",
+                "profit_factor",
+                "cpc_index",
+                "common_sense_ratio",
+                "avg_position_time_s",
+                "sweep_id",
+                "sweep_name",
+                "sweep_exchange_id",
+                "sweep_scope",
+                "sweep_assets_json",
+                "sweep_category_id",
+                "base_asset",
+                "quote_asset",
+                "icon_uri",
+                "shortlisted",
+                "shortlist_note",
+            ]
+
+            extra_where = _runs_global_filters_to_extra_where(get_global_filters())
+            if ui_filters:
+                extra_where.update(ui_filters)
+
+            with _perf("runs_explorer_compare.load_rows"):
+                with open_db_connection() as _runs_conn:
+                    rows, total_count = list_runs_server_side(
+                        conn=_runs_conn,
+                        page=page,
+                        page_size=page_size,
+                        filter_model=st.session_state.get("runs_explorer_filter_model"),
+                        sort_model=st.session_state.get("runs_explorer_sort_model"),
+                        visible_columns=runs_query_cols,
+                        user_id=user_id,
+                        extra_where=extra_where if extra_where else None,
+                    )
+
+            total_count = int(total_count or 0)
+            max_page = max(1, math.ceil(total_count / float(page_size))) if total_count else 1
+            if page > max_page:
+                st.session_state["runs_explorer_page"] = max_page
+                st.rerun()
+
+            if st.checkbox("Show active filters", value=False, key="runs_explorer_show_active_filters"):
+                st.json(_safe_json_for_display({"global": _runs_global_filters_to_extra_where(get_global_filters()), "ui": ui_filters}))
+
+            if st.checkbox("Show grid state (debug)", value=False, key="runs_explorer_debug_grid_state"):
+                st.info("Showing raw grid state for debugging filter/sort extraction.")
 
             if not rows:
                 st.info("No runs found for the current filters.")
@@ -9091,89 +9616,7 @@ def main() -> None:
                 except Exception:
                     df_filter["direction"] = ""
 
-            # Apply global filters (Created preset, strategy/symbol/timeframe, etc) like Results.
-            try:
-                df_filter = apply_global_filters(df_filter, get_global_filters())
-            except Exception:
-                pass
-
-            total_rows = int(len(df_filter))
-            compare_filter_spec = {
-                "run_type": {
-                    "type": "radio",
-                    "label": "Run type",
-                    "options": ["All", "Single", "Sweep"],
-                    "horizontal": True,
-                },
-                "search": {
-                    "type": "text",
-                    "label": "Search",
-                    "columns": ["symbol_full", "strategy", "sweep", "run_id"],
-                },
-                "symbol": "multiselect",
-                "timeframe": "multiselect",
-                "direction": "multiselect",
-                "market": "multiselect",
-                "strategy": "multiselect",
-                "sweep": "multiselect",
-                "net_return_pct": {"type": "range", "label": "Net return (fraction)"},
-                "roi_pct_on_margin": {"type": "range", "label": "ROI % (margin)"},
-                "max_drawdown_pct": {"type": "range", "label": "Max DD (fraction)"},
-                "cpc_index": {"type": "range", "label": "CPC Index"},
-                "sharpe": "range",
-            }
-            try:
-                with open_db_connection() as _filters_conn:
-                    fr = render_table_filters(
-                        df_filter,
-                        compare_filter_spec,
-                        scope_key="runs_explorer:compare",
-                        dataset_cache_key=f"runs_explorer_compare:{total_rows}",
-                        presets_conn=_filters_conn,
-                        presets_user_id=user_id,
-                        presets_scope_key="shared:results_sweeps",
-                    )
-            except Exception:
-                fr = render_table_filters(
-                    df_filter,
-                    compare_filter_spec,
-                    scope_key="runs_explorer:compare",
-                    dataset_cache_key=f"runs_explorer_compare:{total_rows}",
-                    presets_conn=None,
-                    presets_user_id=user_id,
-                    presets_scope_key="shared:results_sweeps",
-                )
-
-            df_filter = fr.df
-
-            # Apply run-type filter after the filter bar (mirrors Results behavior).
-            try:
-                rt = str(st.session_state.get("runs_explorer:compare__run_type", "All") or "All").strip().lower()
-                if rt in {"single", "single runs", "single_run", "single-run"}:
-                    if "sweep_id" in df_filter.columns:
-                        df_filter = df_filter[df_filter["sweep_id"].isna()].copy()
-                    elif "sweep" in df_filter.columns:
-                        df_filter = df_filter[df_filter["sweep"].fillna("").astype(str).str.strip().eq("")].copy()
-                elif rt in {"sweep", "sweep runs", "sweep_run", "sweep-run"}:
-                    if "sweep_id" in df_filter.columns:
-                        df_filter = df_filter[df_filter["sweep_id"].notna()].copy()
-                    elif "sweep" in df_filter.columns:
-                        df_filter = df_filter[~df_filter["sweep"].fillna("").astype(str).str.strip().eq("")].copy()
-            except Exception:
-                pass
-
-            keep_run_ids: set[str] = set()
-            try:
-                if "run_id" in df_filter.columns:
-                    keep_run_ids = set(str(x).strip() for x in df_filter["run_id"].tolist() if str(x).strip())
-            except Exception:
-                keep_run_ids = set()
-
-            if keep_run_ids:
-                rows = [r for r in rows if str(r.get("run_id") or "").strip() in keep_run_ids]
-                total_count = len(rows)
-
-            st.caption(f"{len(rows)} rows shown")
+            st.caption(f"{len(rows)} rows shown (page {page})")
 
             # Parse JSON once per run row (after filtering).
             parsed: List[Dict[str, Any]] = []
@@ -9859,7 +10302,7 @@ def main() -> None:
                 gridOptions=gb.build(),
                 # Sorting/filtering should be client-side (no rerun). Only selection should rerun
                 # (for CSV selection/export) to keep the UI responsive.
-                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.MODEL_CHANGED),
                 data_return_mode=DataReturnMode.AS_INPUT,
                 enable_enterprise_modules=False,
                 allow_unsafe_jscode=True,
@@ -9869,6 +10312,20 @@ def main() -> None:
                 key="runs_explorer_compare_grid",
                 columns_state=columns_state,
             )
+
+            grid_filter_model, grid_sort_model = _extract_aggrid_models(grid)
+            if grid_filter_model is not None or grid_sort_model is not None:
+                if grid_filter_model != st.session_state.get("runs_explorer_filter_model") or grid_sort_model != st.session_state.get("runs_explorer_sort_model"):
+                    st.session_state["runs_explorer_filter_model"] = grid_filter_model
+                    st.session_state["runs_explorer_sort_model"] = grid_sort_model
+                    st.session_state["runs_explorer_page"] = 1
+                    st.rerun()
+
+            if st.session_state.get("runs_explorer_debug_grid_state"):
+                try:
+                    st.json(grid.get("grid_state") or grid.get("gridState") or grid)
+                except Exception:
+                    st.json(grid)
 
             # Open run detail reliably when exactly one row is selected.
             # (If multiple rows are selected we assume the user is doing CSV export.)
@@ -12924,6 +13381,29 @@ def main() -> None:
             columns_state=columns_state,
         )
 
+        pager_cols = st.columns([1, 1, 2, 2, 2])
+        with pager_cols[0]:
+            if st.button("← Prev", key="runs_explorer_prev", disabled=page <= 1):
+                st.session_state["runs_explorer_page"] = max(1, page - 1)
+                st.rerun()
+        with pager_cols[1]:
+            if st.button("Next →", key="runs_explorer_next", disabled=page >= max_page):
+                st.session_state["runs_explorer_page"] = min(max_page, page + 1)
+                st.rerun()
+        with pager_cols[2]:
+            st.caption(f"Page {page} / {max_page}")
+        with pager_cols[3]:
+            st.caption(f"Total rows: {total_count}")
+        with pager_cols[4]:
+            st.selectbox(
+                "Page size",
+                options=page_size_options,
+                index=page_size_options.index(int(page_size)),
+                key="runs_explorer_page_size",
+                on_change=_reset_runs_explorer_page,
+                label_visibility="collapsed",
+            )
+
         # Persist column sizing/order only on explicit save (prevents resize loops).
         if st.session_state.get("runs_explorer_save_layout_requested"):
             try:
@@ -13196,37 +13676,132 @@ def main() -> None:
                 st.session_state.pop("deep_link_run_id", None)
                 st.rerun()
 
-        # Filters are controlled via widgets rendered at the bottom of the page.
-        # We read from session_state here so the grid is always built with the latest values after a rerun.
-        show_all = bool(st.session_state.get("results_show_all_runs", True))
-        filters = None
-        if not show_all:
-            min_ret_pct = float(settings.get("min_net_return_pct", 20.0))
-            filters = {"min_net_return_pct": min_ret_pct / 100.0}
-
-
         # Results grid (AgGrid).
         if AgGrid is None or GridOptionsBuilder is None or JsCode is None:
             st.error("Results requires `streamlit-aggrid`. Install dependencies and restart the app.")
             return
 
-        try:
-            results_grid_limit = int(settings.get("results_grid_limit", 2000))
-        except Exception:
-            results_grid_limit = 2000
-        results_grid_limit = max(1, min(10000, results_grid_limit))
+        def _reset_results_page() -> None:
+            st.session_state["results_runs_page"] = 1
 
+        if "results_runs_page" not in st.session_state:
+            st.session_state["results_runs_page"] = 1
+        if "results_runs_page_size" not in st.session_state:
+            st.session_state["results_runs_page_size"] = 100
+        if "results_runs_filter_model" not in st.session_state:
+            st.session_state["results_runs_filter_model"] = None
+        if "results_runs_sort_model" not in st.session_state:
+            st.session_state["results_runs_sort_model"] = None
+
+        page_size_options = [25, 50, 100, 200]
+        page_size = int(st.session_state.get("results_runs_page_size") or page_size_options[2])
+        if page_size not in page_size_options:
+            page_size_options.append(page_size)
+            page_size_options = sorted(set(page_size_options))
+        page = int(st.session_state.get("results_runs_page") or 1)
+
+        with open_db_connection() as _filter_conn:
+            options_extra = _runs_global_filters_to_extra_where(get_global_filters())
+            symbol_opts = list_backtest_run_symbols(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            if not symbol_opts:
+                symbol_opts = list_backtest_run_symbols(_filter_conn, extra_where=None, user_id=user_id)
+            tf_opts = list_backtest_run_timeframes(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            if not tf_opts:
+                tf_opts = list_backtest_run_timeframes(_filter_conn, extra_where=None, user_id=user_id)
+            strat_opts = list_backtest_run_strategies_filtered(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            if not strat_opts:
+                strat_opts = list_backtest_run_strategies_filtered(_filter_conn, extra_where=None, user_id=user_id)
+            bounds = get_runs_numeric_bounds(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            if not any(v is not None for v in bounds.values()):
+                bounds = get_runs_numeric_bounds(_filter_conn, extra_where=None, user_id=user_id)
+
+        ui_filters = _runs_server_filter_controls(
+            "results_runs",
+            include_run_type=True,
+            on_change=_reset_results_page,
+            symbol_options=symbol_opts,
+            strategy_options=strat_opts,
+            timeframe_options=tf_opts,
+            bounds=bounds,
+        )
+
+        runs_query_cols = [
+            "run_id",
+            "created_at",
+            "symbol",
+            "timeframe",
+            "strategy_name",
+            "strategy_version",
+            "market_type",
+            "config_json",
+            "start_time",
+            "end_time",
+            "net_profit",
+            "net_return_pct",
+            "roi_pct_on_margin",
+            "max_drawdown_pct",
+            "sharpe",
+            "sortino",
+            "win_rate",
+            "profit_factor",
+            "cpc_index",
+            "common_sense_ratio",
+            "avg_position_time_s",
+            "sweep_id",
+            "sweep_name",
+            "sweep_exchange_id",
+            "sweep_scope",
+            "sweep_assets_json",
+            "sweep_category_id",
+            "base_asset",
+            "quote_asset",
+            "icon_uri",
+            "shortlisted",
+            "shortlist_note",
+        ]
+
+        extra_where = _runs_global_filters_to_extra_where(get_global_filters())
+        if ui_filters:
+            extra_where.update(ui_filters)
         with _perf("results.load_rows"):
-            rows = load_backtest_runs_explorer_rows(user_id=user_id, limit=results_grid_limit, filters=filters)
-        if not rows and filters is not None:
-            with _perf("results.load_rows_unfiltered"):
-                rows_unfiltered = load_backtest_runs_explorer_rows(user_id=user_id, limit=results_grid_limit, filters=None)
-            if rows_unfiltered:
-                st.warning(
-                    "No runs match the minimum return filter; showing all runs. "
-                    "Toggle 'Show all runs' or adjust Settings → min_net_return_pct."
+            with open_db_connection() as _runs_conn:
+                rows, total_rows = list_runs_server_side(
+                    conn=_runs_conn,
+                    page=page,
+                    page_size=page_size,
+                    filter_model=st.session_state.get("results_runs_filter_model"),
+                    sort_model=st.session_state.get("results_runs_sort_model"),
+                    visible_columns=runs_query_cols,
+                    user_id=user_id,
+                    extra_where=extra_where if extra_where else None,
                 )
-                rows = rows_unfiltered
+        total_rows = int(total_rows or 0)
+        max_page = max(1, math.ceil(total_rows / float(page_size))) if total_rows else 1
+        if page > max_page:
+            st.session_state["results_runs_page"] = max_page
+            st.rerun()
+
+        if st.checkbox("Show active filters", value=False, key="results_runs_show_active_filters"):
+            st.json(_safe_json_for_display({"global": _runs_global_filters_to_extra_where(get_global_filters()), "ui": ui_filters}))
+
+        if st.checkbox("Show grid state (debug)", value=False, key="results_runs_debug_grid_state"):
+            st.info("Showing raw grid state for debugging filter/sort extraction.")
 
         if not rows:
             st.info("No backtest runs stored yet. Run a backtest to populate this list.")
@@ -13427,75 +14002,7 @@ def main() -> None:
         else:
             df["symbol"] = ""
 
-        # --- In-memory filters (no AG Grid Enterprise required) --------
-        total_rows = int(len(df))
-        runs_filter_spec = {
-            "run_type": {
-                "type": "radio",
-                "label": "Run type",
-                "options": ["All", "Single", "Sweep"],
-                "horizontal": True,
-            },
-            "search": {
-                "type": "text",
-                "label": "Search",
-                "columns": ["symbol_full", "strategy_name", "sweep_name", "run_id"],
-            },
-            "symbol": "multiselect",
-            "category": "multiselect",
-            "timeframe": "multiselect",
-            "direction": "multiselect",
-            "market": "multiselect",
-            "sweep_name": "multiselect",
-            "net_return_pct": {"type": "range", "label": "Net return (fraction)"},
-            "roi_pct_on_margin": {"type": "range", "label": "ROI % (margin)"},
-            "max_drawdown_pct": {"type": "range", "label": "Max DD (fraction)"},
-            "cpc_index": {"type": "range", "label": "CPC Index"},
-            "sharpe": "range",
-        }
-        try:
-            with open_db_connection() as _filters_conn:
-                fr = render_table_filters(
-                    df,
-                    runs_filter_spec,
-                    scope_key="results:runs_explorer",
-                    dataset_cache_key=f"runs:{total_rows}",
-                    presets_conn=_filters_conn,
-                    presets_user_id=user_id,
-                    presets_scope_key="shared:results_sweeps",
-                )
-        except Exception:
-            # If DB access fails for presets, still render the filter UI (without preset persistence).
-            fr = render_table_filters(
-                df,
-                runs_filter_spec,
-                scope_key="results:runs_explorer",
-                dataset_cache_key=f"runs:{total_rows}",
-                presets_conn=None,
-                presets_user_id=user_id,
-                presets_scope_key="shared:results_sweeps",
-            )
-        df = fr.df
-
-        # Apply run-type filter before global filters.
-        try:
-            rt = str(st.session_state.get("results:runs_explorer__run_type", "All") or "All").strip().lower()
-            if rt in {"single", "single runs", "single_run", "single-run"}:
-                if "sweep_id" in df.columns:
-                    df = df[df["sweep_id"].isna()].copy()
-                elif "sweep_name" in df.columns:
-                    df = df[df["sweep_name"].fillna("").astype(str).str.strip().eq("")].copy()
-            elif rt in {"sweep", "sweep runs", "sweep_run", "sweep-run"}:
-                if "sweep_id" in df.columns:
-                    df = df[df["sweep_id"].notna()].copy()
-                elif "sweep_name" in df.columns:
-                    df = df[~df["sweep_name"].fillna("").astype(str).str.strip().eq("")].copy()
-        except Exception:
-            pass
-
-        # Apply global filters after page-specific filters.
-        df = apply_global_filters(df, get_global_filters())
-        st.caption(f"{int(len(df))} rows shown / {total_rows} total")
+        st.caption(f"{total_rows} rows matched")
 
         try:
             need_parse = df["symbol"].fillna("").astype(str).str.strip().eq("")
@@ -14624,13 +15131,54 @@ def main() -> None:
             theme="dark",
             custom_css=custom_css,
             # Keep reruns tight: selection (open run) + value changes (shortlist edits).
-            update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.VALUE_CHANGED),
+            update_mode=(
+                GridUpdateMode.SELECTION_CHANGED
+                | GridUpdateMode.VALUE_CHANGED
+                | GridUpdateMode.MODEL_CHANGED
+            ),
             data_return_mode=DataReturnMode.AS_INPUT,
             fit_columns_on_grid_load=False,
             allow_unsafe_jscode=True,
             height=630,
             columns_state=columns_state,
         )
+
+        pager_cols = st.columns([1, 1, 2, 2, 2])
+        with pager_cols[0]:
+            if st.button("← Prev", key="results_runs_prev", disabled=page <= 1):
+                st.session_state["results_runs_page"] = max(1, page - 1)
+                st.rerun()
+        with pager_cols[1]:
+            if st.button("Next →", key="results_runs_next", disabled=page >= max_page):
+                st.session_state["results_runs_page"] = min(max_page, page + 1)
+                st.rerun()
+        with pager_cols[2]:
+            st.caption(f"Page {page} / {max_page}")
+        with pager_cols[3]:
+            st.caption(f"Total rows: {total_rows}")
+        with pager_cols[4]:
+            st.selectbox(
+                "Page size",
+                options=page_size_options,
+                index=page_size_options.index(int(page_size)),
+                key="results_runs_page_size",
+                on_change=_reset_results_page,
+                label_visibility="collapsed",
+            )
+
+        grid_filter_model, grid_sort_model = _extract_aggrid_models(grid)
+        if grid_filter_model is not None or grid_sort_model is not None:
+            if grid_filter_model != st.session_state.get("results_runs_filter_model") or grid_sort_model != st.session_state.get("results_runs_sort_model"):
+                st.session_state["results_runs_filter_model"] = grid_filter_model
+                st.session_state["results_runs_sort_model"] = grid_sort_model
+                st.session_state["results_runs_page"] = 1
+                st.rerun()
+
+        if st.session_state.get("results_runs_debug_grid_state"):
+            try:
+                st.json(grid.get("grid_state") or grid.get("gridState") or grid)
+            except Exception:
+                st.json(grid)
 
         # Persist column sizing/order only on explicit save.
         if st.session_state.get("runs_explorer_save_layout_requested"):
@@ -14747,14 +15295,6 @@ def main() -> None:
         # --- Results settings (bottom of page) ------------------------------
         st.markdown("---")
         st.caption("Results settings")
-
-        st.checkbox(
-            "Show all runs (ignore minimum filters)",
-            value=bool(st.session_state.get("results_show_all_runs", True)),
-            key=_wkey("results_show_all_runs"),
-            on_change=_sync_model_from_widget,
-            args=("results_show_all_runs",),
-        )
         bottom_bar = st.columns([2, 3], gap="large")
         with bottom_bar[0]:
             st.caption("Columns")
@@ -14861,18 +15401,7 @@ def main() -> None:
             return
 
         # --- Filters (applies to the runs grid below) ---------------------
-
-        show_all_sweeps = st.checkbox(
-            "Show all runs (ignore minimum filters)",
-            value=bool(st.session_state.get("sweeps_show_all_runs", True)),
-            key=_wkey("sweeps_show_all_runs"),
-            on_change=_sync_model_from_widget,
-            args=("sweeps_show_all_runs",),
-        )
         run_filters: Optional[dict] = None
-        if not show_all_sweeps:
-            min_ret_pct = float(settings.get("min_net_return_pct", 20.0))
-            run_filters = {"min_net_return_pct": min_ret_pct / 100.0}
 
         # Font for grid
         st.markdown(
@@ -15005,6 +15534,20 @@ def main() -> None:
                 df_sweeps["jobs_progress_pct"] = df_sweeps.apply(lambda r: _pct(_terminal(dict(r)), r.get("jobs_total")), axis=1)
             except Exception:
                 pass
+
+        # Keep job progress columns stable even when counts are unavailable.
+        if not df_sweeps.empty:
+            for _col in (
+                "jobs_total",
+                "jobs_done",
+                "jobs_failed",
+                "jobs_cancelled",
+                "jobs_running",
+                "jobs_queued",
+                "jobs_progress_pct",
+            ):
+                if _col not in df_sweeps.columns:
+                    df_sweeps[_col] = None
 
         # Status pills + capitalization for the Sweeps grid.
         # Prefer a derived label when pause/cancel is requested on the parent job.
@@ -15422,6 +15965,11 @@ def main() -> None:
         existing_sweeps = [c for c in sweeps_order if c in df_sweeps_display.columns]
         rest_sweeps = [c for c in df_sweeps_display.columns if c not in existing_sweeps]
         df_sweeps_display = df_sweeps_display[existing_sweeps + rest_sweeps]
+
+        # Keep job progress columns present even if upstream data is missing.
+        for _col in ("jobs_progress_pct", "jobs_total", "jobs_done", "jobs_failed"):
+            if _col not in df_sweeps_display.columns:
+                df_sweeps_display[_col] = None
 
         # --- In-memory filters (no AG Grid Enterprise required) --------
         total_sweeps = int(len(df_sweeps_display))
@@ -15868,7 +16416,7 @@ def main() -> None:
             pre_selected_rows=pre_selected_sweep_rows,
         )
         # Prefer checkbox-driven selection for consistency with Results.
-        gb_s.configure_grid_options(headerHeight=52, rowHeight=38, animateRows=False, suppressRowClickSelection=True)
+        gb_s.configure_grid_options(headerHeight=52, rowHeight=38, animateRows=False, suppressRowClickSelection=False)
         sym_filter = "agSetColumnFilter" if use_enterprise else True
 
         # Visible columns (Results-style): persisted separately from column sizing/order.
@@ -15967,7 +16515,13 @@ def main() -> None:
             visible_cols_sweeps = [c for c in _persisted_visible if c in df_sweeps_display.columns]
         else:
             visible_cols_sweeps = [c for c in default_visible_cols if c in df_sweeps_display.columns]
-        # Always keep Actions visible when present.
+        # Always keep Jobs % and Actions visible when present.
+        if "jobs_progress_pct" in df_sweeps_display.columns and "jobs_progress_pct" not in visible_cols_sweeps:
+            try:
+                idx = visible_cols_sweeps.index("status")
+                visible_cols_sweeps.insert(idx, "jobs_progress_pct")
+            except Exception:
+                visible_cols_sweeps.append("jobs_progress_pct")
         if "sweep_actions" in df_sweeps_display.columns and "sweep_actions" not in visible_cols_sweeps:
             visible_cols_sweeps.append("sweep_actions")
 
@@ -16629,27 +17183,16 @@ def main() -> None:
             st.session_state["sweeps_runs_prefs_loaded"] = True
 
         filters_for_runs = dict(run_filters or {})
+        gf_for_runs = get_global_filters()
+        if bool(gf_for_runs.get("enabled", True)) and bool(gf_for_runs.get("profitable_only", False)):
+            filters_for_runs["net_return_pct_gt"] = 0.0
         filters_for_runs["sweep_id"] = str(selected_sweep_id)
 
-        try:
-            results_grid_limit = int(settings.get("results_grid_limit", 2000))
-        except Exception:
-            results_grid_limit = 2000
-        results_grid_limit = max(1, min(10000, results_grid_limit))
-
-        rows = load_backtest_runs_explorer_rows(user_id=user_id, limit=results_grid_limit, filters=filters_for_runs)
-        if not rows and (run_filters is not None):
-            rows_unfiltered = load_backtest_runs_explorer_rows(
-                user_id=user_id,
-                limit=results_grid_limit,
-                filters={"sweep_id": str(selected_sweep_id)},
-            )
-            if rows_unfiltered:
-                st.warning(
-                    "No runs match the minimum return filter; showing all runs for this sweep. "
-                    "Toggle 'Show all runs' or adjust Settings → min_net_return_pct."
-                )
-                rows = rows_unfiltered
+        rows = load_backtest_runs_explorer_rows(
+            user_id=user_id,
+            limit=max(1, int(selected_sweep_run_count or 1)),
+            filters=filters_for_runs,
+        )
 
         if not rows:
             st.info("No runs recorded for this sweep yet.")
@@ -18017,21 +18560,23 @@ def main() -> None:
                     return out
 
                 active_statuses = ("queued", "running", "cancel_requested")
-                active_rows = conn.execute(
+                active_rows = execute_fetchall(
+                    conn,
                     """
                     SELECT * FROM jobs
                     WHERE status IN ('queued','running','cancel_requested')
                     ORDER BY COALESCE(updated_at, created_at) DESC
-                    """
-                ).fetchall()
-                history_rows = conn.execute(
+                    """,
+                )
+                history_rows = execute_fetchall(
+                    conn,
                     """
                     SELECT * FROM jobs
                     WHERE status NOT IN ('queued','running','cancel_requested')
-                    ORDER BY COALESCE(created_at, started_at, finished_at, id) DESC
+                    ORDER BY COALESCE(NULLIF(created_at, ''), NULLIF(started_at, ''), NULLIF(finished_at, '')) DESC NULLS LAST, id DESC
                     LIMIT 20
-                    """
-                ).fetchall()
+                    """,
+                )
 
                 jobs_running = _rows_to_jobs(active_rows)
                 jobs_history = _rows_to_jobs(history_rows)
@@ -18104,8 +18649,6 @@ def main() -> None:
             fee_spot_val = float(current_settings.get("fee_spot_pct", 0.10))
             fee_perps_val = float(current_settings.get("fee_perps_pct", 0.06))
             fee_stocks_val = float(current_settings.get("fee_stocks_pct", 0.10))
-            min_ret_val = float(current_settings.get("min_net_return_pct", 20.0))
-            results_grid_limit_val = int(current_settings.get("results_grid_limit", 2000))
             jobs_refresh_val = float(current_settings.get("jobs_refresh_seconds", jobs_refresh_seconds))
             prefer_bbo_val = bool(current_settings.get("prefer_bbo_maker", True))
             bbo_level_val = int(current_settings.get("bbo_queue_level", 1))
@@ -18142,22 +18685,6 @@ def main() -> None:
 
                 with st.container(border=True):
                     st.markdown("### Display")
-                    min_ret_input = st.number_input(
-                        "Minimum net return % to display in tables",
-                        value=float(st.session_state.get("settings_min_net_return_pct", min_ret_val)),
-                        min_value=0.0,
-                        step=1.0,
-                        key="settings_min_net_return_pct",
-                    )
-                    results_grid_limit_input = st.number_input(
-                        "Results/Sweeps grid row limit",
-                        value=int(st.session_state.get("settings_results_grid_limit", results_grid_limit_val)),
-                        min_value=100,
-                        max_value=10000,
-                        step=100,
-                        help="Max rows loaded for the Results page and Sweeps → Runs table. Higher values can slow down rendering.",
-                        key="settings_results_grid_limit",
-                    )
 
                     tz_common = [
                         "Australia/Brisbane",
@@ -18286,8 +18813,6 @@ def main() -> None:
                 set_setting(conn, "fee_spot_pct", float(fee_spot_input))
                 set_setting(conn, "fee_perps_pct", float(fee_perps_input))
                 set_setting(conn, "fee_stocks_pct", float(fee_stocks_input))
-                set_setting(conn, "min_net_return_pct", float(min_ret_input))
-                set_setting(conn, "results_grid_limit", int(results_grid_limit_input))
                 set_setting(conn, "jobs_refresh_seconds", float(jobs_refresh_input))
                 set_setting(conn, "prefer_bbo_maker", bool(prefer_bbo_input))
                 set_setting(conn, "bbo_queue_level", int(bbo_level_input))
@@ -18304,9 +18829,10 @@ def main() -> None:
             # Preload sweeps list for optional filtering (lightweight columns only)
             sweep_rows = []
             try:
-                sweep_rows = conn.execute(
-                    "SELECT id, name FROM sweeps ORDER BY created_at DESC LIMIT 200"
-                ).fetchall()
+                with open_db_connection(read_only=True) as sweeps_conn:
+                    sweep_rows = sweeps_conn.execute(
+                        "SELECT id, name FROM sweeps ORDER BY created_at DESC LIMIT 200"
+                    ).fetchall()
                 sweep_rows = [dict(r) for r in sweep_rows or []]
             except Exception:
                 sweep_rows = []
@@ -18509,13 +19035,72 @@ def main() -> None:
             exchange_id_assets = str(selected_exchange or "").strip() or "woo"
 
             # --- Assets table + status controls ------------------------
-            assets_rows = []
+            if "assets_page" not in st.session_state:
+                st.session_state["assets_page"] = 1
+            if "assets_page_size" not in st.session_state:
+                st.session_state["assets_page_size"] = 200
+            if "assets_filter_model" not in st.session_state:
+                st.session_state["assets_filter_model"] = None
+            if "assets_sort_model" not in st.session_state:
+                st.session_state["assets_sort_model"] = None
+
+            def _reset_assets_page() -> None:
+                st.session_state["assets_page"] = 1
+
+            # --- Categories + membership manager (grouped) -------------
+            cats = []
             try:
-                assets_rows = list_assets(str(user_id or "").strip() or "admin@local", exchange_id_assets, status="all")
+                cats = list_categories(str(user_id or "").strip() or "admin@local", exchange_id_assets)
+            except Exception:
+                cats = []
+
+            category_labels = [str(c.get("name") or "").strip() for c in cats if str(c.get("name") or "").strip()]
+            category_filter_opts = ["All"] + category_labels
+            chosen_category = st.selectbox(
+                "Category filter",
+                options=category_filter_opts,
+                index=0,
+                key="assets_category_filter",
+                on_change=_reset_assets_page,
+            )
+            category_filter = None if chosen_category == "All" else chosen_category
+
+            search_text = st.text_input(
+                "Search",
+                value=str(st.session_state.get("assets_search_text") or ""),
+                key="assets_search_text",
+                on_change=_reset_assets_page,
+            )
+
+            page_size_options = [50, 100, 200, 500]
+            page_size = int(st.session_state.get("assets_page_size") or 200)
+            if page_size not in page_size_options:
+                page_size_options.append(page_size)
+                page_size_options = sorted(set(page_size_options))
+            page = int(st.session_state.get("assets_page") or 1)
+
+            assets_rows = []
+            total_assets = 0
+            try:
+                with open_db_connection(read_only=True) as _assets_conn:
+                    assets_rows, total_assets = list_assets_server_side(
+                        conn=_assets_conn,
+                        user_id=str(user_id or "").strip() or "admin@local",
+                        exchange_id=exchange_id_assets,
+                        page=page,
+                        page_size=page_size,
+                        filter_model=st.session_state.get("assets_filter_model"),
+                        sort_model=st.session_state.get("assets_sort_model"),
+                        category_name=category_filter,
+                        search_text=search_text,
+                        status="all",
+                    )
             except Exception:
                 assets_rows = []
+                total_assets = 0
 
             left_a, right_a = st.columns([2, 1])
+            sym_rows: list[dict[str, Any]] = []
             with left_a:
                 with st.container(border=True):
                     st.markdown("### Assets")
@@ -18526,7 +19111,90 @@ def main() -> None:
                                 lambda v: ", ".join(v) if isinstance(v, list) else str(v or "")
                             )
                         show_cols = [c for c in ["symbol", "base_asset", "quote_asset", "status", "categories"] if c in df_assets.columns]
-                        st.dataframe(df_assets[show_cols], hide_index=True, width="stretch")
+
+                        use_enterprise = bool(os.environ.get("AGGRID_ENTERPRISE"))
+                        df_assets_view = df_assets[show_cols].copy()
+                        gb_assets = GridOptionsBuilder.from_dataframe(df_assets_view)
+                        gb_assets.configure_default_column(filter=True, sortable=True, resizable=True)
+                        gb_assets.configure_grid_options(
+                            headerHeight=44,
+                            rowHeight=34,
+                            suppressRowHoverHighlight=False,
+                            animateRows=False,
+                        )
+                        if "symbol" in df_assets.columns:
+                            gb_assets.configure_column("symbol", headerName="Symbol", width=160)
+                        if "base_asset" in df_assets.columns:
+                            gb_assets.configure_column("base_asset", headerName="Base", width=120)
+                        if "quote_asset" in df_assets.columns:
+                            gb_assets.configure_column("quote_asset", headerName="Quote", width=120)
+                        if "status" in df_assets.columns:
+                            gb_assets.configure_column("status", headerName="Status", width=110)
+                        if "categories" in df_assets.columns:
+                            gb_assets.configure_column("categories", headerName="Categories", width=200)
+
+                        grid_assets = AgGrid(
+                            df_assets_view,
+                            gridOptions=gb_assets.build(),
+                            update_mode=GridUpdateMode.MODEL_CHANGED,
+                            data_return_mode=DataReturnMode.AS_INPUT,
+                            fit_columns_on_grid_load=False,
+                            allow_unsafe_jscode=True,
+                            enable_enterprise_modules=use_enterprise,
+                            theme="dark",
+                            custom_css=_aggrid_dark_custom_css(),
+                            height=480,
+                            key="assets_grid_v1",
+                        )
+
+                        grid_filter_model, grid_sort_model = _extract_aggrid_models(grid_assets)
+                        if grid_filter_model is not None or grid_sort_model is not None:
+                            if grid_filter_model != st.session_state.get("assets_filter_model") or grid_sort_model != st.session_state.get("assets_sort_model"):
+                                st.session_state["assets_filter_model"] = grid_filter_model
+                                st.session_state["assets_sort_model"] = grid_sort_model
+                                st.session_state["assets_page"] = 1
+                                st.rerun()
+
+                        max_page = max(1, math.ceil(int(total_assets or 0) / float(page_size))) if total_assets else 1
+                        if page > max_page:
+                            st.session_state["assets_page"] = max_page
+                            st.rerun()
+
+                        pager = st.columns([1, 1, 2, 2, 2])
+                        with pager[0]:
+                            if st.button("← Prev", key="assets_prev", disabled=page <= 1):
+                                st.session_state["assets_page"] = max(1, page - 1)
+                                st.rerun()
+                        with pager[1]:
+                            if st.button("Next →", key="assets_next", disabled=page >= max_page):
+                                st.session_state["assets_page"] = min(max_page, page + 1)
+                                st.rerun()
+                        with pager[2]:
+                            st.caption(f"Page {page} / {max_page}")
+                        with pager[3]:
+                            st.caption(f"Total rows: {int(total_assets)}")
+                        with pager[4]:
+                            st.selectbox(
+                                "Page size",
+                                options=page_size_options,
+                                index=page_size_options.index(int(page_size)),
+                                key="assets_page_size",
+                                on_change=_reset_assets_page,
+                                label_visibility="collapsed",
+                            )
+
+                        if st.checkbox("Show assets grid debug", value=False, key="assets_debug_grid"):
+                            st.json(
+                                {
+                                    "page": page,
+                                    "page_size": page_size,
+                                    "total": int(total_assets),
+                                    "category": category_filter,
+                                    "search_text": search_text,
+                                    "filter_model": st.session_state.get("assets_filter_model"),
+                                    "sort_model": st.session_state.get("assets_sort_model"),
+                                }
+                            )
                     else:
                         st.info("No assets stored yet. Add a symbol below or run a backtest to seed assets.")
 
@@ -18544,7 +19212,11 @@ def main() -> None:
 
                 with st.container(border=True):
                     st.markdown("### Enable / disable")
-                    sym_opts = [str(r.get("symbol") or "") for r in (assets_rows or []) if str(r.get("symbol") or "").strip()]
+                    try:
+                        sym_rows = list_asset_symbols(exchange_id_assets, status="all")
+                    except Exception:
+                        sym_rows = []
+                    sym_opts = [str(r.get("symbol") or "") for r in (sym_rows or []) if str(r.get("symbol") or "").strip()]
                     chosen = st.multiselect("Symbols", options=sorted(set(sym_opts)), key="assets_status_symbols")
                     c1, c2 = st.columns(2)
                     if c1.button("Enable", key="assets_enable"):
@@ -18561,13 +19233,6 @@ def main() -> None:
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Failed: {exc}")
-
-            # --- Categories + membership manager (grouped) -------------
-            cats = []
-            try:
-                cats = list_categories(str(user_id or "").strip() or "admin@local", exchange_id_assets)
-            except Exception:
-                cats = []
 
             cat_left, cat_right = st.columns([2, 1])
             with cat_left:
@@ -18607,7 +19272,7 @@ def main() -> None:
 
                         active_assets = [
                             str(r.get("symbol") or "")
-                            for r in (assets_rows or [])
+                            for r in (sym_rows or [])
                             if str(r.get("status") or "").strip().lower() == "active"
                         ]
                         active_assets = sorted(set([s for s in active_assets if s.strip()]))

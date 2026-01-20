@@ -11,6 +11,7 @@ import re
 import threading
 import requests
 import uuid
+import logging
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -21,6 +22,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_
 from uuid import uuid4
 
 from project_dragon.observability import profile_span
+
+logger = logging.getLogger(__name__)
 
 try:
     import psycopg  # type: ignore
@@ -57,12 +60,21 @@ class DbErrors:
     OperationalError = _DB_OPERATIONAL_ERRORS
     IntegrityError = _DB_INTEGRITY_ERRORS
 
+
+def _rollback_quietly(conn: Any) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
 if TYPE_CHECKING:
     from project_dragon.domain import BacktestResult, Candle
 
 _DB_INIT_LOCK = threading.Lock()
 _DB_INITIALIZED_FOR: Optional[str] = None
 _DB_INITIALIZED_VERSION: Optional[int] = None
+_AUTO_MIGRATE_WARNED: bool = False
+_SCHEMA_DDL_ALLOWED: bool = False
 
 
 DEFAULT_USER_EMAIL = "admin@local"
@@ -74,6 +86,51 @@ _UNSET: object = object()
 def get_database_url() -> Optional[str]:
     raw = (os.getenv("DRAGON_DATABASE_URL") or "").strip()
     return raw or None
+
+
+def _truthy_env(var_name: str) -> bool:
+    return (os.getenv(var_name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _auto_migrate_enabled() -> bool:
+    global _AUTO_MIGRATE_WARNED
+    env = (os.getenv("DRAGON_ENV") or "prod").strip().lower()
+    auto = _truthy_env("DRAGON_AUTO_MIGRATE")
+    if env == "prod" and auto:
+        if not _AUTO_MIGRATE_WARNED:
+            logger.warning("DRAGON_AUTO_MIGRATE ignored in prod")
+            _AUTO_MIGRATE_WARNED = True
+        return False
+    return env == "dev" and auto
+
+
+@contextmanager
+def _allow_schema_ddl() -> Iterator[None]:
+    global _SCHEMA_DDL_ALLOWED
+    prev = _SCHEMA_DDL_ALLOWED
+    _SCHEMA_DDL_ALLOWED = True
+    try:
+        yield
+    finally:
+        _SCHEMA_DDL_ALLOWED = prev
+
+
+def _try_acquire_migration_lock(conn: Any) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT pg_try_advisory_lock(hashtext(%s))",
+            ("project_dragon_migrations",),
+        ).fetchone()
+        return bool(row[0]) if row else False
+    except Exception:
+        return False
+
+
+def _release_migration_lock(conn: Any) -> None:
+    try:
+        conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("project_dragon_migrations",))
+    except Exception:
+        pass
 
 
 def is_postgres_dsn(dsn: Optional[str]) -> bool:
@@ -107,6 +164,7 @@ class PostgresConnectionAdapter:
         self._conn.close()
 
     def __enter__(self):
+        _log_tx_state(self._conn, "tx_enter")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -121,6 +179,7 @@ class PostgresConnectionAdapter:
             self.close()
         except Exception:
             pass
+        _log_tx_state(self._conn, "tx_exit")
 
 
 class PostgresConnectionAdapterV3:
@@ -148,6 +207,7 @@ class PostgresConnectionAdapterV3:
         self._conn.close()
 
     def __enter__(self):
+        _log_tx_state(self._conn, "tx_enter")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -162,6 +222,7 @@ class PostgresConnectionAdapterV3:
             self.close()
         except Exception:
             pass
+        _log_tx_state(self._conn, "tx_exit")
 
 
 def is_postgres(conn: Any) -> bool:
@@ -213,6 +274,63 @@ def execute_fetchall(conn: Any, sql: str, params: Optional[Sequence[Any]] = None
     return fetchall_dicts(cur)
 
 
+def _raw_conn_execute(raw_conn: Any, sql: str) -> None:
+    try:
+        if hasattr(raw_conn, "execute"):
+            raw_conn.execute(sql)
+            return
+    except Exception:
+        raise
+    cur = raw_conn.cursor()
+    cur.execute(sql)
+
+
+def _configure_session_timeouts(raw_conn: Any) -> None:
+    try:
+        _raw_conn_execute(raw_conn, "SET statement_timeout = '30s'")
+        _raw_conn_execute(raw_conn, "SET idle_in_transaction_session_timeout = '30s'")
+    except Exception:
+        pass
+
+
+def _configure_read_only(raw_conn: Any) -> None:
+    try:
+        _raw_conn_execute(raw_conn, "SET default_transaction_read_only = on")
+    except Exception:
+        pass
+
+
+def _tx_status_label(raw_conn: Any) -> str:
+    try:
+        if psycopg is not None and isinstance(raw_conn, getattr(psycopg, "Connection", object)):
+            status = getattr(raw_conn, "info", None)
+            if status is not None:
+                return str(getattr(status, "transaction_status", "unknown"))
+    except Exception:
+        pass
+    try:
+        if psycopg2 is not None:
+            status = raw_conn.get_transaction_status()
+            return str(status)
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _log_tx_state(raw_conn: Any, event: str) -> None:
+    if (os.environ.get("DRAGON_DB_TX_DEBUG") or os.environ.get("DRAGON_DEBUG") or "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    try:
+        logger.debug("db_tx.%s status=%s", event, _tx_status_label(raw_conn))
+    except Exception:
+        pass
+
+
 def open_postgres_connection(dsn: str) -> Any:
     if psycopg is not None:
         conn = psycopg.connect(str(dsn))
@@ -220,11 +338,19 @@ def open_postgres_connection(dsn: str) -> Any:
             conn.autocommit = False
         except Exception:
             pass
+        try:
+            _configure_session_timeouts(conn)
+        except Exception:
+            pass
         return conn
     if psycopg2 is not None:
         conn = psycopg2.connect(str(dsn))
         try:
             conn.autocommit = False
+        except Exception:
+            pass
+        try:
+            _configure_session_timeouts(conn)
         except Exception:
             pass
         return conn
@@ -247,9 +373,13 @@ def sql_placeholders(conn: Any, count: int) -> str:
 
 
 def db_execute(conn: Any, sql: str, params: Optional[Sequence[Any]] = None):
-    if params is None:
-        return conn.execute(sql)
-    return conn.execute(sql, params)
+    try:
+        if params is None:
+            return conn.execute(sql)
+        return conn.execute(sql, params)
+    except Exception:
+        _rollback_quietly(conn)
+        raise
 
 
 def execute_optional(conn: Any, sql: str, params: Optional[Sequence[Any]] = None) -> None:
@@ -526,7 +656,7 @@ def _migration_0001_core_schema(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep_created_at ON backtest_runs(sweep_id, created_at)"
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_sweeps_created_at ON sweeps(created_at)")
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_sweeps_created_at ON sweeps(created_at)")
 
     # Optional multi-user performance index for sweeps list.
     # (Safe even if the column doesn't exist yet; `_ensure_schema` will add it.)
@@ -968,16 +1098,82 @@ def _migration_0005_jsonb_columns(conn: Any) -> None:
             )
 
 
+def _migration_0006_candles_cache_timestamp_bigint(conn: Any) -> None:
+    if not _table_exists(conn, "candles_cache"):
+        return
+    try:
+        conn.execute("ALTER TABLE candles_cache ALTER COLUMN timestamp_ms TYPE BIGINT")
+    except Exception:
+        pass
+
+
+def _migration_0007_backtest_runs_indexes(conn: Any) -> None:
+    if not _table_exists(conn, "backtest_runs"):
+        return
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_backtest_runs_created_at ON backtest_runs(created_at DESC)")
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol_tf_created ON backtest_runs(symbol, timeframe, created_at DESC)",
+    )
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy_created ON backtest_runs(strategy_name, created_at DESC)",
+    )
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep_created ON backtest_runs(sweep_id, created_at DESC)",
+    )
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_sweep_id ON backtest_runs(sweep_id)",
+    )
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_backtest_runs_net_profit ON backtest_runs(net_profit)")
+    # Expression index for run_key (jsonb)
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_key ON backtest_runs ((metadata_jsonb->>'run_key'))",
+    )
+
+
+def _migration_0008_jobs_indexes(conn: Any) -> None:
+    if not _table_exists(conn, "jobs"):
+        return
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_jobs_sweep_type_status ON jobs(sweep_id, job_type, status)",
+    )
+
+
+def _migration_0009_sweeps_indexes(conn: Any) -> None:
+    if not _table_exists(conn, "sweeps"):
+        return
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_sweeps_created_at ON sweeps(created_at)")
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_sweeps_user_created ON sweeps(user_id, created_at)")
+
+
+def _migration_0010_assets_indexes(conn: Any) -> None:
+    if not _table_exists(conn, "assets"):
+        return
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_assets_updated_at ON assets(updated_at)")
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_assets_symbol ON assets(symbol)")
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_assets_base_asset ON assets(base_asset)")
+
+
 _MIGRATIONS: list[tuple[int, str, Any]] = [
     (1, "core_schema", _migration_0001_core_schema),
     (2, "backtest_run_details", _migration_0002_backtest_run_details),
     (3, "exchange_state_snapshots", _migration_0003_exchange_state_snapshots),
     (4, "backtest_run_details_artifacts", _migration_0004_backtest_run_details_artifacts),
     (5, "jsonb_columns", _migration_0005_jsonb_columns),
+    (6, "candles_cache_timestamp_bigint", _migration_0006_candles_cache_timestamp_bigint),
+    (7, "backtest_runs_indexes", _migration_0007_backtest_runs_indexes),
+    (8, "jobs_indexes", _migration_0008_jobs_indexes),
+    (9, "sweeps_indexes", _migration_0009_sweeps_indexes),
+    (10, "assets_indexes", _migration_0010_assets_indexes),
 ]
 
 
-def apply_migrations(conn: Any) -> None:
+def apply_migrations(conn: Any, *, use_lock: bool = True) -> None:
     """Apply any pending schema migrations."""
     def _tx_context() -> Any:
         tx = getattr(conn, "transaction", None)
@@ -996,44 +1192,47 @@ def apply_migrations(conn: Any) -> None:
         return _fallback()
 
     _ensure_schema_migrations(conn)
-    conn.execute("SELECT pg_advisory_lock(hashtext(%s))", ("project_dragon_migrations",))
+    if use_lock:
+        conn.execute("SELECT pg_advisory_lock(hashtext(%s))", ("project_dragon_migrations",))
     try:
-        applied = {
-            int(r[0])
-            for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-        }
-        for version, name, fn in _MIGRATIONS:
-            if int(version) in applied:
-                continue
-            with _tx_context():
-                fn(conn)
-                conn.execute(
-                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (%s, %s, %s)",
-                    (int(version), str(name), now_utc_iso()),
+        with _allow_schema_ddl():
+            applied = {
+                int(r[0])
+                for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+            }
+            for version, name, fn in _MIGRATIONS:
+                if int(version) in applied:
+                    continue
+                with _tx_context():
+                    fn(conn)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (%s, %s, %s)",
+                        (int(version), str(name), now_utc_iso()),
+                    )
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(1) AS c, MAX(version) AS max_v FROM schema_migrations"
+                ).fetchone()
+            except Exception as exc:
+                raise RuntimeError("schema_migrations check failed") from exc
+            if not row:
+                raise RuntimeError("schema_migrations check failed: no rows")
+            try:
+                count = int(row[0] or 0)
+                max_v = int(row[1] or 0)
+            except Exception as exc:
+                raise RuntimeError("schema_migrations check failed: unreadable rows") from exc
+            expected_max = max(v for v, _name, _fn in _MIGRATIONS)
+            if count < len(_MIGRATIONS) or max_v < expected_max:
+                raise RuntimeError(
+                    f"schema_migrations check failed: count={count} max={max_v} expected_max={expected_max}"
                 )
-        try:
-            row = conn.execute(
-                "SELECT COUNT(1) AS c, MAX(version) AS max_v FROM schema_migrations"
-            ).fetchone()
-        except Exception as exc:
-            raise RuntimeError("schema_migrations check failed") from exc
-        if not row:
-            raise RuntimeError("schema_migrations check failed: no rows")
-        try:
-            count = int(row[0] or 0)
-            max_v = int(row[1] or 0)
-        except Exception as exc:
-            raise RuntimeError("schema_migrations check failed: unreadable rows") from exc
-        expected_max = max(v for v, _name, _fn in _MIGRATIONS)
-        if count < len(_MIGRATIONS) or max_v < expected_max:
-            raise RuntimeError(
-                f"schema_migrations check failed: count={count} max={max_v} expected_max={expected_max}"
-            )
     finally:
-        conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("project_dragon_migrations",))
+        if use_lock:
+            conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", ("project_dragon_migrations",))
 
 
-def open_db_connection(*_args: Any, **_kwargs: Any) -> Any:
+def open_db_connection(*_args: Any, read_only: bool = False, **_kwargs: Any) -> Any:
     """Open a configured Postgres connection for Project Dragon."""
 
     dsn = get_database_url()
@@ -1043,6 +1242,16 @@ def open_db_connection(*_args: Any, **_kwargs: Any) -> Any:
         )
     _init_postgres_db(str(dsn))
     raw_conn = open_postgres_connection(str(dsn))
+    try:
+        _configure_session_timeouts(raw_conn)
+        if read_only:
+            try:
+                raw_conn.autocommit = True
+            except Exception:
+                pass
+            _configure_read_only(raw_conn)
+    except Exception:
+        pass
     if psycopg is not None and isinstance(raw_conn, getattr(psycopg, "Connection", object)):
         return PostgresConnectionAdapterV3(raw_conn)
     return PostgresConnectionAdapter(raw_conn)
@@ -1451,6 +1660,8 @@ def _init_postgres_db(dsn: str) -> str:
     except Exception:
         latest_version = 0
 
+    if not _auto_migrate_enabled():
+        return dsn
     if (
         _DB_INITIALIZED_FOR is not None
         and _DB_INITIALIZED_FOR == key
@@ -1460,6 +1671,8 @@ def _init_postgres_db(dsn: str) -> str:
         return dsn
 
     with _DB_INIT_LOCK:
+        if not _auto_migrate_enabled():
+            return dsn
         if (
             _DB_INITIALIZED_FOR is not None
             and _DB_INITIALIZED_FOR == key
@@ -1474,7 +1687,11 @@ def _init_postgres_db(dsn: str) -> str:
         else:
             conn = PostgresConnectionAdapter(raw_conn)
         try:
-            apply_migrations(conn)
+            if not _try_acquire_migration_lock(conn):
+                logger.debug("Auto-migrate skipped: lock unavailable")
+                return dsn
+            apply_migrations(conn, use_lock=False)
+            _release_migration_lock(conn)
             try:
                 row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
                 _DB_INITIALIZED_VERSION = int(row[0] or 0) if row else 0
@@ -1533,7 +1750,30 @@ def _db_add_column_if_missing(
         raise
 
 
+def _is_tx_read_only(conn: Any) -> bool:
+    try:
+        cur = conn.execute("SHOW transaction_read_only")
+        row = cur.fetchone() if cur is not None else None
+        if row is None:
+            return False
+        try:
+            val = row[0]
+        except Exception:
+            val = row
+        return str(val or "").strip().lower() in {"on", "true", "1"}
+    except Exception:
+        return False
+
+
 def _ensure_schema(conn: Any) -> None:
+    if not _auto_migrate_enabled() and not _SCHEMA_DDL_ALLOWED:
+        return
+    if _is_tx_read_only(conn):
+        logger.debug("Skipping schema ensure for read-only transaction")
+        return
+    if not _try_acquire_migration_lock(conn):
+        logger.debug("Skipping schema ensure: lock unavailable")
+        return
     ph = sql_placeholder(conn)
     # Core identity + credentials tables.
     conn.execute(
@@ -1602,7 +1842,7 @@ def _ensure_schema(conn: Any) -> None:
             market_type TEXT NOT NULL,
             symbol TEXT NOT NULL,
             timeframe TEXT NOT NULL,
-            timestamp_ms INTEGER NOT NULL,
+            timestamp_ms BIGINT NOT NULL,
             open REAL NOT NULL,
             high REAL NOT NULL,
             low REAL NOT NULL,
@@ -2509,6 +2749,7 @@ def _ensure_schema(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_account_state_snapshots_exchange_updated ON account_state_snapshots(exchange_id, updated_at DESC)"
     )
+    _release_migration_lock(conn)
 
 
 def _get_conn() -> Any:
@@ -2846,8 +3087,7 @@ def list_assets(
     if st_norm not in {"active", "disabled", "all"}:
         st_norm = "active"
 
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
 
         # One query: assets + a comma-separated list of category names for this user.
         rows = execute_fetchall(
@@ -2889,11 +3129,214 @@ def list_assets(
     return out
 
 
+def list_asset_symbols(
+    exchange_id: str,
+    *,
+    status: str = "all",
+    conn: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    ex_id = (exchange_id or "").strip()
+    if not ex_id:
+        return []
+    st_norm = (status or "").strip().lower() or "all"
+    if st_norm not in {"active", "disabled", "all"}:
+        st_norm = "all"
+
+    owns_conn = conn is None
+    connection = conn or open_db_connection(read_only=True)
+    try:
+        params: list[Any] = [ex_id]
+        where = "WHERE exchange_id = %s"
+        if st_norm != "all":
+            where += " AND status = %s"
+            params.append(st_norm)
+        rows = execute_fetchall(
+            connection,
+            f"SELECT symbol, status FROM assets {where} ORDER BY symbol ASC",
+            tuple(params),
+        )
+        return [dict(r) for r in rows or []]
+    finally:
+        if owns_conn:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
+def list_assets_server_side(
+    *,
+    user_id: str,
+    exchange_id: str,
+    page: int,
+    page_size: int,
+    sort_model: Optional[List[Dict[str, Any]]] = None,
+    filter_model: Optional[Dict[str, Any]] = None,
+    category_id: Optional[int] = None,
+    category_name: Optional[str] = None,
+    search_text: Optional[str] = None,
+    status: str = "all",
+    conn: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    ex_id = (exchange_id or "").strip()
+    st_norm = (status or "").strip().lower() or "all"
+    if st_norm not in {"active", "disabled", "all"}:
+        st_norm = "all"
+
+    if not ex_id:
+        return [], 0
+
+    def _order_sql(model: Optional[List[Dict[str, Any]]]) -> str:
+        allowed_sort = {
+            "id": {"sql": "a.id"},
+            "exchange_id": {"sql": "a.exchange_id"},
+            "symbol": {"sql": "a.symbol"},
+            "base_asset": {"sql": "a.base_asset"},
+            "quote_asset": {"sql": "a.quote_asset"},
+            "status": {"sql": "a.status"},
+            "created_at": {"sql": "a.created_at"},
+            "updated_at": {"sql": "a.updated_at"},
+            "categories": {"sql": "categories_csv"},
+        }
+        if not isinstance(model, list) or not model:
+            return "ORDER BY a.updated_at DESC, a.id ASC"
+        order_parts: list[str] = []
+        for item in model:
+            if not isinstance(item, dict):
+                continue
+            col = item.get("colId") or item.get("field")
+            if col not in allowed_sort:
+                continue
+            sql_expr = allowed_sort[col].get("sql")
+            if not sql_expr:
+                continue
+            direction = str(item.get("sort") or "desc").lower()
+            if direction not in {"asc", "desc"}:
+                direction = "desc"
+            order_parts.append(f"{sql_expr} {direction.upper()}")
+        if not order_parts:
+            return "ORDER BY a.updated_at DESC, a.id ASC"
+        return "ORDER BY " + ", ".join(order_parts)
+
+    owns_conn = conn is None
+    connection = conn or open_db_connection(read_only=True)
+    try:
+        allowed_filters = {
+            "id": {"type": "number", "sql": "a.id"},
+            "exchange_id": {"type": "text", "sql": "a.exchange_id"},
+            "symbol": {"type": "text", "sql": "a.symbol"},
+            "base_asset": {"type": "text", "sql": "a.base_asset"},
+            "quote_asset": {"type": "text", "sql": "a.quote_asset"},
+            "status": {"type": "text", "sql": "a.status"},
+            "created_at": {"type": "date", "sql": "a.created_at"},
+            "updated_at": {"type": "date", "sql": "a.updated_at"},
+            "categories": {"type": "text", "sql": "c.name"},
+            "category": {"type": "text", "sql": "c.name"},
+            "category_name": {"type": "text", "sql": "c.name"},
+            "name": {"type": "text", "sql": "COALESCE(a.base_asset, a.symbol)"},
+        }
+
+        where_parts: list[str] = ["a.exchange_id = %s"]
+        params: list[Any] = [ex_id]
+
+        if st_norm != "all":
+            where_parts.append("a.status = %s")
+            params.append(st_norm)
+
+        if category_id is not None:
+            where_parts.append("m.category_id = %s")
+            params.append(int(category_id))
+
+        if category_name:
+            where_parts.append("LOWER(c.name) = LOWER(%s)")
+            params.append(str(category_name))
+
+        if search_text:
+            s = str(search_text).strip()
+            if s:
+                like = f"%{s}%"
+                where_parts.append(
+                    "(a.symbol ILIKE %s OR a.base_asset ILIKE %s OR a.quote_asset ILIKE %s OR c.name ILIKE %s)"
+                )
+                params.extend([like, like, like, like])
+
+        filt_sql, filt_params = translate_filter_model(filter_model, allowed_filters)
+        if filt_sql:
+            where_parts.append(f"({filt_sql})")
+            params.extend(filt_params)
+
+        where_clause = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+        order_sql = _order_sql(sort_model)
+
+        page_val = max(1, int(page or 1))
+        size_val = max(1, min(int(page_size or 200), 500))
+        offset_val = (page_val - 1) * size_val
+
+        sql = f"""
+            SELECT
+                a.id,
+                a.exchange_id,
+                a.symbol,
+                a.base_asset,
+                a.quote_asset,
+                a.status,
+                a.created_at,
+                a.updated_at,
+                COALESCE(STRING_AGG(DISTINCT c.name, ','), '') AS categories_csv
+            FROM assets a
+            LEFT JOIN asset_category_membership m
+                ON m.exchange_id = a.exchange_id
+                AND m.symbol = a.symbol
+                AND m.user_id = %s
+            LEFT JOIN asset_categories c
+                ON c.id = m.category_id
+                AND c.user_id = m.user_id
+                AND c.exchange_id = m.exchange_id
+            {where_clause}
+            GROUP BY a.id
+            {order_sql}
+            LIMIT %s OFFSET %s
+        """
+
+        data_params = [uid] + list(params) + [size_val, offset_val]
+        rows = execute_fetchall(connection, sql, tuple(data_params))
+
+        count_sql = f"""
+            SELECT COUNT(DISTINCT a.id)
+            FROM assets a
+            LEFT JOIN asset_category_membership m
+                ON m.exchange_id = a.exchange_id
+                AND m.symbol = a.symbol
+                AND m.user_id = %s
+            LEFT JOIN asset_categories c
+                ON c.id = m.category_id
+                AND c.user_id = m.user_id
+                AND c.exchange_id = m.exchange_id
+            {where_clause}
+        """
+        total_row = connection.execute(count_sql, tuple([uid] + list(params))).fetchone()
+        total_count = int(total_row[0] or 0) if total_row else 0
+
+        out: list[Dict[str, Any]] = []
+        for r in rows or []:
+            d = dict(r)
+            cats = [c.strip() for c in str(d.get("categories_csv") or "").split(",") if c.strip()]
+            d["categories"] = cats
+            out.append(d)
+        return out, int(total_count)
+    finally:
+        if owns_conn:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 def list_categories(user_id: str, exchange_id: str) -> List[Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     ex_id = (exchange_id or "").strip()
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
         rows = execute_fetchall(
             conn,
             """
@@ -2985,8 +3428,7 @@ def get_category_symbols(user_id: str, exchange_id: str, category_id: int) -> Li
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     ex_id = (exchange_id or "").strip()
     cid = int(category_id)
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
         rows = execute_fetchall(
             conn,
             """
@@ -3660,12 +4102,16 @@ def delete_runs_and_children(
     }
 
 
-def list_sweeps(limit: int = 100, offset: int = 0) -> List[Dict]:
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+def list_sweeps(limit: int = 100, offset: int = 0, *, conn: Optional[Any] = None) -> List[Dict]:
+    def _is_db_conn(obj: Any) -> bool:
+        return bool(obj is not None and hasattr(obj, "execute"))
+
+    connection = conn if _is_db_conn(conn) else open_db_connection(read_only=True)
+    owns_conn = connection is not conn
+    try:
         with profile_span("db.list_sweeps", meta={"limit": int(limit), "offset": int(offset)}):
             rows = execute_fetchall(
-                conn,
+                connection,
                 """
                 SELECT * FROM sweeps
                 ORDER BY created_at DESC
@@ -3673,7 +4119,18 @@ def list_sweeps(limit: int = 100, offset: int = 0) -> List[Dict]:
                 """,
                 (limit, offset),
             )
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
+    finally:
+        if not owns_conn:
+            try:
+                connection.commit()
+            except Exception:
+                pass
+        if owns_conn:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 def list_sweeps_with_run_counts(
@@ -3682,6 +4139,7 @@ def list_sweeps_with_run_counts(
     filters: Optional[Dict[str, Any]] = None,
     limit: int = 100,
     offset: int = 0,
+    conn: Optional[Any] = None,
 ) -> List[Dict]:
     """List sweeps with a DB-derived run_count per sweep.
 
@@ -3691,10 +4149,11 @@ def list_sweeps_with_run_counts(
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     _ = filters  # reserved for future SQL WHERE clauses
 
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    owns_conn = conn is None
+    connection = conn or open_db_connection(read_only=True)
+    try:
         try:
-            sweep_cols = get_table_columns(conn, "sweeps")
+            sweep_cols = get_table_columns(connection, "sweeps")
         except Exception:
             sweep_cols = set()
 
@@ -3711,6 +4170,7 @@ def list_sweeps_with_run_counts(
             meta={"limit": int(limit), "offset": int(offset), "user_scoped": bool(where_clause)},
         ):
             rows = execute_fetchall(
+                connection,
                 f"""
                 SELECT
                     s.*,
@@ -3729,8 +4189,18 @@ def list_sweeps_with_run_counts(
                 """,
                 tuple(params),
             )
-
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
+    finally:
+        if not owns_conn:
+            try:
+                connection.commit()
+            except Exception:
+                pass
+        if owns_conn:
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 def list_sweep_best_metrics(*, user_id: str) -> List[Dict[str, Any]]:
@@ -3747,8 +4217,7 @@ def list_sweep_best_metrics(*, user_id: str) -> List[Dict[str, Any]]:
 
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
 
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
 
         try:
             run_cols = get_table_columns(conn, "backtest_runs")
@@ -3800,8 +4269,7 @@ def get_sweep_run_count(*, user_id: str, sweep_id: str) -> int:
     if not sid:
         return 0
 
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
         row = execute_fetchone(
             conn,
             "SELECT COUNT(*) AS c FROM backtest_runs WHERE sweep_id = %s",
@@ -3814,15 +4282,13 @@ def get_sweep_run_count(*, user_id: str, sweep_id: str) -> int:
 
 
 def get_sweep(sweep_id: str) -> Optional[Dict]:
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
         row = execute_fetchone(conn, "SELECT * FROM sweeps WHERE id = %s", (sweep_id,))
     return dict(row) if row else None
 
 
 def list_runs_for_sweep(sweep_id: str) -> List[Dict]:
-    with _get_conn() as conn:
-        _ensure_schema(conn)
+    with open_db_connection(read_only=True) as conn:
         with profile_span("db.list_runs_for_sweep", meta={"sweep_id": str(sweep_id)}):
             rows = execute_fetchall(
                 conn,
@@ -4044,7 +4510,6 @@ def get_app_settings(conn: Any) -> Dict[str, Any]:
         "fee_perps_pct": 0.06,
         "fee_stocks_pct": 0.10,
         "min_net_return_pct": 20.0,
-        "results_grid_limit": 5000,
         "jobs_refresh_seconds": 2.0,
         "prefer_bbo_maker": True,
         "bbo_queue_level": 1,
@@ -4064,7 +4529,6 @@ def get_app_settings(conn: Any) -> Dict[str, Any]:
     # Backfill Settings-page keys so they persist across restarts even if the
     # user hasn't opened the Settings page yet.
     for k in (
-        "results_grid_limit",
         "jobs_refresh_seconds",
         "prefer_bbo_maker",
         "bbo_queue_level",
@@ -4278,92 +4742,98 @@ def create_job(
     priority: Optional[int] = None,
     is_interactive: Optional[int] = None,
 ) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    payload_json = json.dumps(payload)
-
-    # Backwards compatible: older DBs may not have newer columns.
+    cur = None
     try:
-        job_cols = get_table_columns(conn, "jobs")
-    except Exception:
-        job_cols = set()
+        now = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload)
 
-    cols = ["job_type", "status", "payload_json", "progress", "message", "created_at", "updated_at"]
-    vals: list[Any] = [str(job_type), "queued", payload_json, 0.0, "", now, now]
+        # Backwards compatible: older DBs may not have newer columns.
+        try:
+            job_cols = get_table_columns(conn, "jobs")
+        except Exception:
+            job_cols = set()
 
-    if "job_key" in job_cols:
-        cols.insert(1, "job_key")
-        vals.insert(1, (str(job_key).strip() if job_key is not None else None))
+        cols = ["job_type", "status", "payload_json", "progress", "message", "created_at", "updated_at"]
+        vals: list[Any] = [str(job_type), "queued", payload_json, 0.0, "", now, now]
 
-    if "sweep_id" in job_cols:
-        cols.insert(4 if "job_key" in job_cols else 3, "sweep_id")
-        vals.insert(4 if "job_key" in job_cols else 3, (str(sweep_id) if sweep_id is not None else None))
-    if "run_id" in job_cols:
-        cols.insert(5 if "job_key" in job_cols else 4, "run_id")
-        vals.insert(5 if "job_key" in job_cols else 4, (str(run_id) if run_id is not None else None))
-    if "bot_id" in job_cols:
-        cols.insert(6 if "job_key" in job_cols else 5, "bot_id")
-        vals.insert(6 if "job_key" in job_cols else 5, bot_id)
+        if "job_key" in job_cols:
+            cols.insert(1, "job_key")
+            vals.insert(1, (str(job_key).strip() if job_key is not None else None))
 
-    # Optional planner/group linkage (older DBs may not have these columns).
-    if "parent_job_id" in job_cols:
-        cols.append("parent_job_id")
-        vals.append(int(parent_job_id) if parent_job_id is not None else None)
-    if "group_key" in job_cols:
-        cols.append("group_key")
-        vals.append(str(group_key).strip() if group_key is not None else None)
+        if "sweep_id" in job_cols:
+            cols.insert(4 if "job_key" in job_cols else 3, "sweep_id")
+            vals.insert(4 if "job_key" in job_cols else 3, (str(sweep_id) if sweep_id is not None else None))
+        if "run_id" in job_cols:
+            cols.insert(5 if "job_key" in job_cols else 4, "run_id")
+            vals.insert(5 if "job_key" in job_cols else 4, (str(run_id) if run_id is not None else None))
+        if "bot_id" in job_cols:
+            cols.insert(6 if "job_key" in job_cols else 5, "bot_id")
+            vals.insert(6 if "job_key" in job_cols else 5, bot_id)
 
-    # Optional job scheduling fields.
-    if priority is not None and "priority" in job_cols:
-        cols.append("priority")
-        vals.append(int(priority))
-    if is_interactive is not None and "is_interactive" in job_cols:
-        cols.append("is_interactive")
-        vals.append(1 if int(is_interactive) else 0)
+        # Optional planner/group linkage (older DBs may not have these columns).
+        if "parent_job_id" in job_cols:
+            cols.append("parent_job_id")
+            vals.append(int(parent_job_id) if parent_job_id is not None else None)
+        if "group_key" in job_cols:
+            cols.append("group_key")
+            vals.append(str(group_key).strip() if group_key is not None else None)
 
-    cols_sql = ", ".join(cols)
-    placeholders = sql_placeholders(conn, len(cols))
+        # Optional job scheduling fields.
+        if priority is not None and "priority" in job_cols:
+            cols.append("priority")
+            vals.append(int(priority))
+        if is_interactive is not None and "is_interactive" in job_cols:
+            cols.append("is_interactive")
+            vals.append(1 if int(is_interactive) else 0)
 
-    if is_postgres(conn):
-        if job_key is not None and "job_key" in job_cols:
-            cur = conn.execute(
-                f"""
-                INSERT INTO jobs ({cols_sql})
-                VALUES ({placeholders})
-                ON CONFLICT (job_key) DO NOTHING
-                RETURNING id
-                """,
-                tuple(vals),
-            )
-        else:
-            cur = conn.execute(
-                f"""
-                INSERT INTO jobs ({cols_sql})
-                VALUES ({placeholders})
-                RETURNING id
-                """,
-                tuple(vals),
-            )
-        row = cur.fetchone()
-        conn.commit()
-        if row is not None:
-            return int(row[0])
-    # If ignored due to UNIQUE(job_key), return existing id.
-    if cur.rowcount == 0 and job_key is not None and "job_key" in job_cols:
-        row = conn.execute(
-            f"SELECT id FROM jobs WHERE job_key = {sql_placeholder(conn)} LIMIT 1",
-            (str(job_key).strip(),),
-        ).fetchone()
-        if row is not None:
-            try:
+        cols_sql = ", ".join(cols)
+        placeholders = sql_placeholders(conn, len(cols))
+
+        if is_postgres(conn):
+            if job_key is not None and "job_key" in job_cols:
+                cur = conn.execute(
+                    f"""
+                    INSERT INTO jobs ({cols_sql})
+                    VALUES ({placeholders})
+                    ON CONFLICT (job_key) DO NOTHING
+                    RETURNING id
+                    """,
+                    tuple(vals),
+                )
+            else:
+                cur = conn.execute(
+                    f"""
+                    INSERT INTO jobs ({cols_sql})
+                    VALUES ({placeholders})
+                    RETURNING id
+                    """,
+                    tuple(vals),
+                )
+            row = cur.fetchone()
+            conn.commit()
+            if row is not None:
                 return int(row[0])
+        # If ignored due to UNIQUE(job_key), return existing id.
+        if cur is not None and cur.rowcount == 0 and job_key is not None and "job_key" in job_cols:
+            row = conn.execute(
+                f"SELECT id FROM jobs WHERE job_key = {sql_placeholder(conn)} LIMIT 1",
+                (str(job_key).strip(),),
+            ).fetchone()
+            if row is not None:
+                try:
+                    return int(row[0])
+                except Exception:
+                    pass
+        if cur is not None:
+            try:
+                return int(cur.lastrowid)
             except Exception:
                 pass
-    if cur is not None:
-        try:
-            return int(cur.lastrowid)
-        except Exception:
-            pass
-    raise ValueError("Failed to create job")
+        raise ValueError("Failed to create job")
+    except Exception:
+        _rollback_quietly(conn)
+        logger.exception("create_job failed for job_type=%s job_key=%s", job_type, job_key)
+        raise
 
 
 def create_bot(
@@ -4814,17 +5284,22 @@ def set_bot_credentials(conn: Any, bot_id: int, *, user_id: str, credentials_id:
 def update_job(conn: Any, job_id: int, **fields: Any) -> None:
     if not fields:
         fields = {}
-    now = datetime.now(timezone.utc).isoformat()
-    fields = {**fields, "updated_at": now}
-    columns = []
-    params: list[Any] = []
-    ph = sql_placeholder(conn)
-    for key, value in fields.items():
-        columns.append(f"{key} = {ph}")
-        params.append(value)
-    params.append(job_id)
-    conn.execute(f"UPDATE jobs SET {', '.join(columns)} WHERE id = {ph}", tuple(params))
-    conn.commit()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        fields = {**fields, "updated_at": now}
+        columns = []
+        params: list[Any] = []
+        ph = sql_placeholder(conn)
+        for key, value in fields.items():
+            columns.append(f"{key} = {ph}")
+            params.append(value)
+        params.append(job_id)
+        conn.execute(f"UPDATE jobs SET {', '.join(columns)} WHERE id = {ph}", tuple(params))
+        conn.commit()
+    except Exception:
+        _rollback_quietly(conn)
+        logger.exception("update_job failed for job_id=%s", job_id)
+        raise
 
 
 def list_jobs(conn: Any, limit: int = 200) -> List[Dict[str, Any]]:
@@ -4997,17 +5472,21 @@ def claim_job_with_lease(
                     return get_job(conn, int(row[0]))
                 except Exception:
                     return None
-        except DbErrors.OperationalError:
-            # If RETURNING is not supported, fall back to non-RETURNING approach.
-            pass
+        except DbErrors.OperationalError as exc:
+            _rollback_quietly(conn)
+            logger.debug("claim_job_with_lease RETURNING failed; falling back: %s", exc)
         except Exception:
-            pass
+            _rollback_quietly(conn)
+            logger.exception("claim_job_with_lease failed during initial claim")
+            return None
 
         # Fallback (no RETURNING): select then update.
         try:
             row2 = conn.execute(select_sql, tuple(types)).fetchone()
         except Exception:
-            row2 = None
+            _rollback_quietly(conn)
+            logger.exception("claim_job_with_lease failed selecting queued job")
+            return None
         if not row2:
             return None
         try:
@@ -5016,34 +5495,39 @@ def claim_job_with_lease(
             return None
 
         ph = sql_placeholder(conn)
-        cur2 = conn.execute(
-            f"""
-            UPDATE jobs
-            SET
-              status = 'running',
-              worker_id = {ph},
-              claimed_by = {ph},
-              claimed_at = {ph},
-              lease_expires_at = {ph},
-              last_lease_renew_at = {ph},
-              lease_version = COALESCE(lease_version, 0) + 1,
-              started_at = COALESCE(started_at, {ph}),
-              updated_at = {ph}
-            WHERE id = {ph}
-              AND status = 'queued'
-            """,
-            (
-                str(worker_id),
-                str(worker_id),
-                now_iso,
-                lease_expires_iso,
-                now_iso,
-                now_iso,
-                now_iso,
-                job_id,
-            ),
-        )
-        conn.commit()
+        try:
+            cur2 = conn.execute(
+                f"""
+                UPDATE jobs
+                SET
+                  status = 'running',
+                  worker_id = {ph},
+                  claimed_by = {ph},
+                  claimed_at = {ph},
+                  lease_expires_at = {ph},
+                  last_lease_renew_at = {ph},
+                  lease_version = COALESCE(lease_version, 0) + 1,
+                  started_at = COALESCE(started_at, {ph}),
+                  updated_at = {ph}
+                WHERE id = {ph}
+                  AND status = 'queued'
+                """,
+                (
+                    str(worker_id),
+                    str(worker_id),
+                    now_iso,
+                    lease_expires_iso,
+                    now_iso,
+                    now_iso,
+                    now_iso,
+                    job_id,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            _rollback_quietly(conn)
+            logger.exception("claim_job_with_lease failed updating job %s", job_id)
+            return None
         if cur2.rowcount > 0:
             return get_job(conn, job_id)
 
@@ -5071,129 +5555,134 @@ def bulk_enqueue_backtest_run_jobs(
     """
 
     try:
-        job_cols = get_table_columns(conn, "jobs")
-    except Exception:
-        job_cols = set()
+        try:
+            job_cols = get_table_columns(conn, "jobs")
+        except Exception:
+            job_cols = set()
 
-    created = 0
-    existing = 0
+        created = 0
+        existing = 0
 
-    rows_in = [(str(k).strip(), p, (str(s) if s is not None else None)) for (k, p, s) in (jobs or []) if str(k).strip()]
-    if not rows_in:
-        return {"created": 0, "existing": 0}
+        rows_in = [(str(k).strip(), p, (str(s) if s is not None else None)) for (k, p, s) in (jobs or []) if str(k).strip()]
+        if not rows_in:
+            return {"created": 0, "existing": 0}
 
-    now = now_utc_iso()
+        now = now_utc_iso()
 
-    # No job_key support -> non-idempotent (legacy DB); still enqueue.
-    if "job_key" not in job_cols:
-        for k, payload, sid in rows_in:
-            _ = create_job(
+        # No job_key support -> non-idempotent (legacy DB); still enqueue.
+        if "job_key" not in job_cols:
+            for k, payload, sid in rows_in:
+                _ = create_job(
+                    conn,
+                    "backtest_run",
+                    payload,
+                    sweep_id=sid,
+                    job_key=None,
+                    priority=100,
+                    is_interactive=0,
+                )
+                created += 1
+            return {"created": int(created), "existing": 0}
+
+        keys = [k for k, _p, _sid in rows_in]
+        existing_keys: set[str] = set()
+        chunk = 500
+        for i in range(0, len(keys), chunk):
+            part = keys[i : i + chunk]
+            placeholders = ",".join(["%s"] * len(part))
+            found = execute_fetchall(
                 conn,
-                "backtest_run",
-                payload,
-                sweep_id=sid,
-                job_key=None,
-                priority=100,
-                is_interactive=0,
+                f"SELECT job_key FROM jobs WHERE job_key IN ({placeholders})",
+                tuple(part),
             )
-            created += 1
-        return {"created": int(created), "existing": 0}
+            for r in found or []:
+                try:
+                    existing_keys.add(str(r.get("job_key") or "").strip())
+                except Exception:
+                    continue
 
-    keys = [k for k, _p, _sid in rows_in]
-    existing_keys: set[str] = set()
-    chunk = 500
-    for i in range(0, len(keys), chunk):
-        part = keys[i : i + chunk]
-        placeholders = ",".join(["%s"] * len(part))
-        found = execute_fetchall(
-            conn,
-            f"SELECT job_key FROM jobs WHERE job_key IN ({placeholders})",
-            tuple(part),
-        )
-        for r in found or []:
+        to_insert = [(k, payload, sid) for (k, payload, sid) in rows_in if k not in existing_keys]
+        existing = len(rows_in) - len(to_insert)
+
+        if not to_insert:
+            return {"created": 0, "existing": int(existing)}
+
+        has_parent = "parent_job_id" in job_cols
+        has_group = "group_key" in job_cols
+        has_priority = "priority" in job_cols
+        has_interactive = "is_interactive" in job_cols
+
+        payload_rows: list[tuple[Any, ...]] = []
+        for k, payload, sid in to_insert:
+            # Store job_key + deterministic run_key inside the payload for traceability.
+            # (Safe to add; workers treat payload as opaque.)
             try:
-                existing_keys.add(str(r.get("job_key") or "").strip())
+                if not isinstance(payload, dict):
+                    payload = {}
             except Exception:
-                continue
-
-    to_insert = [(k, payload, sid) for (k, payload, sid) in rows_in if k not in existing_keys]
-    existing = len(rows_in) - len(to_insert)
-
-    if not to_insert:
-        return {"created": 0, "existing": int(existing)}
-
-    has_parent = "parent_job_id" in job_cols
-    has_group = "group_key" in job_cols
-    has_priority = "priority" in job_cols
-    has_interactive = "is_interactive" in job_cols
-
-    payload_rows: list[tuple[Any, ...]] = []
-    for k, payload, sid in to_insert:
-        # Store job_key + deterministic run_key inside the payload for traceability.
-        # (Safe to add; workers treat payload as opaque.)
-        try:
-            if not isinstance(payload, dict):
                 payload = {}
-        except Exception:
-            payload = {}
-        payload = dict(payload)
-        payload.setdefault("job_key", str(k))
-        if sid is not None:
-            payload.setdefault("sweep_id", str(sid))
-        try:
-            payload.setdefault("run_key", compute_run_key(payload))
-        except Exception:
-            # If the payload contains non-serializable values, worker will compute.
-            pass
-        row: list[Any] = [
-            "backtest_run",
-            str(k),
-            "queued",
-            json.dumps(payload),
-            (str(sid) if sid is not None else None),
-            None,
-            None,
-            0.0,
-            "",
-            now,
-            now,
-        ]
+            payload = dict(payload)
+            payload.setdefault("job_key", str(k))
+            if sid is not None:
+                payload.setdefault("sweep_id", str(sid))
+            try:
+                payload.setdefault("run_key", compute_run_key(payload))
+            except Exception:
+                # If the payload contains non-serializable values, worker will compute.
+                pass
+            row: list[Any] = [
+                "backtest_run",
+                str(k),
+                "queued",
+                json.dumps(payload),
+                (str(sid) if sid is not None else None),
+                None,
+                None,
+                0.0,
+                "",
+                now,
+                now,
+            ]
+            if has_parent:
+                row.append(int(parent_job_id) if parent_job_id is not None else None)
+            if has_group:
+                row.append(str(group_key).strip() if group_key is not None else None)
+            if has_interactive:
+                row.append(0)
+            if has_priority:
+                row.append(100)
+            payload_rows.append(tuple(row))
+
+        # Insert only missing keys.
+        cols_sql = "job_type, job_key, status, payload_json, sweep_id, run_id, bot_id, progress, message, created_at, updated_at"
+        placeholders = ", ".join(["%s"] * 11)
         if has_parent:
-            row.append(int(parent_job_id) if parent_job_id is not None else None)
+            cols_sql += ", parent_job_id"
+            placeholders += ", %s"
         if has_group:
-            row.append(str(group_key).strip() if group_key is not None else None)
+            cols_sql += ", group_key"
+            placeholders += ", %s"
         if has_interactive:
-            row.append(0)
+            cols_sql += ", is_interactive"
+            placeholders += ", %s"
         if has_priority:
-            row.append(100)
-        payload_rows.append(tuple(row))
+            cols_sql += ", priority"
+            placeholders += ", %s"
 
-    # Insert only missing keys.
-    cols_sql = "job_type, job_key, status, payload_json, sweep_id, run_id, bot_id, progress, message, created_at, updated_at"
-    placeholders = ", ".join(["%s"] * 11)
-    if has_parent:
-        cols_sql += ", parent_job_id"
-        placeholders += ", %s"
-    if has_group:
-        cols_sql += ", group_key"
-        placeholders += ", %s"
-    if has_interactive:
-        cols_sql += ", is_interactive"
-        placeholders += ", %s"
-    if has_priority:
-        cols_sql += ", priority"
-        placeholders += ", %s"
-
-    conn.executemany(
-        f"""
-        INSERT INTO jobs ({cols_sql})
-        VALUES ({placeholders})
-        """,
-        payload_rows,
-    )
-    conn.commit()
-    created = len(to_insert)
-    return {"created": int(created), "existing": int(existing)}
+        conn.executemany(
+            f"""
+            INSERT INTO jobs ({cols_sql})
+            VALUES ({placeholders})
+            """,
+            payload_rows,
+        )
+        conn.commit()
+        created = len(to_insert)
+        return {"created": int(created), "existing": int(existing)}
+    except Exception:
+        _rollback_quietly(conn)
+        logger.exception("bulk_enqueue_backtest_run_jobs failed")
+        raise
 
 
 def get_sweep_row(conn: Any, sweep_id: str) -> Optional[Dict[str, Any]]:
@@ -8386,7 +8875,7 @@ def load_backtest_runs_explorer_rows(
     - Joins per-user shortlist (optional).
     """
 
-    lim = max(1, min(int(limit or 2000), 10000))
+    lim = max(1, int(limit or 2000))
     uid = (str(user_id).strip() if user_id is not None else "")
     filters = filters or {}
 
@@ -8408,6 +8897,9 @@ def load_backtest_runs_explorer_rows(
         if filters.get("min_net_return_pct") is not None:
             where_clauses.append("r.net_return_pct IS NOT NULL AND r.net_return_pct >= %s")
             filter_params.append(filters.get("min_net_return_pct"))
+        if filters.get("net_return_pct_gt") is not None:
+            where_clauses.append("r.net_return_pct IS NOT NULL AND r.net_return_pct > %s")
+            filter_params.append(filters.get("net_return_pct_gt"))
 
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
@@ -8479,6 +8971,633 @@ def load_backtest_runs_explorer_rows(
 
         rows = execute_fetchall(conn, sql, tuple(params))
         return [dict(r) for r in rows]
+
+
+def _runs_allowed_filter_map(run_cols: set[str]) -> Dict[str, Dict[str, str]]:
+    allow: Dict[str, Dict[str, str]] = {
+        "run_id": {"type": "text", "sql": "r.id"},
+        "created_at": {"type": "date", "sql": "r.created_at"},
+        "symbol": {"type": "text", "sql": "r.symbol"},
+        "timeframe": {"type": "text", "sql": "r.timeframe"},
+        "strategy_name": {"type": "text", "sql": "r.strategy_name"},
+        "strategy_version": {"type": "text", "sql": "r.strategy_version"},
+        "strategy": {"type": "text", "sql": "r.strategy_name"},
+        "market_type": {"type": "text", "sql": "r.market_type"},
+        "market": {"type": "text", "sql": "r.market_type"},
+        "net_profit": {"type": "number", "sql": "r.net_profit"},
+        "net_return_pct": {"type": "number", "sql": "r.net_return_pct"},
+        "roi_pct_on_margin": {"type": "number", "sql": "r.roi_pct_on_margin"},
+        "max_drawdown_pct": {"type": "number", "sql": "r.max_drawdown_pct"},
+        "sharpe": {"type": "number", "sql": "r.sharpe"},
+        "sortino": {"type": "number", "sql": "r.sortino"},
+        "win_rate": {"type": "number", "sql": "r.win_rate"},
+        "profit_factor": {"type": "number", "sql": "r.profit_factor"},
+        "cpc_index": {"type": "number", "sql": "r.cpc_index"},
+        "common_sense_ratio": {"type": "number", "sql": "r.common_sense_ratio"},
+        "sweep_id": {"type": "text", "sql": "r.sweep_id"},
+        "sweep_name": {"type": "text", "sql": "sw.name"},
+        "user_id": {"type": "text", "sql": "r.user_id"},
+    }
+    if "metadata_jsonb" in run_cols:
+        allow["run_key"] = {"type": "text", "sql": "(r.metadata_jsonb->>'run_key')"}
+    return allow
+
+
+def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
+    select: Dict[str, str] = {
+        "run_id": "r.id AS run_id",
+        "id": "r.id",
+        "created_at": "r.created_at",
+        "symbol": "r.symbol",
+        "timeframe": "r.timeframe",
+        "strategy_name": "r.strategy_name",
+        "strategy_version": "r.strategy_version",
+        "market_type": "r.market_type",
+        "config_json": "r.config_json",
+        "metrics_json": "r.metrics_json",
+        "metadata_json": "r.metadata_json",
+        "start_time": "r.start_time",
+        "end_time": "r.end_time",
+        "net_profit": "r.net_profit",
+        "net_return_pct": "r.net_return_pct",
+        "roi_pct_on_margin": "r.roi_pct_on_margin",
+        "max_drawdown_pct": "r.max_drawdown_pct",
+        "sharpe": "r.sharpe",
+        "sortino": "r.sortino",
+        "win_rate": "r.win_rate",
+        "profit_factor": "r.profit_factor",
+        "cpc_index": "r.cpc_index",
+        "common_sense_ratio": "r.common_sense_ratio",
+        "avg_position_time_s": "r.avg_position_time_s",
+        "sweep_id": "r.sweep_id",
+        "sweep_name": "sw.name AS sweep_name",
+        "sweep_exchange_id": "sw.exchange_id AS sweep_exchange_id",
+        "sweep_scope": "sw.sweep_scope AS sweep_scope",
+        "sweep_assets_json": "sw.sweep_assets_json AS sweep_assets_json",
+        "sweep_category_id": "sw.sweep_category_id AS sweep_category_id",
+        "base_asset": "s.base_asset",
+        "quote_asset": "s.quote_asset",
+        "icon_uri": "s.icon_uri",
+        "shortlisted": "COALESCE(rs.shortlisted, 0) AS shortlisted",
+        "shortlist_note": "COALESCE(rs.note, '') AS shortlist_note",
+    }
+    if "metadata_jsonb" in run_cols:
+        select["run_key"] = "(r.metadata_jsonb->>'run_key') AS run_key"
+    # Drop selections for missing columns.
+    for key in list(select.keys()):
+        if key in {"run_id", "id", "sweep_name", "sweep_exchange_id", "sweep_scope", "sweep_assets_json", "sweep_category_id", "base_asset", "quote_asset", "icon_uri", "shortlisted", "shortlist_note", "run_key"}:
+            continue
+        col = select[key].split(" AS ")[0].strip()
+        if col.startswith("r.") and col[2:] not in run_cols:
+            select.pop(key, None)
+    return select
+
+
+def _runs_duration_seconds_sql() -> str:
+    return "EXTRACT(EPOCH FROM (r.end_time::timestamptz - r.start_time::timestamptz))"
+
+
+def _build_runs_where(
+    *,
+    filter_model: Optional[Dict[str, Any]],
+    allowed_filters: Dict[str, Dict[str, str]],
+    extra_where: Optional[Dict[str, Any]],
+    user_id: Optional[str],
+    run_cols: set[str],
+    exclude_keys: Optional[set[str]] = None,
+) -> Tuple[str, List[Any]]:
+    exclude_keys = exclude_keys or set()
+    where_parts: List[str] = []
+    where_params: List[Any] = []
+
+    where_sql, where_from_filters = translate_filter_model(filter_model, allowed_filters)
+    if where_sql:
+        where_parts.append(where_sql)
+        where_params.extend(where_from_filters)
+
+    if isinstance(extra_where, dict):
+        for key, value in extra_where.items():
+            if key in exclude_keys:
+                continue
+            if key == "min_net_return_pct":
+                where_parts.append("r.net_return_pct IS NOT NULL AND r.net_return_pct >= %s")
+                where_params.append(value)
+                continue
+            if key == "sweep_id":
+                where_parts.append("r.sweep_id = %s")
+                where_params.append(value)
+                continue
+            if key == "search":
+                term = str(value or "").strip()
+                if term:
+                    like = f"%{term}%"
+                    where_parts.append(
+                        "(r.id ILIKE %s OR r.symbol ILIKE %s OR r.strategy_name ILIKE %s OR sw.name ILIKE %s)"
+                    )
+                    where_params.extend([like, like, like, like])
+                continue
+            if key == "symbol_contains":
+                term = str(value or "").strip()
+                if term:
+                    like = f"%{term}%"
+                    where_parts.append("(r.symbol ILIKE %s OR s.base_asset ILIKE %s OR s.quote_asset ILIKE %s)")
+                    where_params.extend([like, like, like])
+                continue
+            if key == "strategy_contains":
+                term = str(value or "").strip()
+                if term:
+                    where_parts.append("r.strategy_name ILIKE %s")
+                    where_params.append(f"%{term}%")
+                continue
+            if key == "timeframe_contains":
+                term = str(value or "").strip()
+                if term:
+                    where_parts.append("r.timeframe ILIKE %s")
+                    where_params.append(f"%{term}%")
+                continue
+            if key == "sweep_name_contains":
+                term = str(value or "").strip()
+                if term:
+                    where_parts.append("sw.name ILIKE %s")
+                    where_params.append(f"%{term}%")
+                continue
+            if key == "created_at_from":
+                where_parts.append("r.created_at >= %s")
+                where_params.append(value)
+                continue
+            if key == "created_at_to":
+                where_parts.append("r.created_at <= %s")
+                where_params.append(value)
+                continue
+            if key == "net_profit_min":
+                where_parts.append("r.net_profit >= %s")
+                where_params.append(value)
+                continue
+            if key == "net_profit_max":
+                where_parts.append("r.net_profit <= %s")
+                where_params.append(value)
+                continue
+            if key == "net_return_pct_min":
+                where_parts.append("r.net_return_pct >= %s")
+                where_params.append(value)
+                continue
+            if key == "net_return_pct_gt":
+                where_parts.append("r.net_return_pct > %s")
+                where_params.append(value)
+                continue
+            if key == "net_return_pct_max":
+                where_parts.append("r.net_return_pct <= %s")
+                where_params.append(value)
+                continue
+            if key == "roi_pct_on_margin_min":
+                where_parts.append("r.roi_pct_on_margin >= %s")
+                where_params.append(value)
+                continue
+            if key == "roi_pct_on_margin_max":
+                where_parts.append("r.roi_pct_on_margin <= %s")
+                where_params.append(value)
+                continue
+            if key == "max_drawdown_pct_min":
+                where_parts.append("r.max_drawdown_pct >= %s")
+                where_params.append(value)
+                continue
+            if key == "max_drawdown_pct_max":
+                where_parts.append("r.max_drawdown_pct <= %s")
+                where_params.append(value)
+                continue
+            if key == "duration_min_hours":
+                where_parts.append(
+                    f"r.start_time IS NOT NULL AND r.end_time IS NOT NULL AND {_runs_duration_seconds_sql()} >= %s"
+                )
+                where_params.append(float(value) * 3600.0)
+                continue
+            if key == "duration_max_hours":
+                where_parts.append(
+                    f"r.start_time IS NOT NULL AND r.end_time IS NOT NULL AND {_runs_duration_seconds_sql()} <= %s"
+                )
+                where_params.append(float(value) * 3600.0)
+                continue
+            if key == "run_type":
+                rt = str(value or "").strip().lower()
+                if rt in {"single", "single_run", "single-run"}:
+                    where_parts.append("r.sweep_id IS NULL")
+                elif rt in {"sweep", "sweep_run", "sweep-run"}:
+                    where_parts.append("r.sweep_id IS NOT NULL")
+                continue
+            if key == "symbol" and isinstance(value, (list, tuple, set)):
+                vals = [v for v in value if v is not None and str(v).strip() != ""]
+                if vals:
+                    placeholders = ",".join(["%s"] * len(vals))
+                    where_parts.append(
+                        f"(r.symbol IN ({placeholders}) OR s.base_asset IN ({placeholders}))"
+                    )
+                    where_params.extend(list(vals) + list(vals))
+                continue
+            if key in allowed_filters:
+                sql_expr = allowed_filters[key]["sql"]
+                if isinstance(value, (list, tuple, set)):
+                    vals = [v for v in value if v is not None and str(v).strip() != ""]
+                    if vals:
+                        placeholders = ",".join(["%s"] * len(vals))
+                        where_parts.append(f"{sql_expr} IN ({placeholders})")
+                        where_params.extend(vals)
+                else:
+                    where_parts.append(f"{sql_expr} = %s")
+                    where_params.append(value)
+
+    if user_id and "user_id" in run_cols:
+        where_parts.append("r.user_id = %s")
+        where_params.append(str(user_id))
+
+    where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    return where_clause, where_params
+
+
+def translate_filter_model(
+    filter_model: Optional[Dict[str, Any]],
+    allowed_filters: Dict[str, Dict[str, str]],
+) -> Tuple[str, List[Any]]:
+    if not isinstance(filter_model, dict) or not filter_model:
+        return "", []
+
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    def _apply_simple(model: Dict[str, Any], sql_expr: str, ftype: str) -> Optional[str]:
+        op = str(model.get("type") or "").strip()
+        if ftype == "set":
+            values = model.get("values") or []
+            if not isinstance(values, list) or not values:
+                return None
+            placeholders = ",".join(["%s"] * len(values))
+            if any(isinstance(v, str) for v in values):
+                params.extend([str(v).lower() for v in values])
+                return f"LOWER({sql_expr}) IN ({placeholders})"
+            params.extend([v for v in values])
+            return f"{sql_expr} IN ({placeholders})"
+
+        if op == "blank":
+            if ftype == "number":
+                return f"{sql_expr} IS NULL"
+            return f"({sql_expr} IS NULL OR {sql_expr} = '')"
+        if op == "notBlank":
+            if ftype == "number":
+                return f"{sql_expr} IS NOT NULL"
+            return f"({sql_expr} IS NOT NULL AND {sql_expr} <> '')"
+
+        val = model.get("filter")
+        val_to = model.get("filterTo") or model.get("dateTo")
+        if ftype == "date":
+            val = model.get("dateFrom") or val
+
+        if op in {"equals", "notEqual"}:
+            params.append(val)
+            return f"{sql_expr} {'!=' if op == 'notEqual' else '='} %s"
+        if op == "contains":
+            params.append(f"%{val}%")
+            return f"{sql_expr} ILIKE %s"
+        if op == "startsWith":
+            params.append(f"{val}%")
+            return f"{sql_expr} ILIKE %s"
+        if op == "endsWith":
+            params.append(f"%{val}")
+            return f"{sql_expr} ILIKE %s"
+        if op == "lessThan":
+            params.append(val)
+            return f"{sql_expr} < %s"
+        if op == "greaterThan":
+            params.append(val)
+            return f"{sql_expr} > %s"
+        if op == "lessThanOrEqual":
+            params.append(val)
+            return f"{sql_expr} <= %s"
+        if op == "greaterThanOrEqual":
+            params.append(val)
+            return f"{sql_expr} >= %s"
+        if op == "inRange":
+            params.extend([val, val_to])
+            return f"{sql_expr} BETWEEN %s AND %s"
+        return None
+
+    def _walk(model: Dict[str, Any], sql_expr: str, ftype: str) -> Optional[str]:
+        if not isinstance(model, dict):
+            return None
+        ftype_local = ftype
+        filter_type = str(model.get("filterType") or "").strip().lower()
+        if filter_type in {"text", "number", "date", "set"}:
+            ftype_local = filter_type
+        if model.get("operator") and model.get("condition1") and model.get("condition2"):
+            cond1 = _walk(model.get("condition1") or {}, sql_expr, ftype_local)
+            cond2 = _walk(model.get("condition2") or {}, sql_expr, ftype_local)
+            if cond1 and cond2:
+                op = str(model.get("operator") or "AND").upper()
+                if op not in {"AND", "OR"}:
+                    op = "AND"
+                return f"({cond1} {op} {cond2})"
+            return cond1 or cond2
+        return _apply_simple(model, sql_expr, ftype_local)
+
+    for col, model in filter_model.items():
+        if col not in allowed_filters:
+            continue
+        meta = allowed_filters[col]
+        sql_expr = meta.get("sql")
+        ftype = meta.get("type")
+        if not sql_expr or not ftype:
+            continue
+        clause = _walk(model if isinstance(model, dict) else {}, sql_expr, str(ftype))
+        if clause:
+            clauses.append(clause)
+
+    if not clauses:
+        return "", []
+    return " AND ".join(clauses), params
+
+
+def translate_sort_model(
+    sort_model: Optional[List[Dict[str, Any]]],
+    allowed_filters: Dict[str, Dict[str, str]],
+) -> str:
+    if not isinstance(sort_model, list) or not sort_model:
+        return "ORDER BY r.created_at DESC"
+    order_parts: List[str] = []
+    for item in sort_model:
+        if not isinstance(item, dict):
+            continue
+        col = item.get("colId") or item.get("field")
+        if col not in allowed_filters:
+            continue
+        sql_expr = allowed_filters[col].get("sql")
+        if not sql_expr:
+            continue
+        direction = str(item.get("sort") or "desc").lower()
+        if direction not in {"asc", "desc"}:
+            direction = "desc"
+        order_parts.append(f"{sql_expr} {direction.upper()}")
+    if not order_parts:
+        return "ORDER BY r.created_at DESC"
+    return "ORDER BY " + ", ".join(order_parts)
+
+
+def list_runs_server_side(
+    conn: Any,
+    page: int,
+    page_size: int,
+    filter_model: Optional[Dict[str, Any]] = None,
+    sort_model: Optional[List[Dict[str, Any]]] = None,
+    visible_columns: Optional[List[str]] = None,
+    user_id: Optional[str] = None,
+    extra_where: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    try:
+        run_cols = get_table_columns(conn, "backtest_runs")
+        allowed_filters = _runs_allowed_filter_map(run_cols)
+        allowed_select = _runs_allowed_select_map(run_cols)
+
+        req_cols = {"run_id", "created_at", "symbol", "timeframe", "strategy_name"}
+        if visible_columns:
+            selected = [c for c in visible_columns if c in allowed_select]
+        else:
+            selected = []
+        for col in req_cols:
+            if col in allowed_select and col not in selected:
+                selected.append(col)
+        if "config_json" in allowed_select and "config_json" not in selected:
+            selected.append("config_json")
+        if "start_time" in allowed_select and "start_time" not in selected:
+            selected.append("start_time")
+        if "end_time" in allowed_select and "end_time" not in selected:
+            selected.append("end_time")
+
+        select_sql = ", ".join([allowed_select[c] for c in selected])
+        if not select_sql:
+            select_sql = "r.id AS run_id, r.created_at"
+
+        where_clause, where_params = _build_runs_where(
+            filter_model=filter_model,
+            allowed_filters=allowed_filters,
+            extra_where=extra_where,
+            user_id=user_id,
+            run_cols=run_cols,
+        )
+
+        order_sql = translate_sort_model(sort_model, allowed_filters)
+
+        page_val = max(1, int(page or 1))
+        size_val = max(1, min(int(page_size or 50), 500))
+        offset_val = (page_val - 1) * size_val
+
+        shortlist_join = ""
+        select_params: List[Any] = list(where_params)
+        if user_id:
+            shortlist_join = "LEFT JOIN run_shortlists rs ON rs.run_id = r.id AND rs.user_id = %s"
+            select_params = [str(user_id)] + select_params
+
+        sql = f"""
+            SELECT {select_sql}
+            FROM backtest_runs r
+            LEFT JOIN sweeps sw ON sw.id = r.sweep_id
+            LEFT JOIN symbols s ON s.exchange_symbol = r.symbol
+            {shortlist_join}
+            {where_clause}
+            {order_sql}
+            LIMIT %s OFFSET %s
+        """
+        data_params = list(select_params) + [size_val, offset_val]
+
+        rows = execute_fetchall(conn, sql, tuple(data_params))
+
+        count_sql = (
+            "SELECT COUNT(1) "
+            "FROM backtest_runs r "
+            "LEFT JOIN sweeps sw ON sw.id = r.sweep_id "
+            "LEFT JOIN symbols s ON s.exchange_symbol = r.symbol "
+            f"{where_clause}"
+        )
+        total_row = conn.execute(count_sql, tuple(where_params)).fetchone()
+        total_count = int(total_row[0] or 0) if total_row else 0
+
+        # Ensure symbols for current page (icon lookup) without full table scan.
+        try:
+            symbols = []
+            for r in rows or []:
+                s = str((r.get("symbol") if isinstance(r, dict) else None) or "").strip()
+                if s:
+                    symbols.append(s)
+            if symbols:
+                ensure_symbols_for_exchange_symbols(conn, list(dict.fromkeys(symbols)))
+        except Exception:
+            pass
+
+        return [dict(r) for r in rows], int(total_count)
+    except Exception:
+        _rollback_quietly(conn)
+        logger.exception("list_runs_server_side failed")
+        raise
+
+
+def list_backtest_run_symbols(
+    conn: Any,
+    *,
+    filter_model: Optional[Dict[str, Any]] = None,
+    extra_where: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    limit: int = 500,
+) -> List[str]:
+    run_cols = get_table_columns(conn, "backtest_runs")
+    allowed_filters = _runs_allowed_filter_map(run_cols)
+    where_clause, params = _build_runs_where(
+        filter_model=filter_model,
+        allowed_filters=allowed_filters,
+        extra_where=extra_where,
+        user_id=user_id,
+        run_cols=run_cols,
+        exclude_keys={"symbol", "symbol_contains"},
+    )
+    lim = max(1, min(int(limit or 500), 5000))
+    sql = f"""
+        SELECT DISTINCT COALESCE(s.base_asset, r.symbol) AS symbol
+        FROM backtest_runs r
+        LEFT JOIN symbols s ON s.exchange_symbol = r.symbol
+        LEFT JOIN sweeps sw ON sw.id = r.sweep_id
+        {where_clause}
+        ORDER BY 1
+        LIMIT %s
+    """
+    rows = execute_fetchall(conn, sql, tuple(list(params) + [lim]))
+    out: List[str] = []
+    for r in rows or []:
+        v = r.get("symbol") if isinstance(r, dict) else None
+        s = ("" if v is None else str(v)).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def list_backtest_run_timeframes(
+    conn: Any,
+    *,
+    filter_model: Optional[Dict[str, Any]] = None,
+    extra_where: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    limit: int = 200,
+) -> List[str]:
+    run_cols = get_table_columns(conn, "backtest_runs")
+    allowed_filters = _runs_allowed_filter_map(run_cols)
+    where_clause, params = _build_runs_where(
+        filter_model=filter_model,
+        allowed_filters=allowed_filters,
+        extra_where=extra_where,
+        user_id=user_id,
+        run_cols=run_cols,
+        exclude_keys={"timeframe", "timeframe_contains"},
+    )
+    lim = max(1, min(int(limit or 200), 2000))
+    sql = f"""
+        SELECT DISTINCT r.timeframe
+        FROM backtest_runs r
+        LEFT JOIN sweeps sw ON sw.id = r.sweep_id
+        {where_clause}
+        ORDER BY r.timeframe
+        LIMIT %s
+    """
+    rows = execute_fetchall(conn, sql, tuple(list(params) + [lim]))
+    out: List[str] = []
+    for r in rows or []:
+        v = r.get("timeframe") if isinstance(r, dict) else None
+        s = ("" if v is None else str(v)).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def list_backtest_run_strategies_filtered(
+    conn: Any,
+    *,
+    filter_model: Optional[Dict[str, Any]] = None,
+    extra_where: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    limit: int = 500,
+) -> List[str]:
+    run_cols = get_table_columns(conn, "backtest_runs")
+    allowed_filters = _runs_allowed_filter_map(run_cols)
+    where_clause, params = _build_runs_where(
+        filter_model=filter_model,
+        allowed_filters=allowed_filters,
+        extra_where=extra_where,
+        user_id=user_id,
+        run_cols=run_cols,
+        exclude_keys={"strategy", "strategy_name", "strategy_contains"},
+    )
+    lim = max(1, min(int(limit or 500), 5000))
+    sql = f"""
+        SELECT DISTINCT r.strategy_name
+        FROM backtest_runs r
+        LEFT JOIN sweeps sw ON sw.id = r.sweep_id
+        {where_clause}
+        ORDER BY r.strategy_name
+        LIMIT %s
+    """
+    rows = execute_fetchall(conn, sql, tuple(list(params) + [lim]))
+    out: List[str] = []
+    for r in rows or []:
+        v = r.get("strategy_name") if isinstance(r, dict) else None
+        s = ("" if v is None else str(v)).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def get_runs_numeric_bounds(
+    conn: Any,
+    *,
+    filter_model: Optional[Dict[str, Any]] = None,
+    extra_where: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+) -> Dict[str, Optional[float]]:
+    run_cols = get_table_columns(conn, "backtest_runs")
+    allowed_filters = _runs_allowed_filter_map(run_cols)
+    where_clause, params = _build_runs_where(
+        filter_model=filter_model,
+        allowed_filters=allowed_filters,
+        extra_where=extra_where,
+        user_id=user_id,
+        run_cols=run_cols,
+        exclude_keys={
+            "net_profit_min",
+            "net_profit_max",
+            "net_return_pct_min",
+            "net_return_pct_max",
+            "roi_pct_on_margin_min",
+            "roi_pct_on_margin_max",
+            "max_drawdown_pct_min",
+            "max_drawdown_pct_max",
+            "duration_min_hours",
+            "duration_max_hours",
+        },
+    )
+    sql = f"""
+        SELECT
+            MIN(r.net_profit) AS net_profit_min,
+            MAX(r.net_profit) AS net_profit_max,
+            MIN(r.net_return_pct) AS net_return_pct_min,
+            MAX(r.net_return_pct) AS net_return_pct_max,
+            MIN({_runs_duration_seconds_sql()}) AS duration_sec_min,
+            MAX({_runs_duration_seconds_sql()}) AS duration_sec_max
+        FROM backtest_runs r
+        LEFT JOIN sweeps sw ON sw.id = r.sweep_id
+        {where_clause}
+    """
+    row = execute_fetchone(conn, sql, tuple(params)) or {}
+    out: Dict[str, Optional[float]] = {
+        "net_profit_min": float(row.get("net_profit_min")) if row.get("net_profit_min") is not None else None,
+        "net_profit_max": float(row.get("net_profit_max")) if row.get("net_profit_max") is not None else None,
+        "net_return_pct_min": float(row.get("net_return_pct_min")) if row.get("net_return_pct_min") is not None else None,
+        "net_return_pct_max": float(row.get("net_return_pct_max")) if row.get("net_return_pct_max") is not None else None,
+        "duration_hours_min": float(row.get("duration_sec_min")) / 3600.0 if row.get("duration_sec_min") is not None else None,
+        "duration_hours_max": float(row.get("duration_sec_max")) / 3600.0 if row.get("duration_sec_max") is not None else None,
+    }
+    return out
 
 
 def list_backtest_run_strategies(*, limit: int = 5000) -> List[str]:

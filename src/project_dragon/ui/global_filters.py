@@ -10,6 +10,7 @@ import streamlit as st
 
 @dataclass(frozen=True)
 class GlobalFilters:
+    enabled: bool = True
     # Global created-at filter (run creation dates), expressed as a preset label.
     created_at_preset: Optional[str] = None
     # Backwards compat: older sessions stored an explicit date range tuple.
@@ -20,6 +21,7 @@ class GlobalFilters:
     symbols: List[str] = None  # type: ignore[assignment]
     strategies: List[str] = None  # type: ignore[assignment]
     timeframes: List[str] = None  # type: ignore[assignment]
+    profitable_only: bool = False
 
 
 def _as_list_str(v: Any) -> List[str]:
@@ -56,7 +58,8 @@ def _as_list_int(v: Any) -> List[int]:
 def ensure_global_filters_initialized() -> None:
     if "global_filters" not in st.session_state or not isinstance(st.session_state.get("global_filters"), dict):
         st.session_state["global_filters"] = {
-            "created_at_preset": "Last Month",
+            "enabled": True,
+            "created_at_preset": "All Time",
             "date_range": None,
             "account_ids": [],
             "exchanges": [],
@@ -64,13 +67,22 @@ def ensure_global_filters_initialized() -> None:
             "symbols": [],
             "strategies": [],
             "timeframes": [],
+            "profitable_only": False,
         }
     else:
         # Backfill new key into existing sessions.
         gf = st.session_state.get("global_filters")
         if isinstance(gf, dict) and "created_at_preset" not in gf:
             gf = dict(gf)
-            gf["created_at_preset"] = "Last Month"
+            gf["created_at_preset"] = "All Time"
+            st.session_state["global_filters"] = gf
+        if isinstance(gf, dict) and "enabled" not in gf:
+            gf = dict(gf)
+            gf["enabled"] = True
+            st.session_state["global_filters"] = gf
+        if isinstance(gf, dict) and "profitable_only" not in gf:
+            gf = dict(gf)
+            gf["profitable_only"] = False
             st.session_state["global_filters"] = gf
 
 
@@ -106,6 +118,8 @@ def apply_global_filters(df: pd.DataFrame, global_filters: Dict[str, Any]) -> pd
         return df
 
     gf = global_filters or {}
+    if not bool(gf.get("enabled", True)):
+        return df
 
     # --- Created-at date range ----------------------------------------
     # Goal: consistent semantics across the app: filter by run creation dates.
@@ -114,7 +128,7 @@ def apply_global_filters(df: pd.DataFrame, global_filters: Dict[str, Any]) -> pd
     start_dt: Optional[datetime] = None
     end_dt: Optional[datetime] = None
 
-    if preset:
+    if preset and preset != "All Time":
         # These are approximate (month=30 days). Good enough for UX.
         now = datetime.now(timezone.utc)
         today = now.date()
@@ -219,6 +233,14 @@ def apply_global_filters(df: pd.DataFrame, global_filters: Dict[str, Any]) -> pd
                 s = df[col].fillna("").astype(str).str.strip().str.lower()
                 df = df.loc[s.isin(strategies_l)].copy()
                 break
+
+    # --- Profitable-only ------------------------------------------------
+    if bool(gf.get("profitable_only", False)):
+        try:
+            if "net_return_pct" in df.columns:
+                df = df.loc[pd.to_numeric(df["net_return_pct"], errors="coerce") > 0.0].copy()
+        except Exception:
+            pass
 
     # --- Timeframe -----------------------------------------------------
     timeframes = [s.lower() for s in _as_list_str(gf.get("timeframes"))]

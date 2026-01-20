@@ -27,6 +27,14 @@ def _describe_target(dsn: str) -> str:
     return f"host={host} db={db}"
 
 
+def _role_from_dsn(dsn: str) -> str:
+    try:
+        parsed = urlparse(dsn)
+        return (parsed.username or "dragon").strip() or "dragon"
+    except Exception:
+        return "dragon"
+
+
 def main() -> int:
     dsn = str(get_database_url() or "").strip()
     if not dsn:
@@ -45,6 +53,18 @@ def main() -> int:
         else:
             conn = PostgresConnectionAdapter(raw)
         apply_migrations(conn)
+        try:
+            role = _role_from_dsn(dsn)
+            conn.execute(
+                f"ALTER ROLE {role} SET idle_in_transaction_session_timeout = '30s'"
+            )
+            conn.execute(
+                f"ALTER ROLE {role} SET statement_timeout = '30s'"
+            )
+            conn.commit()
+            print(f"DB role timeouts applied for {role}")
+        except Exception as exc:
+            print(f"DB role timeout setup skipped: {exc}")
         print("DB migrations ok")
         return 0
     except Exception as exc:

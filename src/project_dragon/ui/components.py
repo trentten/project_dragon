@@ -425,6 +425,8 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
 def render_active_filter_chips(global_filters: Dict[str, Any]) -> None:
     chips: List[str] = []
     gf = global_filters or {}
+    if not bool(gf.get("enabled", True)):
+        return
 
     preset = str(gf.get("created_at_preset") or "").strip()
     if preset:
@@ -453,6 +455,8 @@ def render_active_filter_chips(global_filters: Dict[str, Any]) -> None:
     _add_multi("Symbols", "symbols", upper=True)
     _add_multi("Strategy", "strategies")
     _add_multi("TF", "timeframes")
+    if bool(gf.get("profitable_only", False)):
+        chips.append("Profitable only")
 
     if not chips:
         return

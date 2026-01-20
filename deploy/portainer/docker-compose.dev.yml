@@ -8,21 +8,48 @@ services:
       context: ../..
       dockerfile: Dockerfile
     image: project_dragon:dev
+    volumes:
+      - ../..:/app
+      - ../../config:/app/config
+      - ../../logs:/app/logs
 
   live_worker:
     build:
       context: ../..
       dockerfile: Dockerfile
     image: project_dragon:dev
+    volumes:
+      - ../..:/app
+      - ../../config:/app/config
+      - ../../logs:/app/logs
 
   backtest_worker:
     build:
       context: ../..
       dockerfile: Dockerfile
     image: project_dragon:dev
+    volumes:
+      - ../..:/app
+      - ../../config:/app/config
+      - ../../logs:/app/logs
 
   backtest_worker_2:
     build:
       context: ../..
       dockerfile: Dockerfile
     image: project_dragon:dev
+    volumes:
+      - ../..:/app
+      - ../../config:/app/config
+      - ../../logs:/app/logs
+
+  db_migrate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: project_dragon:dev
+    volumes:
+      - ../..:/app
+      - ../../config:/app/config
+      - ../../logs:/app/logs
+

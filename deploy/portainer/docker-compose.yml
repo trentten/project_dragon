@@ -20,6 +20,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db_migrate:
+        condition: service_completed_successfully
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
@@ -31,8 +33,7 @@ services:
     ports:
       - "8501:8501"
     command: >
-      bash -lc "python -m project_dragon.db_migrate &&
-      streamlit run streamlit_app.py
+      bash -lc "streamlit run streamlit_app.py
       --server.address 0.0.0.0
       --server.port 8501"
 
@@ -42,6 +43,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db_migrate:
+        condition: service_completed_successfully
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
@@ -51,8 +54,7 @@ services:
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     command: >
-      bash -lc "python -m project_dragon.db_migrate &&
-      python -m project_dragon.live_worker"
+      bash -lc "python -m project_dragon.live_worker"
 
   backtest_worker:
     image: ghcr.io/trentten/project_dragon:v0.1.7
@@ -60,6 +62,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db_migrate:
+        condition: service_completed_successfully
     environment:
       TZ: Australia/Brisbane
       DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
@@ -69,12 +73,29 @@ services:
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     command: >
-      bash -lc "python -m project_dragon.db_migrate &&
-      python -m project_dragon.backtest_worker"
+      bash -lc "python -m project_dragon.backtest_worker"
 
   backtest_worker_2:
     image: ghcr.io/trentten/project_dragon:v0.1.7
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db_migrate:
+        condition: service_completed_successfully
+    environment:
+      TZ: Australia/Brisbane
+      DRAGON_MASTER_KEY: ${DRAGON_MASTER_KEY}
+      DRAGON_USER_EMAIL: ${DRAGON_USER_EMAIL:-admin@local}
+      DRAGON_DATABASE_URL: postgresql://dragon:${DRAGON_POSTGRES_PASSWORD}@postgres:5432/dragon
+    volumes:
+      - /share/Container/dragon-test/config:/app/config
+      - /share/Container/dragon-test/logs:/app/logs
+    command: >
+      bash -lc "python -m project_dragon.backtest_worker"
+
+  db_migrate:
+    image: ghcr.io/trentten/project_dragon:v0.1.7
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,8 +108,7 @@ services:
       - /share/Container/dragon-test/config:/app/config
       - /share/Container/dragon-test/logs:/app/logs
     command: >
-      bash -lc "python -m project_dragon.db_migrate &&
-      python -m project_dragon.backtest_worker"
+      bash -lc "python -m project_dragon.db_migrate"
 
 volumes:
   dragon_postgres_data:

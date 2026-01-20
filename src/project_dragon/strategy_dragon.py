@@ -77,6 +77,8 @@ class DragonDcaAtrStrategy:
     debug_next_dca_prices: List[Optional[float]] = field(default_factory=list)
     debug_tp_levels: List[Optional[float]] = field(default_factory=list)
     debug_sl_levels: List[Optional[float]] = field(default_factory=list)
+    debug_trend_ma: List[Optional[float]] = field(default_factory=list)
+    debug_indicator_ready: List[bool] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.debug_tp_levels = []
@@ -106,6 +108,11 @@ class DragonDcaAtrStrategy:
         indicator_ctx = self._compute_indicator_context(candle)
         if indicator_ctx:
             self.state.last_indicator_ctx = indicator_ctx
+        try:
+            self.debug_trend_ma.append(indicator_ctx.trend_ma if indicator_ctx else None)
+            self.debug_indicator_ready.append(bool(indicator_ctx is not None))
+        except Exception:
+            pass
 
         self._refresh_pending_orders(i, broker)
 

@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import project_dragon.live_worker as live_worker
+from uuid import uuid4
+
 from project_dragon.storage import (
+    bulk_enqueue_backtest_run_jobs,
     claim_job_with_lease,
     create_job,
     get_job,
@@ -102,3 +105,38 @@ def test_worker_helper_stops_when_lease_renewal_fails():
         )
         assert ok is False
         assert any(et == "job_lease_lost" for _, et, _, _ in events)
+
+
+def test_bulk_enqueue_backtest_run_jobs_idempotent():
+    payload = {
+        "config": {"foo": "bar"},
+        "data_settings": {
+            "exchange_id": "binance",
+            "market_type": "spot",
+            "symbol": "BTC/USDT",
+            "timeframe": "1h",
+        },
+        "metadata": {"strategy_name": "test"},
+    }
+    sweep_id = f"sweep_{uuid4().hex[:8]}"
+    job_key1 = f"backtest_run:test:{uuid4().hex}"
+    job_key2 = f"backtest_run:test:{uuid4().hex}"
+
+    with open_db_connection() as conn:
+        res1 = bulk_enqueue_backtest_run_jobs(
+            conn,
+            jobs=[
+                (job_key1, payload, sweep_id),
+                (job_key2, payload, sweep_id),
+            ],
+        )
+        assert int(res1.get("created") or 0) == 2
+        res2 = bulk_enqueue_backtest_run_jobs(
+            conn,
+            jobs=[
+                (job_key1, payload, sweep_id),
+                (job_key2, payload, sweep_id),
+            ],
+        )
+        assert int(res2.get("created") or 0) == 0
+        assert int(res2.get("existing") or 0) == 2

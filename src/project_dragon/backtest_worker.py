@@ -8,12 +8,13 @@ import logging
 import os
 import socket
 import time
-from collections import Counter, OrderedDict
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from project_dragon.backtest_core import DataSettings, run_single_backtest
+from project_dragon.backtest_core import DataSettings, compute_analysis_window_from_snapshot, run_single_backtest
+from project_dragon.candle_cache import get_candles_analysis_window, prefetch_analysis_window
 from project_dragon.data_online import get_candles_with_cache, load_ccxt_candles
 from project_dragon.domain import Candle
 from project_dragon.storage import (
@@ -44,98 +45,12 @@ JOB_LEASE_RENEW_EVERY_S = float(os.environ.get("DRAGON_JOB_LEASE_RENEW_EVERY_S",
 # Sweep planning chunk size (limits memory and allows pause/cancel to take effect quickly).
 SWEEP_PLAN_BATCH_SIZE = int(os.environ.get("DRAGON_SWEEP_PLAN_BATCH_SIZE", "250") or 250)
 
-# Worker-local candle LRU cache (bounded, in-memory)
-_CANDLE_CACHE_MAX_ENTRIES = int(os.environ.get("DRAGON_CANDLE_CACHE_MAX_ENTRIES", "32") or 32)
-_CANDLE_CACHE_MAX_TOTAL_CANDLES = int(os.environ.get("DRAGON_CANDLE_CACHE_MAX_TOTAL_CANDLES", "200000") or 200_000)
-_CANDLE_CACHE_PREFETCH = int(os.environ.get("DRAGON_CANDLE_CACHE_PREFETCH", "1") or 1)
-_CANDLE_CACHE_PREFETCH_TOP_N = int(os.environ.get("DRAGON_CANDLE_CACHE_PREFETCH_TOP_N", "2") or 2)
-
-_CANDLE_CACHE_PREFETCH_QUERY_LIMIT = 50
-_CANDLE_CACHE_PREFETCH_BUDGET_S = 2.0
-
 # In-process lease tracking (like live_worker).
 _JOB_EXPECTED_LEASE_VERSION: Dict[int, int] = {}
 _JOB_LAST_LEASE_RENEW_S: Dict[int, float] = {}
-
-
-class CandleCache:
-    """Worker-local bounded LRU candle cache.
-
-    Stores lists of Candle objects in memory.
-    Eviction is by LRU and bounded by both entry count and total candle count.
-    """
-
-    def __init__(self, *, max_entries: int, max_total_candles: int):
-        self.max_entries = max(1, int(max_entries))
-        self.max_total_candles = max(1, int(max_total_candles))
-        self._od: "OrderedDict[tuple, list[Candle]]" = OrderedDict()
-        self._total_candles = 0
-
-    @property
-    def total_candles(self) -> int:
-        return int(self._total_candles)
-
-    @property
-    def entries(self) -> int:
-        return int(len(self._od))
-
-    def get(self, key: tuple) -> Optional[list[Candle]]:
-        try:
-            v = self._od.get(key)
-        except Exception:
-            v = None
-        if v is None:
-            return None
-        try:
-            self._od.move_to_end(key, last=True)
-        except Exception:
-            pass
-        return v
-
-    def set(self, key: tuple, candles: list[Candle]) -> None:
-        if candles is None:
-            return
-        try:
-            n_new = int(len(candles))
-        except Exception:
-            n_new = 0
-
-        # Replace existing.
-        if key in self._od:
-            try:
-                old = self._od.pop(key)
-                self._total_candles -= int(len(old))
-            except Exception:
-                pass
-
-        self._od[key] = candles
-        self._total_candles += int(n_new)
-        try:
-            self._od.move_to_end(key, last=True)
-        except Exception:
-            pass
-
-        self._evict_if_needed()
-
-    def _evict_if_needed(self) -> None:
-        # Evict until within both bounds.
-        while True:
-            if len(self._od) <= int(self.max_entries) and int(self._total_candles) <= int(self.max_total_candles):
-                return
-            try:
-                k, v = self._od.popitem(last=False)
-                self._total_candles -= int(len(v))
-            except KeyError:
-                self._total_candles = 0
-                return
-            except Exception:
-                return
-
-
-_CANDLE_CACHE = CandleCache(max_entries=_CANDLE_CACHE_MAX_ENTRIES, max_total_candles=_CANDLE_CACHE_MAX_TOTAL_CANDLES)
-_CANDLE_CACHE_HITS = 0
-_CANDLE_CACHE_MISSES = 0
-_CANDLE_CACHE_LOG_EVERY = 50
+_CANDLE_CACHE_PREFETCH_TOP_N = int(os.environ.get("DRAGON_CANDLE_CACHE_PREFETCH_TOP_N", "2") or 2)
+_CANDLE_CACHE_PREFETCH_QUERY_LIMIT = 50
+_CANDLE_CACHE_PREFETCH_BUDGET_S = 2.0
 _LAST_PREFETCH_GROUP_KEY: Optional[str] = None
 
 
@@ -171,98 +86,43 @@ def _to_ms(value: Any) -> Optional[int]:
     return None
 
 
-def _candle_cache_key_from_settings(ds: DataSettings) -> Optional[tuple]:
-    try:
-        if str(ds.data_source).lower() == "synthetic":
-            return None
-        params = ds.range_params or {}
-        exchange_id = str(ds.exchange_id or "binance").strip().lower()
-        market_type = str(ds.market_type or "unknown").strip().lower()
-        symbol = str(ds.symbol or "BTC/USDT").strip()
-        timeframe = str(ds.timeframe or "1h").strip()
-        range_mode = str(ds.range_mode or "bars").strip().lower()
-        limit = params.get("limit")
-        try:
-            limit_i = int(limit) if limit is not None else None
-        except Exception:
-            limit_i = None
-        since_ms = _to_ms(params.get("since"))
-        until_ms = _to_ms(params.get("until"))
-        return (exchange_id, market_type, symbol, timeframe, range_mode, limit_i, since_ms, until_ms)
-    except Exception:
-        return None
-
-
 def _load_candles_worker_cached(ds: DataSettings) -> list[Candle]:
-    global _CANDLE_CACHE_HITS, _CANDLE_CACHE_MISSES
-
-    key = _candle_cache_key_from_settings(ds)
-    if key is not None:
-        hit = _CANDLE_CACHE.get(key)
-        if hit is not None:
-            _CANDLE_CACHE_HITS += 1
-            if (_CANDLE_CACHE_HITS + _CANDLE_CACHE_MISSES) % _CANDLE_CACHE_LOG_EVERY == 0:
-                logger.info(
-                    "candle_cache stats worker=%s hits=%s misses=%s entries=%s total_candles=%s",
-                    "?",
-                    int(_CANDLE_CACHE_HITS),
-                    int(_CANDLE_CACHE_MISSES),
-                    int(_CANDLE_CACHE.entries),
-                    int(_CANDLE_CACHE.total_candles),
-                )
-            return hit
-
-    _CANDLE_CACHE_MISSES += 1
     params = ds.range_params or {}
     exchange_id = ds.exchange_id or "binance"
-    market_type = ds.market_type or "unknown"
     symbol = ds.symbol or "BTC/USDT"
     timeframe = ds.timeframe or "1h"
+    market_type = ds.market_type or "unknown"
     range_mode = (ds.range_mode or "bars").lower()
-    limit = params.get("limit")
-    since = params.get("since")
-    until = params.get("until")
-
     try:
-        candles = get_candles_with_cache(
-            exchange_id=exchange_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit,
-            since=since,
-            until=until,
-            range_mode=range_mode,
-            market_type=market_type,
+        _analysis_start, _display_start, _display_end, candles_analysis, _candles_display = get_candles_analysis_window(
+            data_settings=ds,
+            analysis_info=None,
+            display_start_ms=_to_ms(params.get("since")),
+            display_end_ms=_to_ms(params.get("until")),
+            fetch_fn=get_candles_with_cache,
         )
+        return list(candles_analysis)
     except Exception as exc:
         msg = str(exc).lower()
         if "database is locked" in msg or "locked" in msg:
-            candles = load_ccxt_candles(
-                exchange_id,
-                symbol,
-                timeframe,
-                limit=limit,
-                since=since,
-                until=until,
-                range_mode=range_mode,
-                market_type=market_type,
+            return list(
+                load_ccxt_candles(
+                    exchange_id,
+                    symbol,
+                    timeframe,
+                    limit=params.get("limit"),
+                    since=params.get("since"),
+                    until=params.get("until"),
+                    range_mode=range_mode,
+                    market_type=market_type,
+                )
             )
-        else:
-            raise
-
-    if key is not None:
-        try:
-            _CANDLE_CACHE.set(key, list(candles))
-        except Exception:
-            pass
-    return list(candles)
+        raise
 
 
 def _prefetch_group_candles(*, conn, group_key: str, worker_id: str) -> None:
     global _LAST_PREFETCH_GROUP_KEY
 
-    if int(_CANDLE_CACHE_PREFETCH or 0) != 1:
-        return
     gk = str(group_key or "").strip()
     if not gk:
         return
@@ -289,6 +149,7 @@ def _prefetch_group_candles(*, conn, group_key: str, worker_id: str) -> None:
         return
 
     keys: list[tuple] = []
+    key_to_payload: Dict[tuple, tuple[DataSettings, Dict[str, Any]]] = {}
     for r in rows or []:
         if (time.time() - start_s) > float(_CANDLE_CACHE_PREFETCH_BUDGET_S):
             break
@@ -296,9 +157,33 @@ def _prefetch_group_candles(*, conn, group_key: str, worker_id: str) -> None:
             payload_raw = r[0] if not isinstance(r, dict) else r.get("payload_json")
             payload = json.loads(payload_raw) if isinstance(payload_raw, str) and payload_raw.strip() else {}
             ds = DataSettings(**(payload.get("data_settings") or {}))
-            k = _candle_cache_key_from_settings(ds)
-            if k is not None:
-                keys.append(k)
+            config_snapshot = payload.get("config") or {}
+            try:
+                analysis_info = compute_analysis_window_from_snapshot(config_snapshot, ds)
+            except Exception:
+                analysis_info = {}
+            params = getattr(ds, "range_params", None) or {}
+            analysis_start_ms = analysis_info.get("analysis_start_ms") or _to_ms(params.get("since"))
+            analysis_end_ms = analysis_info.get("analysis_end_ms") or _to_ms(params.get("until"))
+            try:
+                analysis_limit = analysis_info.get("analysis_limit")
+                if analysis_limit is None and params.get("limit") is not None:
+                    analysis_limit = int(params.get("limit"))
+            except Exception:
+                analysis_limit = None
+            k = (
+                str(getattr(ds, "exchange_id", None) or "binance").lower(),
+                str(getattr(ds, "market_type", None) or "unknown").lower(),
+                str(getattr(ds, "symbol", None) or "BTC/USDT"),
+                str(getattr(ds, "timeframe", None) or "1h"),
+                str(getattr(ds, "range_mode", None) or "bars").lower(),
+                int(analysis_start_ms or 0),
+                int(analysis_end_ms or 0),
+                int(analysis_limit or 0),
+            )
+            keys.append(k)
+            if k not in key_to_payload:
+                key_to_payload[k] = (ds, analysis_info)
         except Exception:
             continue
 
@@ -314,50 +199,25 @@ def _prefetch_group_candles(*, conn, group_key: str, worker_id: str) -> None:
     for k, _count in common:
         if (time.time() - start_s) > float(_CANDLE_CACHE_PREFETCH_BUDGET_S):
             break
-        if _CANDLE_CACHE.get(k) is not None:
-            continue
         try:
-            exchange_id, market_type, symbol, timeframe, range_mode, limit_i, since_ms, until_ms = k
-            # Use the exact same fetch path as a real run (DB cache + fallback).
-            try:
-                candles = get_candles_with_cache(
-                    exchange_id=str(exchange_id),
-                    symbol=str(symbol),
-                    timeframe=str(timeframe),
-                    limit=limit_i,
-                    since=since_ms,
-                    until=until_ms,
-                    range_mode=str(range_mode),
-                    market_type=str(market_type),
-                )
-            except Exception as exc:
-                msg = str(exc).lower()
-                if "database is locked" in msg or "locked" in msg:
-                    candles = load_ccxt_candles(
-                        str(exchange_id),
-                        str(symbol),
-                        str(timeframe),
-                        limit=limit_i,
-                        since=since_ms,
-                        until=until_ms,
-                        range_mode=str(range_mode),
-                        market_type=str(market_type),
-                    )
-                else:
-                    continue
-            _CANDLE_CACHE.set(k, list(candles))
+            ds, analysis_info = key_to_payload.get(k, (None, None))
+            if ds is None:
+                continue
+            prefetch_analysis_window(
+                data_settings=ds,
+                analysis_info=analysis_info or {},
+                reason=f"group:{gk}",
+            )
             prefetched += 1
         except Exception:
             continue
 
     if prefetched > 0:
         logger.info(
-            "candle_cache prefetch worker=%s group=%s prefetched=%s entries=%s total_candles=%s",
+            "candle_cache prefetch worker=%s group=%s prefetched=%s",
             str(worker_id),
             str(gk),
             int(prefetched),
-            int(_CANDLE_CACHE.entries),
-            int(_CANDLE_CACHE.total_candles),
         )
 
 
@@ -785,6 +645,12 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
     config_snapshot = payload.get("config") or {}
     data_settings = DataSettings(**(payload.get("data_settings") or {}))
 
+    analysis_info: Dict[str, Any] = {}
+    try:
+        analysis_info = compute_analysis_window_from_snapshot(config_snapshot, data_settings)
+    except Exception:
+        analysis_info = {}
+
     # Best-effort prefetch for new sweep groups.
     try:
         group_key = job.get("group_key") or payload.get("group_key")
@@ -800,7 +666,18 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
     storage_timeframe_override: Optional[str] = None
     try:
         if str(getattr(data_settings, "data_source", "") or "").lower() != "synthetic":
-            candles_override = _load_candles_worker_cached(data_settings)
+            params = dict(data_settings.range_params or {})
+            if analysis_info.get("analysis_start_ms") is not None:
+                params["since"] = analysis_info.get("analysis_start_ms")
+            if analysis_info.get("analysis_end_ms") is not None:
+                params["until"] = analysis_info.get("analysis_end_ms")
+            if analysis_info.get("analysis_limit") is not None:
+                params["limit"] = analysis_info.get("analysis_limit")
+            fetch_range_mode = analysis_info.get("effective_range_mode") or data_settings.range_mode
+            data_settings_fetch = DataSettings(
+                **{**data_settings.__dict__, "range_params": params, "range_mode": fetch_range_mode}
+            )
+            candles_override = _load_candles_worker_cached(data_settings_fetch)
             try:
                 exchange_id = data_settings.exchange_id or "binance"
                 symbol = data_settings.symbol or "BTC/USDT"

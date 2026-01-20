@@ -70,6 +70,10 @@ class BacktestEngine:
             extra_series["tp_level"] = list(strategy.debug_tp_levels)
         if hasattr(strategy, "debug_sl_levels"):
             extra_series["sl_level"] = list(strategy.debug_sl_levels)
+        if hasattr(strategy, "debug_trend_ma"):
+            extra_series["trend_ma"] = list(strategy.debug_trend_ma)
+        if hasattr(strategy, "debug_indicator_ready"):
+            extra_series["indicator_ready"] = list(strategy.debug_indicator_ready)
 
         start_time = candle_list[0].timestamp if candle_list else None
         end_time = candle_list[-1].timestamp if candle_list else None
