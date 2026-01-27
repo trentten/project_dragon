@@ -1159,6 +1159,25 @@ def _migration_0010_assets_indexes(conn: Any) -> None:
     execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_assets_base_asset ON assets(base_asset)")
 
 
+def _migration_0011_saved_periods(conn: Any) -> None:
+    execute_optional(
+        conn,
+        f"""
+        CREATE TABLE IF NOT EXISTS saved_periods (
+            id {_auto_pk(conn)},
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            start_ts TEXT NOT NULL,
+            end_ts TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, name)
+        )
+        """,
+    )
+    execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_saved_periods_user_updated ON saved_periods(user_id, updated_at DESC)")
+
+
 _MIGRATIONS: list[tuple[int, str, Any]] = [
     (1, "core_schema", _migration_0001_core_schema),
     (2, "backtest_run_details", _migration_0002_backtest_run_details),
@@ -1170,6 +1189,7 @@ _MIGRATIONS: list[tuple[int, str, Any]] = [
     (8, "jobs_indexes", _migration_0008_jobs_indexes),
     (9, "sweeps_indexes", _migration_0009_sweeps_indexes),
     (10, "assets_indexes", _migration_0010_assets_indexes),
+    (11, "saved_periods", _migration_0011_saved_periods),
 ]
 
 
@@ -1800,6 +1820,23 @@ def _ensure_schema(conn: Any) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_user ON user_settings(user_id)")
+
+    # Saved periods (named Start/End presets for backtest ranges).
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS saved_periods (
+            id {_auto_pk(conn)},
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            start_ts TEXT NOT NULL,
+            end_ts TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, name)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_periods_user_updated ON saved_periods(user_id, updated_at DESC)")
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS exchange_credentials (
@@ -4614,6 +4651,106 @@ def set_user_setting(conn: Any, user_id: str, key: str, value: Any) -> None:
     conn.commit()
 
 
+def list_saved_periods(conn: Any, user_id: str) -> List[Dict[str, Any]]:
+    _ensure_schema(conn)
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    rows = execute_fetchall(
+        conn,
+        """
+        SELECT id, name, start_ts, end_ts, created_at, updated_at
+        FROM saved_periods
+        WHERE user_id = %s
+        ORDER BY updated_at DESC, created_at DESC
+        """,
+        (uid,),
+    )
+    return [dict(r) for r in rows]
+
+
+def get_saved_period(conn: Any, user_id: str, period_id: int) -> Optional[Dict[str, Any]]:
+    _ensure_schema(conn)
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    row = execute_fetchone(
+        conn,
+        """
+        SELECT id, name, start_ts, end_ts, created_at, updated_at
+        FROM saved_periods
+        WHERE user_id = %s AND id = %s
+        """,
+        (uid, int(period_id)),
+    )
+    return dict(row) if row else None
+
+
+def create_saved_period(
+    conn: Any,
+    *,
+    user_id: str,
+    name: str,
+    start_ts: str,
+    end_ts: str,
+) -> int:
+    _ensure_schema(conn)
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """
+        INSERT INTO saved_periods(user_id, name, start_ts, end_ts, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT(user_id, name) DO UPDATE
+        SET start_ts = excluded.start_ts,
+            end_ts = excluded.end_ts,
+            updated_at = excluded.updated_at
+        RETURNING id
+        """,
+        (uid, str(name).strip(), str(start_ts), str(end_ts), now, now),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    try:
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def update_saved_period(
+    conn: Any,
+    *,
+    user_id: str,
+    period_id: int,
+    name: str,
+    start_ts: str,
+    end_ts: str,
+) -> bool:
+    _ensure_schema(conn)
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """
+        UPDATE saved_periods
+        SET name = %s,
+            start_ts = %s,
+            end_ts = %s,
+            updated_at = %s
+        WHERE user_id = %s AND id = %s
+        """,
+        (str(name).strip(), str(start_ts), str(end_ts), now, uid, int(period_id)),
+    )
+    conn.commit()
+    return bool(cur.rowcount and int(cur.rowcount) > 0)
+
+
+def delete_saved_period(conn: Any, *, user_id: str, period_id: int) -> bool:
+    _ensure_schema(conn)
+    uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
+    cur = conn.execute(
+        "DELETE FROM saved_periods WHERE user_id = %s AND id = %s",
+        (uid, int(period_id)),
+    )
+    conn.commit()
+    return bool(cur.rowcount and int(cur.rowcount) > 0)
+
+
 def set_setting(conn: Any, key: str, value: Any) -> None:
     payload = json.dumps(value)
     now = datetime.now(timezone.utc).isoformat()
@@ -6030,6 +6167,11 @@ def set_job_cancel_requested(conn: Any, job_id: int, cancelled: bool) -> None:
         conn.commit()
         if gk:
             _ = bulk_mark_jobs_cancelled(conn, gk)
+        try:
+            if sid:
+                finalize_sweep_if_complete(conn, str(sid))
+        except Exception:
+            pass
     else:
         conn.execute(
             """
@@ -6071,6 +6213,119 @@ def count_jobs_by_status_for_group(conn: Any, group_key: str) -> Dict[str, int]:
         total += int(c)
     out["total"] = int(total)
     return out
+
+
+def requeue_orphaned_running_jobs(
+    conn: Any,
+    *,
+    job_types: Sequence[str],
+    older_than_s: float = 60.0,
+) -> int:
+    """Requeue running jobs missing leases after restart."""
+
+    types = [str(t).strip() for t in (job_types or []) if str(t).strip()]
+    if not types:
+        return 0
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    cutoff = (now_dt - timedelta(seconds=float(older_than_s))).isoformat()
+    placeholders = ",".join(["%s"] * len(types))
+    cur = conn.execute(
+        f"""
+        UPDATE jobs
+        SET status = 'queued', worker_id = NULL, progress = 0.0,
+            message = 'Resumed after restart', updated_at = %s
+        WHERE job_type IN ({placeholders})
+          AND status = 'running'
+          AND (lease_expires_at IS NULL OR TRIM(COALESCE(lease_expires_at::text, '')) = '')
+          AND COALESCE(updated_at, created_at) < %s
+        """,
+        tuple([now_iso] + types + [cutoff]),
+    )
+    conn.commit()
+    try:
+        return int(cur.rowcount or 0)
+    except Exception:
+        return 0
+
+
+def requeue_expired_lease_jobs(
+    conn: Any,
+    *,
+    job_types: Sequence[str],
+) -> int:
+    """Requeue running jobs whose leases have expired."""
+
+    types = [str(t).strip() for t in (job_types or []) if str(t).strip()]
+    if not types:
+        return 0
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    placeholders = ",".join(["%s"] * len(types))
+    cur = conn.execute(
+        f"""
+        UPDATE jobs
+        SET status = 'queued', worker_id = NULL, claimed_by = NULL,
+            claimed_at = NULL, lease_expires_at = NULL, last_lease_renew_at = NULL,
+            progress = 0.0, message = 'Resumed after lease expiry', updated_at = %s
+        WHERE job_type IN ({placeholders})
+          AND status = 'running'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at < %s
+        """,
+        tuple([now_iso] + types + [now_iso]),
+    )
+    conn.commit()
+    try:
+        return int(cur.rowcount or 0)
+    except Exception:
+        return 0
+
+
+def ensure_sweep_parent_jobs(conn: Any, *, sweep_ids: Optional[Sequence[str]] = None) -> int:
+    """Ensure sweep_parent jobs exist for running/paused sweeps.
+
+    Uses job_key uniqueness for idempotency.
+    """
+
+    ids: list[str] = [str(s).strip() for s in (sweep_ids or []) if str(s).strip()]
+    params: list[Any] = []
+    where_parts = ["status IN ('running','paused')"]
+    if ids:
+        placeholders = ",".join(["%s"] * len(ids))
+        where_parts.append(f"id IN ({placeholders})")
+        params.extend(ids)
+
+    rows = execute_fetchall(
+        conn,
+        f"SELECT id, user_id FROM sweeps WHERE {' AND '.join(where_parts)}",
+        tuple(params),
+    )
+    if not rows:
+        return 0
+
+    created = 0
+    for r in rows or []:
+        sid = str(r.get("id") or "").strip()
+        if not sid:
+            continue
+        user_id = str(r.get("user_id") or "").strip() or None
+        job_key = f"sweep_parent:{sid}"
+        payload = {"sweep_id": sid, "user_id": user_id}
+        try:
+            jid = create_job(
+                conn,
+                "sweep_parent",
+                payload,
+                sweep_id=sid,
+                job_key=job_key,
+                group_key=f"sweep:{sid}",
+            )
+            if int(jid or 0) > 0:
+                created += 1
+        except Exception:
+            continue
+    return int(created)
 
 
 def get_backtest_run_job_counts_by_parent(
@@ -6675,9 +6930,23 @@ def upsert_backtest_run_by_run_key(
     return run_id
 
 
-def finalize_sweep_if_complete(conn: Any, sweep_id: str) -> None:
-    """Mark sweep done/failed when all child backtest_run jobs are terminal.
+def _try_advisory_xact_lock(conn: Any, key: str) -> bool:
+    if not is_postgres(conn):
+        return True
+    try:
+        row = conn.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+            (str(key or "").strip(),),
+        ).fetchone()
+        return bool(row[0]) if row else False
+    except Exception:
+        return False
 
+
+def finalize_sweep_if_complete(conn: Any, sweep_id: str) -> None:
+    """Mark sweep terminal when all child backtest_run jobs are terminal.
+
+    Terminal states: done / cancelled / failed.
     Race-safe: updates only if the sweep is not already terminal.
     Does not commit.
     """
@@ -6699,23 +6968,32 @@ def finalize_sweep_if_complete(conn: Any, sweep_id: str) -> None:
 
     counts: Dict[str, int] = {}
     total = 0
+    terminal = 0
     for r in rows or []:
         st = str(r.get("status"))
         c = int(r.get("c"))
         counts[st] = int(c)
         total += int(c)
+        if st in {"done", "failed", "cancelled", "canceled", "error"}:
+            terminal += int(c)
 
     if total <= 0:
         return
 
-    queued = int(counts.get("queued") or 0)
-    running = int(counts.get("running") or 0)
-    if queued > 0 or running > 0:
+    if terminal < total:
         return
 
     failed = int(counts.get("failed") or 0) + int(counts.get("error") or 0)
-    status = "failed" if failed > 0 else "done"
-    err_msg = "one_or_more_child_jobs_failed" if failed > 0 else None
+    cancelled = int(counts.get("cancelled") or 0) + int(counts.get("canceled") or 0)
+    if failed > 0:
+        status = "failed"
+        err_msg = "one_or_more_child_jobs_failed"
+    elif cancelled > 0:
+        status = "cancelled"
+        err_msg = None
+    else:
+        status = "done"
+        err_msg = None
 
     conn.execute(
         """
@@ -6726,6 +7004,146 @@ def finalize_sweep_if_complete(conn: Any, sweep_id: str) -> None:
         """,
         (status, err_msg, sid),
     )
+
+
+def reconcile_sweep_statuses(
+    conn: Any,
+    *,
+    sweep_ids: Optional[Sequence[str]] = None,
+    user_id: Optional[str] = None,
+) -> Dict[str, int]:
+    """Reconcile sweeps marked running/paused against actual child jobs.
+
+    Idempotent + concurrency-safe (per-sweep advisory lock).
+    Caller must provide a write-capable connection.
+    """
+
+    ids: list[str] = [str(s).strip() for s in (sweep_ids or []) if str(s).strip()]
+
+    if not ids:
+        where = "status IN ('running','paused')"
+        params: list[Any] = []
+        try:
+            sweep_cols = get_table_columns(conn, "sweeps")
+        except Exception:
+            sweep_cols = set()
+        if user_id and "user_id" in sweep_cols:
+            where += " AND (user_id = %s OR user_id IS NULL OR TRIM(user_id) = '')"
+            params.append(str(user_id))
+        rows = execute_fetchall(conn, f"SELECT id FROM sweeps WHERE {where}", tuple(params))
+        ids = [str(r.get("id") or "").strip() for r in rows or [] if str(r.get("id") or "").strip()]
+
+    if not ids:
+        return {"checked": 0, "updated": 0, "done": 0, "failed": 0, "cancelled": 0}
+
+    updated = 0
+    done = 0
+    failed = 0
+    cancelled = 0
+
+    for sid in ids:
+        if not sid:
+            continue
+        try:
+            with conn:
+                if not _try_advisory_xact_lock(conn, f"project_dragon_sweep_reconcile:{sid}"):
+                    continue
+
+                row = execute_fetchone(conn, "SELECT status FROM sweeps WHERE id = %s", (sid,))
+                current = str(row.get("status") or "").strip().lower() if isinstance(row, dict) else ""
+                if current in {"done", "failed", "cancelled", "canceled"}:
+                    continue
+                if current not in {"running", "paused"}:
+                    continue
+
+                rows = execute_fetchall(
+                    conn,
+                    """
+                    SELECT status, COUNT(*) AS c
+                    FROM jobs
+                    WHERE job_type = 'backtest_run'
+                      AND sweep_id = %s
+                    GROUP BY status
+                    """,
+                    (sid,),
+                )
+
+                counts: Dict[str, int] = {}
+                total = 0
+                terminal = 0
+                for r in rows or []:
+                    st = str(r.get("status"))
+                    c = int(r.get("c"))
+                    counts[st] = int(c)
+                    total += int(c)
+                    if st in {"done", "failed", "cancelled", "canceled", "error"}:
+                        terminal += int(c)
+
+                next_status: Optional[str] = None
+                err_msg: Optional[str] = None
+
+                if total > 0 and terminal >= total:
+                    failed_count = int(counts.get("failed") or 0) + int(counts.get("error") or 0)
+                    cancel_count = int(counts.get("cancelled") or 0) + int(counts.get("canceled") or 0)
+                    if failed_count > 0:
+                        next_status = "failed"
+                        err_msg = "one_or_more_child_jobs_failed"
+                    elif cancel_count > 0:
+                        next_status = "cancelled"
+                    else:
+                        next_status = "done"
+                elif total == 0:
+                    parent = execute_fetchone(
+                        conn,
+                        """
+                        SELECT status
+                        FROM jobs
+                        WHERE job_type = 'sweep_parent'
+                          AND sweep_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (sid,),
+                    )
+                    pstat = str(parent.get("status") or "").strip().lower() if isinstance(parent, dict) else ""
+                    if pstat in {"done", "failed", "cancelled", "canceled", "error"}:
+                        if pstat in {"failed", "error"}:
+                            next_status = "failed"
+                            err_msg = "sweep_parent_failed"
+                        elif pstat in {"cancelled", "canceled"}:
+                            next_status = "cancelled"
+                        else:
+                            next_status = "done"
+
+                if next_status:
+                    cur = conn.execute(
+                        """
+                        UPDATE sweeps
+                        SET status = %s,
+                            error_message = COALESCE(error_message, %s)
+                        WHERE id = %s
+                          AND status NOT IN ('done','failed','cancelled','canceled')
+                        """,
+                        (next_status, err_msg, sid),
+                    )
+                    if int(getattr(cur, "rowcount", 0) or 0) > 0:
+                        updated += 1
+                        if next_status == "done":
+                            done += 1
+                        elif next_status == "failed":
+                            failed += 1
+                        elif next_status == "cancelled":
+                            cancelled += 1
+        except Exception:
+            continue
+
+    return {
+        "checked": int(len(ids)),
+        "updated": int(updated),
+        "done": int(done),
+        "failed": int(failed),
+        "cancelled": int(cancelled),
+    }
 
 
 def get_backtest_run_job_counts_by_sweep(
@@ -9140,6 +9558,33 @@ def _runs_allowed_filter_map(run_cols: set[str]) -> Dict[str, Dict[str, str]]:
 
 
 def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
+    def _coalesce_jsonb(cols: list[str]) -> str:
+        cols_clean = [c for c in cols if c]
+        return f"COALESCE({', '.join(cols_clean)})" if cols_clean else "NULL::jsonb"
+
+    cfg_sources = ["d.config_jsonb", "d.config_json::jsonb"]
+    met_sources = ["d.metadata_jsonb", "d.metadata_json::jsonb"]
+    mtr_sources = ["d.metrics_jsonb", "d.metrics_json::jsonb"]
+
+    if "config_jsonb" in run_cols:
+        cfg_sources.append("r.config_jsonb")
+    if "config_json" in run_cols:
+        cfg_sources.append("r.config_json::jsonb")
+
+    if "metadata_jsonb" in run_cols:
+        met_sources.append("r.metadata_jsonb")
+    if "metadata_json" in run_cols:
+        met_sources.append("r.metadata_json::jsonb")
+
+    if "metrics_jsonb" in run_cols:
+        mtr_sources.append("r.metrics_jsonb")
+    if "metrics_json" in run_cols:
+        mtr_sources.append("r.metrics_json::jsonb")
+
+    cfg_expr = _coalesce_jsonb(cfg_sources)
+    met_expr = _coalesce_jsonb(met_sources)
+    mtr_expr = _coalesce_jsonb(mtr_sources)
+
     select: Dict[str, str] = {
         "run_id": "r.id AS run_id",
         "id": "r.id",
@@ -9149,9 +9594,9 @@ def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
         "strategy_name": "r.strategy_name",
         "strategy_version": "r.strategy_version",
         "market_type": "r.market_type",
-        "config_json": "r.config_json",
-        "metrics_json": "r.metrics_json",
-        "metadata_json": "r.metadata_json",
+        "config_json": f"{cfg_expr}::text AS config_json",
+        "metrics_json": f"{mtr_expr}::text AS metrics_json",
+        "metadata_json": f"{met_expr}::text AS metadata_json",
         "start_time": "r.start_time",
         "end_time": "r.end_time",
         "net_profit": "r.net_profit",
@@ -9191,6 +9636,29 @@ def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
 
 def _runs_duration_seconds_sql() -> str:
     return "EXTRACT(EPOCH FROM (r.end_time::timestamptz - r.start_time::timestamptz))"
+
+
+_SAFE_JSON_PATH_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _safe_json_path_parts(key: str) -> Optional[List[str]]:
+    parts = [p for p in str(key or "").strip().split(".") if p]
+    if not parts:
+        return None
+    for part in parts:
+        if not _SAFE_JSON_PATH_RE.match(part):
+            return None
+    return parts
+
+
+def _runs_config_jsonb_expr(run_cols: set[str]) -> str:
+    cfg_sources = ["d.config_jsonb", "d.config_json::jsonb"]
+    if "config_jsonb" in run_cols:
+        cfg_sources.append("r.config_jsonb")
+    if "config_json" in run_cols:
+        cfg_sources.append("r.config_json::jsonb")
+    cfg_sources = [c for c in cfg_sources if c]
+    return f"COALESCE({', '.join(cfg_sources)})" if cfg_sources else "NULL::jsonb"
 
 
 def _build_runs_where(
@@ -9482,6 +9950,7 @@ def list_runs_server_side(
     filter_model: Optional[Dict[str, Any]] = None,
     sort_model: Optional[List[Dict[str, Any]]] = None,
     visible_columns: Optional[List[str]] = None,
+    config_keys: Optional[List[str]] = None,
     user_id: Optional[str] = None,
     extra_where: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
@@ -9505,7 +9974,18 @@ def list_runs_server_side(
         if "end_time" in allowed_select and "end_time" not in selected:
             selected.append("end_time")
 
-        select_sql = ", ".join([allowed_select[c] for c in selected])
+        extra_select: List[str] = []
+        if config_keys:
+            cfg_expr = _runs_config_jsonb_expr(run_cols)
+            for key in config_keys:
+                parts = _safe_json_path_parts(key)
+                if not parts:
+                    continue
+                path_sql = ", ".join([f"'{p}'" for p in parts])
+                alias = f"cfg__{key}"
+                extra_select.append(f"jsonb_extract_path_text({cfg_expr}, {path_sql}) AS \"{alias}\"")
+
+        select_sql = ", ".join([allowed_select[c] for c in selected] + extra_select)
         if not select_sql:
             select_sql = "r.id AS run_id, r.created_at"
 
@@ -9534,6 +10014,7 @@ def list_runs_server_side(
             FROM backtest_runs r
             LEFT JOIN sweeps sw ON sw.id = r.sweep_id
             LEFT JOIN symbols s ON s.exchange_symbol = r.symbol
+            LEFT JOIN backtest_run_details d ON d.run_id = r.id
             {shortlist_join}
             {where_clause}
             {order_sql}

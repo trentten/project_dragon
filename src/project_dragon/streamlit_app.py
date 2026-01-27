@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, MutableMapping
 
 import pandas as pd
 
@@ -113,6 +113,11 @@ from project_dragon.storage import (
     get_job,
     get_or_create_user_id,
     get_user_setting,
+    list_saved_periods,
+    create_saved_period,
+    update_saved_period,
+    delete_saved_period,
+    get_saved_period,
     init_db,
     link_bot_to_run,
     list_assets,
@@ -138,6 +143,7 @@ from project_dragon.storage import (
     load_cached_range,
     open_db_connection,
     reconcile_inprocess_jobs_after_restart,
+    reconcile_sweep_statuses,
     sample_backtest_runs_missing_details,
     save_backtest_run,
     save_backtest_run_details_for_existing_run,
@@ -177,7 +183,13 @@ from project_dragon.runs_explorer import (
     top_config_keys_by_frequency,
 )
 from project_dragon.ui.icons import ICONS as TABLER_ICONS
-from project_dragon.ui.icons import get_tabler_svg, render_tabler_icon, st_tabler_icon, tabler_svg_to_data_uri
+from project_dragon.ui.icons import (
+    get_tabler_svg,
+    render_tabler_icon,
+    st_tabler_icon,
+    tabler_svg_to_data_uri,
+    tabler_assets_available,
+)
 from project_dragon.ui.ui_filters import render_table_filters
 from project_dragon.ui.components import (
     aggrid_pill_style,
@@ -222,6 +234,18 @@ def _ui_local_date_iso(value: Any, tz: Any) -> Optional[str]:
     try:
         dt_local = to_local_display(value, tz)
         return dt_local.date().isoformat() if dt_local is not None else None
+    except Exception:
+        return None
+
+
+def _ui_local_date_dmy(value: Any, tz: Any) -> Optional[str]:
+    """Convert a timestamp to a local date string (DD/MM/YY) for UI display."""
+
+    try:
+        dt_local = to_local_display(value, tz)
+        if dt_local is None:
+            return None
+        return dt_local.strftime("%d/%m/%y")
     except Exception:
         return None
 
@@ -929,7 +953,12 @@ def _aggrid_dark_custom_css() -> dict:
         ".ag-cell-wrapper": {"align-items": "center", "height": "100%"},
         ".ag-cell-value": {"display": "flex", "align-items": "center", "height": "100%"},
         ".ag-row": {"background-color": "#262627"},
-        ".ag-body-viewport": {"color-scheme": "dark"},
+        ".ag-body": {"background-color": "#262627"},
+        ".ag-body-viewport": {"color-scheme": "dark", "background-color": "#262627"},
+        ".ag-center-cols-viewport": {"background-color": "#262627"},
+        ".ag-center-cols-container": {"background-color": "#262627"},
+        ".ag-overlay-no-rows-center": {"background-color": "#262627", "color": "rgba(242,242,242,0.7)"},
+        ".ag-overlay-loading-center": {"background-color": "#262627", "color": "rgba(242,242,242,0.7)"},
         ".ag-popup": {"color-scheme": "dark"},
         ".ag-popup-child": {
             "background-color": "#262627",
@@ -1324,12 +1353,156 @@ def test_woox_credential(user_id: str, credential_id: int, symbol: str) -> Dict[
         }
 
 DURATION_CHOICES = {
-    "1 day": timedelta(days=1),
-    "3 days": timedelta(days=3),
     "1 week": timedelta(weeks=1),
-    "2 weeks": timedelta(weeks=2),
     "1 month": timedelta(days=30),
+    "3 months": timedelta(days=90),
+    "6 months": timedelta(days=180),
+    "12 months": timedelta(days=365),
 }
+    
+def _aggrid_metrics_gradient_style_js() -> str:
+    """Shared metric gradient style (Results + Sweeps Runs)."""
+
+    return """
+            function(params) {
+                const col = (params && params.colDef && params.colDef.field) ? params.colDef.field.toString() : '';
+                const v = Number(params.value);
+                if (!isFinite(v)) { return {}; }
+
+                const greenText = '#7ee787';
+                const redText = '#ff7b72';
+                const neutralText = '#cbd5e1';
+                const greenRgb = '46,160,67';
+                const redRgb = '248,81,73';
+
+                function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
+                function alphaFromT(t) { return 0.10 + (0.22 * clamp01(t)); }
+                function styleGoodBad(isGood, t) {
+                    const a = alphaFromT(t);
+                    if (isGood === true) return { color: greenText, backgroundColor: `rgba(${greenRgb},${a})`, textAlign: 'center' };
+                    if (isGood === false) return { color: redText, backgroundColor: `rgba(${redRgb},${a})`, textAlign: 'center' };
+                    return { color: neutralText, textAlign: 'center' };
+                }
+
+                function asRatio(x) {
+                    if (!isFinite(x)) { return x; }
+                    return (Math.abs(x) <= 1.0) ? x : (x / 100.0);
+                }
+
+                if (col === 'max_drawdown_pct') {
+                    const r = asRatio(v);
+                    const t = clamp01(r / 0.30);
+                    return styleGoodBad(false, t);
+                }
+                if (col === 'net_return_pct') {
+                    const r = asRatio(v);
+                    const t = clamp01(Math.abs(r) / 0.50);
+                    if (r > 0) return styleGoodBad(true, t);
+                    if (r < 0) return styleGoodBad(false, t);
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                if (col === 'roi_pct_on_margin') {
+                    // v is already a percent (e.g. 100.0 means +100%)
+                    const t = clamp01(Math.abs(v) / 200.0);
+                    if (v > 0) return styleGoodBad(true, t);
+                    if (v < 0) return styleGoodBad(false, t);
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                if (col === 'win_rate') {
+                    const r = asRatio(v);
+                    const dist = Math.abs(r - 0.5);
+                    const t = clamp01(dist / 0.25);
+                    return styleGoodBad(r >= 0.5, t);
+                }
+                if (['profit_factor', 'cpc_index', 'common_sense_ratio'].includes(col)) {
+                    const dist = Math.abs(v - 1.0);
+                    const t = clamp01(dist / 1.0);
+                    return styleGoodBad(v >= 1.0, t);
+                }
+                if (['sharpe', 'sortino'].includes(col)) {
+                    if (v >= 1.0) {
+                        const t = clamp01((v - 1.0) / 2.0);
+                        return styleGoodBad(true, t);
+                    }
+                    if (v < 0.0) {
+                        const t = clamp01(Math.abs(v) / 1.5);
+                        return styleGoodBad(false, t);
+                    }
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                if (col === 'net_profit') {
+                    const t = clamp01(Math.abs(v) / 1000.0);
+                    if (v > 0) return styleGoodBad(true, t);
+                    if (v < 0) return styleGoodBad(false, t);
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                return {};
+            }
+            """
+
+def _aggrid_ddmmyy_formatter() -> Any:
+    return JsCode(
+        """
+            function(params) {
+                try {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    const s = v.toString().trim();
+                    if (!s) return '';
+
+                    // Fast-path for YYYY-MM-DD.
+                    const m = s.match(/^([0-9]{4})-([0-9]{2})-([0-9]{2})/);
+                    if (m) {
+                        return `${m[3]}/${m[2]}/${m[1].slice(2)}`;
+                    }
+
+                    let d;
+                    if (/^[0-9]+$/.test(s)) {
+                        const n = parseInt(s, 10);
+                        d = new Date(n > 1000000000000 ? n : (n * 1000));
+                    } else {
+                        d = new Date(s);
+                    }
+                    if (isNaN(d.getTime())) return s;
+
+                    const dd = String(d.getUTCDate()).padStart(2, '0');
+                    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+                    const yy = String(d.getUTCFullYear()).slice(2);
+                    return `${dd}/${mm}/${yy}`;
+                } catch (e) {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    return v;
+                }
+            }
+            """
+    )
+
+def _sanitize_widget_choice(
+    state: MutableMapping[str, Any],
+    key: str,
+    options: Sequence[Any],
+    *,
+    default: Any = None,
+) -> Optional[Any]:
+    """Normalize invalid widget values before Streamlit renders controls."""
+
+    if not options:
+        return None
+    if key not in state:
+        return None
+    current = state.get(key)
+    if current in options:
+        return current
+
+    # Case-insensitive/normalized match
+    cur_norm = str(current).strip().lower()
+    for opt in options:
+        if str(opt).strip().lower() == cur_norm:
+            state[key] = opt
+            return opt
+
+    fallback = default if default in options else options[0]
+    state[key] = fallback
+    return fallback
 
 ORDER_STYLE_OPTIONS = {
     "Market": OrderStyle.MARKET,
@@ -1484,8 +1657,6 @@ def init_state_defaults(settings: Dict[str, Any]) -> None:
     _seed("bt_base_deviation_pct", 1.0)
     _seed("bt_deviation_multiplier", 2.0)
     _seed("bt_volume_multiplier", 2.0)
-
-    _seed("bt_plot_dca_levels", False)
 
     _seed("bt_ma_interval_min", 120)
     _seed("bt_ma_length", 200)
@@ -1725,73 +1896,70 @@ def _runs_server_filter_controls(
         else:
             _ = row1[1].text_input("Symbol contains", key=f"{prefix}_symbol_contains", **_kw())
 
-        strategy_vals: List[str] = []
-        if isinstance(strategy_options, list) and strategy_options:
-            strategy_vals = row1[2].multiselect(
-                "Strategy",
-                options=strategy_options,
-                default=st.session_state.get(f"{prefix}_strategy_multi", []),
-                key=f"{prefix}_strategy_multi",
-            )
-        else:
-            _ = row1[2].text_input("Strategy contains", key=f"{prefix}_strategy_contains", **_kw())
-
         timeframe_vals: List[str] = []
         if isinstance(timeframe_options, list) and timeframe_options:
-            timeframe_vals = row1[3].multiselect(
+            timeframe_vals = row1[2].multiselect(
                 "Timeframe",
                 options=timeframe_options,
                 default=st.session_state.get(f"{prefix}_timeframe_multi", []),
                 key=f"{prefix}_timeframe_multi",
             )
         else:
-            _ = row1[3].text_input("Timeframe contains", key=f"{prefix}_timeframe_contains", **_kw())
+            _ = row1[2].text_input("Timeframe contains", key=f"{prefix}_timeframe_contains", **_kw())
+
+        direction_val = row1[3].selectbox(
+            "Direction",
+            options=["All", "Long", "Short"],
+            index=["All", "Long", "Short"].index(
+                str(st.session_state.get(f"{prefix}_direction", "All") or "All")
+                if str(st.session_state.get(f"{prefix}_direction", "All") or "All") in {"All", "Long", "Short"}
+                else "All"
+            ),
+            key=f"{prefix}_direction",
+        )
 
         row2 = st.columns(4)
-        sweep = row2[0].text_input("Sweep name contains", key=f"{prefix}_sweep_contains", **_kw())
+        strategy_vals: List[str] = []
+        if isinstance(strategy_options, list) and strategy_options:
+            strategy_vals = row2[0].multiselect(
+                "Strategy",
+                options=strategy_options,
+                default=st.session_state.get(f"{prefix}_strategy_multi", []),
+                key=f"{prefix}_strategy_multi",
+            )
+        else:
+            _ = row2[0].text_input("Strategy contains", key=f"{prefix}_strategy_contains", **_kw())
 
         bounds = bounds or {}
-        np_min_bound = bounds.get("net_profit_min")
-        np_max_bound = bounds.get("net_profit_max")
-        if np_min_bound is not None and np_max_bound is not None:
-            net_profit_range = row2[1].slider(
-                "Net profit",
-                min_value=float(np_min_bound),
-                max_value=float(np_max_bound),
-                value=(float(np_min_bound), float(np_max_bound)),
-                key=f"{prefix}_net_profit_range",
+        roi_min_bound = bounds.get("roi_pct_on_margin_min")
+        roi_max_bound = bounds.get("roi_pct_on_margin_max")
+        if roi_min_bound is not None and roi_max_bound is not None:
+            roi_min = row2[1].slider(
+                "ROI % (min)",
+                min_value=float(roi_min_bound),
+                max_value=float(roi_max_bound),
+                value=float(st.session_state.get(f"{prefix}_roi_min", roi_min_bound)),
+                step=1.0,
+                key=f"{prefix}_roi_min",
             )
         else:
-            net_profit_range = None
-            _ = row2[1].text_input("Net profit min", key=f"{prefix}_net_profit_min", **_kw())
-            _ = row2[2].text_input("Net profit max", key=f"{prefix}_net_profit_max", **_kw())
+            roi_min = row2[1].text_input("ROI % (min)", key=f"{prefix}_roi_min", **_kw())
 
-        nr_min_bound = bounds.get("net_return_pct_min")
-        nr_max_bound = bounds.get("net_return_pct_max")
-        if nr_min_bound is not None and nr_max_bound is not None:
-            net_return_range = row2[2].slider(
-                "Net return %",
-                min_value=float(nr_min_bound * 100.0),
-                max_value=float(nr_max_bound * 100.0),
-                value=(float(nr_min_bound * 100.0), float(nr_max_bound * 100.0)),
-                key=f"{prefix}_net_return_range",
-            )
-        else:
-            net_return_range = None
-            _ = row2[2].text_input("Net return % (min)", key=f"{prefix}_net_ret_min", **_kw())
-            _ = row2[3].text_input("Net return % (max)", key=f"{prefix}_net_ret_max", **_kw())
-
-        max_dd_max = row2[3].text_input("Max DD % (max)", key=f"{prefix}_max_dd_max", **_kw())
-
-        row3 = st.columns(4)
-        roi_min = row3[0].text_input("ROI % (min)", key=f"{prefix}_roi_min", **_kw())
-        roi_max = row3[1].text_input("ROI % (max)", key=f"{prefix}_roi_max", **_kw())
-        duration_min = row3[2].text_input("Duration min (hrs)", key=f"{prefix}_duration_min", **_kw())
-        duration_max = row3[3].text_input("Duration max (hrs)", key=f"{prefix}_duration_max", **_kw())
+        duration_choice = row2[2].selectbox(
+            "Duration",
+            options=["All", "1W", "1M", "3M", "6M", "12M"],
+            index=["All", "1W", "1M", "3M", "6M", "12M"].index(
+                str(st.session_state.get(f"{prefix}_duration_preset", "All") or "All")
+                if str(st.session_state.get(f"{prefix}_duration_preset", "All") or "All")
+                in {"All", "1W", "1M", "3M", "6M", "12M"}
+                else "All"
+            ),
+            key=f"{prefix}_duration_preset",
+        )
 
         run_type = "All"
         if include_run_type:
-            run_type = st.radio(
+            run_type = row2[3].radio(
                 "Run type",
                 options=["All", "Single", "Sweep"],
                 index=["All", "Single", "Sweep"].index(
@@ -1802,6 +1970,8 @@ def _runs_server_filter_controls(
                 key=f"{prefix}_run_type",
                 horizontal=True,
             )
+        else:
+            row2[3].markdown("&nbsp;", unsafe_allow_html=True)
 
         def _clear_filters() -> None:
             for key_suffix in (
@@ -1812,18 +1982,9 @@ def _runs_server_filter_controls(
                 "strategy_multi",
                 "timeframe_contains",
                 "timeframe_multi",
-                "sweep_contains",
-                "net_profit_min",
-                "net_profit_max",
-                "net_profit_range",
-                "max_dd_max",
-                "net_ret_min",
-                "net_ret_max",
-                "net_return_range",
+                "direction",
                 "roi_min",
-                "roi_max",
-                "duration_min",
-                "duration_max",
+                "duration_preset",
                 "run_type",
             ):
                 st.session_state.pop(f"{prefix}_{key_suffix}", None)
@@ -1867,8 +2028,8 @@ def _runs_server_filter_controls(
         extra["timeframe_contains"] = timeframe_text
     if timeframe_vals:
         extra["timeframe"] = timeframe_vals
-    if str(sweep or "").strip():
-        extra["sweep_name_contains"] = str(sweep).strip()
+    if str(direction_val or "").strip() and str(direction_val).lower() != "all":
+        extra["direction"] = str(direction_val).strip()
 
     if include_run_type:
         if str(run_type).lower() == "single":
@@ -1876,59 +2037,25 @@ def _runs_server_filter_controls(
         elif str(run_type).lower() == "sweep":
             extra["run_type"] = "sweep"
 
-    if isinstance(net_profit_range, tuple) and len(net_profit_range) == 2:
-        try:
-            lo, hi = float(net_profit_range[0]), float(net_profit_range[1])
-            base_lo = float(np_min_bound) if np_min_bound is not None else None
-            base_hi = float(np_max_bound) if np_max_bound is not None else None
-            if base_lo is None or base_hi is None or abs(lo - base_lo) > 1e-9 or abs(hi - base_hi) > 1e-9:
-                extra["net_profit_min"] = lo
-                extra["net_profit_max"] = hi
-        except Exception:
-            pass
-    else:
-        np_min = _as_float(st.session_state.get(f"{prefix}_net_profit_min"))
-        if np_min is not None:
-            extra["net_profit_min"] = np_min
-        np_max = _as_float(st.session_state.get(f"{prefix}_net_profit_max"))
-        if np_max is not None:
-            extra["net_profit_max"] = np_max
-
-    dd_max = _as_float(max_dd_max)
-    if dd_max is not None:
-        extra["max_drawdown_pct_max"] = dd_max / 100.0
-
-    if isinstance(net_return_range, tuple) and len(net_return_range) == 2:
-        try:
-            lo, hi = float(net_return_range[0]), float(net_return_range[1])
-            base_lo = float(nr_min_bound * 100.0) if nr_min_bound is not None else None
-            base_hi = float(nr_max_bound * 100.0) if nr_max_bound is not None else None
-            if base_lo is None or base_hi is None or abs(lo - base_lo) > 1e-9 or abs(hi - base_hi) > 1e-9:
-                extra["net_return_pct_min"] = lo / 100.0
-                extra["net_return_pct_max"] = hi / 100.0
-        except Exception:
-            pass
-    else:
-        nr_min = _as_float(st.session_state.get(f"{prefix}_net_ret_min"))
-        if nr_min is not None:
-            extra["net_return_pct_min"] = nr_min / 100.0
-        nr_max = _as_float(st.session_state.get(f"{prefix}_net_ret_max"))
-        if nr_max is not None:
-            extra["net_return_pct_max"] = nr_max / 100.0
-
     rmin = _as_float(roi_min)
     if rmin is not None:
         extra["roi_pct_on_margin_min"] = rmin
-    rmax = _as_float(roi_max)
-    if rmax is not None:
-        extra["roi_pct_on_margin_max"] = rmax
 
-    dmin = _as_float(duration_min)
-    if dmin is not None:
-        extra["duration_min_hours"] = dmin
-    dmax = _as_float(duration_max)
-    if dmax is not None:
-        extra["duration_max_hours"] = dmax
+    if str(duration_choice or "").strip() and str(duration_choice) != "All":
+        now = datetime.now(timezone.utc)
+        delta_days = 7
+        if duration_choice == "1M":
+            delta_days = 30
+        elif duration_choice == "3M":
+            delta_days = 90
+        elif duration_choice == "6M":
+            delta_days = 180
+        elif duration_choice == "12M":
+            delta_days = 365
+        start_dt = datetime.combine((now - timedelta(days=delta_days)).date(), datetime.min.time(), tzinfo=timezone.utc)
+        end_dt = datetime.combine(now.date(), datetime.max.time(), tzinfo=timezone.utc)
+        extra["created_at_from"] = start_dt.isoformat()
+        extra["created_at_to"] = end_dt.isoformat()
 
     return extra
 
@@ -2275,6 +2402,10 @@ def _wkey(model_key: str) -> str:
 def _sync_model_from_widget(model_key: str) -> None:
     widget_key = _wkey(model_key)
     st.session_state[model_key] = st.session_state.get(widget_key)
+    if model_key.endswith("_value"):
+        base_key = model_key[: -len("_value")]
+        if base_key:
+            st.session_state[base_key] = st.session_state.get(widget_key)
 
 
 def _sync_sweep_mode_from_bool(mode_key: str, bool_key: str) -> None:
@@ -2424,14 +2555,36 @@ def render_sweepable_number(
     sweep_values: Optional[list[Any]] = None
     if str(mode_val).strip().lower() == "sweep":
         with cols[2]:
+            sweep_kind_options = ["Range", "List"]
+            widget_key = _wkey(sweep_kind_key)
+            _sanitize_widget_choice(
+                st.session_state,
+                widget_key,
+                sweep_kind_options,
+                default="Range",
+            )
+            _sanitize_widget_choice(
+                st.session_state,
+                sweep_kind_key,
+                sweep_kind_options,
+                default="Range",
+            )
+            selected_kind = st.session_state.get(widget_key) if widget_key in st.session_state else st.session_state.get(sweep_kind_key)
+            kind_index = 0
+            try:
+                if selected_kind in sweep_kind_options:
+                    kind_index = sweep_kind_options.index(selected_kind)
+                elif str(selected_kind or "").strip().lower() == "list":
+                    kind_index = 1
+            except Exception:
+                kind_index = 0
+
             kind = st.radio(
                 "Sweep type",
-                options=["Range", "List"],
-                index=0
-                if str(st.session_state.get(sweep_kind_key) or "range").strip().lower() != "list"
-                else 1,
+                options=sweep_kind_options,
+                index=kind_index,
                 horizontal=True,
-                key=_wkey(sweep_kind_key),
+                key=widget_key,
                 on_change=_sync_model_from_widget,
                 args=(sweep_kind_key,),
                 label_visibility="collapsed",
@@ -4433,21 +4586,63 @@ def build_config(form_inputs: Dict[str, Any]) -> DragonAlgoConfig:
         macd=macd,
         rsi=rsi,
     )
+def normalize_exchange_id(exchange_id: str) -> str:
+    ex = (str(exchange_id or "").strip().lower() or "")
+    if ex in {"woo", "woox", "woo-x", "woo_x"}:
+        return "woox"
+    return ex
+
+
+def exchange_id_for_ccxt(exchange_id: str) -> str:
+    ex = normalize_exchange_id(exchange_id)
+    return "woo" if ex == "woox" else ex
+
+
+def _dedupe_symbol_candidates(symbols: list[str], markets: Optional[dict] = None) -> list[str]:
+    """Deduplicate symbol candidates with a stable preference order.
+
+    Preference rule:
+    - Keep the first occurrence unless a later duplicate is marked active.
+    """
+
+    out: list[str] = []
+    best_score: dict[str, int] = {}
+    markets = markets or {}
+    for sym in symbols or []:
+        s = str(sym or "").strip()
+        if not s:
+            continue
+        m = markets.get(s) if isinstance(markets, dict) else None
+        active = bool(m.get("active")) if isinstance(m, dict) else False
+        score = 2 if active else 0
+        if s not in best_score:
+            best_score[s] = score
+            out.append(s)
+        elif score > best_score.get(s, -1):
+            best_score[s] = score
+            try:
+                idx = out.index(s)
+                out[idx] = s
+            except ValueError:
+                out.append(s)
+    return out
+
+
 def fetch_ccxt_metadata(exchange_id: str) -> tuple[dict, list[str]]:
     # NOTE: This is used to populate UI dropdowns. It must be fast and should
     # avoid heavyweight network calls whenever possible.
 
-    ex_norm = (str(exchange_id or "").strip().lower() or "woo")
+    ex_norm = normalize_exchange_id(exchange_id) or "woox"
 
     # WooX: prefer our public REST implementation (no ccxt.load_markets).
-    if ex_norm in {"woox", "woo", "woo-x", "woo_x"}:
+    if ex_norm == "woox":
         markets, timeframes = get_woox_market_catalog(ex_norm, ttl_sec=600)
         return markets, list(timeframes)
 
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
 
-    exchange_class = getattr(ccxt, exchange_id)
+    exchange_class = getattr(ccxt, exchange_id_for_ccxt(exchange_id))
     exchange = exchange_class()
     try:
         markets = exchange.load_markets()
@@ -4517,12 +4712,6 @@ def _jsonify(value: Any) -> Any:
 
 
 SWEEPABLE_FIELDS: Dict[str, Dict[str, Any]] = {
-    "general.max_entries": {
-        "label": "General – Max entries",
-        "path": ("general", "max_entries"),
-        "type": int,
-        "default_values": "3,5,7",
-    },
     "general.initial_entry_balance_pct": {
         "label": "General – Initial entry (% of balance)",
         "path": ("general", "initial_entry_balance_pct"),
@@ -4534,18 +4723,6 @@ SWEEPABLE_FIELDS: Dict[str, Dict[str, Any]] = {
         "path": ("general", "initial_entry_fixed_usd"),
         "type": float,
         "default_values": "25,50,100",
-    },
-    "general.entry_timeout_min": {
-        "label": "General – Entry timeout (min)",
-        "path": ("general", "entry_timeout_min"),
-        "type": int,
-        "default_values": "5,10,15",
-    },
-    "general.entry_cooldown_min": {
-        "label": "General – Entry cooldown (min)",
-        "path": ("general", "entry_cooldown_min"),
-        "type": int,
-        "default_values": "5,10,20",
     },
     "general.dynamic_activation.entry_pct": {
         "label": "Dynamic activation – Entry (%)",
@@ -6702,50 +6879,6 @@ def render_run_detail_from_db(
                 if pr_fig is not None:
                     pr_fig.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10))
 
-                debug_ma = st.checkbox(
-                    "Debug HTF MA (resample + ffill)",
-                    value=False,
-                    key=f"run_details_debug_ma_{run_id_for_key}",
-                    help="Print the last 10 base candles, HTF closes, HTF MA values, and mapped MA values.",
-                )
-                if debug_ma and result is not None and ma_periods:
-                    try:
-                        period = int(ma_periods[0])
-                    except Exception:
-                        period = 0
-                    if period > 0 and result.candles:
-                        base_ts = [getattr(c, "timestamp", None) for c in result.candles]
-                        base_closes = [getattr(c, "close", None) for c in result.candles]
-                        _, htf_closes, htf_ma, mapped_ma = htf_ma_mapping(
-                            base_ts,
-                            base_closes,
-                            int(ma_interval_min or 1),
-                            period,
-                            str(ma_type or "sma"),
-                        )
-
-                        def _fmt_tail(series: pd.Series, label: str) -> list[str]:
-                            out = [label]
-                            tail = series.tail(10)
-                            for idx, val in tail.items():
-                                ts = pd.to_datetime(idx, utc=True)
-                                if pd.isna(val):
-                                    out.append(f"  {ts.isoformat()} → NaN")
-                                else:
-                                    out.append(f"  {ts.isoformat()} → {float(val):.6f}")
-                            return out
-
-                        debug_lines: list[str] = []
-                        base_series = pd.Series(base_closes, index=pd.to_datetime(base_ts, utc=True))
-                        debug_lines.extend(_fmt_tail(base_series, "Base candles (last 10: ts → close)"))
-                        debug_lines.append("")
-                        debug_lines.extend(_fmt_tail(htf_closes, "HTF closes (last 10: ts → close)"))
-                        debug_lines.append("")
-                        debug_lines.extend(_fmt_tail(htf_ma, "HTF MA (last 10: ts → MA)"))
-                        debug_lines.append("")
-                        debug_lines.extend(_fmt_tail(mapped_ma, "Mapped MA on base (last 10: ts → MA)"))
-                        st.code("\n".join(debug_lines))
-
                 render_card(
                     "Equity curve",
                     (lambda: st.plotly_chart(eq_fig, width="stretch", key=f"run_{run_id_for_key}_equity_detail"))
@@ -7036,11 +7169,8 @@ def _apply_backtest_data_settings_to_ui(
 
 
 _SWEEP_FIELD_KEY_TO_BASE_KEY: Dict[str, str] = {
-    "general.max_entries": "bt_max_entries",
     "general.initial_entry_balance_pct": "bt_initial_entry_balance_pct",
     "general.initial_entry_fixed_usd": "bt_initial_entry_fixed_usd",
-    "general.entry_timeout_min": "bt_entry_timeout_min",
-    "general.entry_cooldown_min": "bt_entry_cooldown_min",
     "exits.fixed_sl_pct": "bt_fixed_sl_pct",
     "exits.fixed_tp_pct": "bt_fixed_tp_pct",
     "exits.use_atr_tp": "bt_use_atr_tp",
@@ -7311,8 +7441,6 @@ def _apply_run_config_to_backtest_ui(run_row: Dict[str, Any], *, settings: Dict[
     _set_model_and_widget("bt_use_atr_tp", tp_mode_raw == TakeProfitMode.ATR.value)
 
     _set_model_and_widget("bt_tp_replace_threshold_pct", float(_f(exits, "tp_replace_threshold_pct", 0.05)))
-
-    _set_model_and_widget("bt_plot_dca_levels", bool(_f(general, "plot_dca_levels", False)))
 
     # Backtest leverage (used for ROI-on-margin style metrics). Stored as `_futures.leverage` when != 1.
     lev_bt = None
@@ -7603,11 +7731,10 @@ def render_dragon_strategy_config_view(config_dict: Dict[str, Any], *, key_prefi
 
     with st.container(border=True):
         st.markdown("### DCA")
-        d = st.columns(4)
+        d = st.columns(3)
         d[0].number_input("Base deviation (%)", value=float(cfg.dca.base_deviation_pct), disabled=True, key=_k("dca_bd"))
         d[1].number_input("Deviation multiplier", value=float(cfg.dca.deviation_multiplier), disabled=True, key=_k("dca_dm"))
         d[2].number_input("Volume multiplier", value=float(cfg.dca.volume_multiplier), disabled=True, key=_k("dca_vm"))
-        d[3].checkbox("Plot DCA levels", value=bool(cfg.general.plot_dca_levels), disabled=True, key=_k("dca_plot"))
 
     with st.container(border=True):
         st.markdown("### Exits")
@@ -7697,7 +7824,24 @@ def render_dragon_strategy_config_view(config_dict: Dict[str, Any], *, key_prefi
 
 
 def main() -> None:
-    st.set_page_config(page_title="Project Dragon", layout="wide")
+    icon_path = None
+    try:
+        icon_candidate = Path(__file__).resolve().parents[2] / "app" / "assets" / "project_dragon_icon.svg"
+        if icon_candidate.exists():
+            icon_path = str(icon_candidate)
+    except Exception:
+        icon_path = None
+    st.set_page_config(page_title="Project Dragon", layout="wide", page_icon=(icon_path or "🐉"))
+
+    try:
+        if not st.session_state.get("_tabler_assets_warned", False) and not tabler_assets_available():
+            st.warning(
+                "Tabler icon assets are missing. UI icons may not render correctly. "
+                "Ensure app/assets/ui_icons/tabler is present in the container."
+            )
+            st.session_state["_tabler_assets_warned"] = True
+    except Exception:
+        pass
     inject_trade_stream_css(max_width_px=1920)
 
     # Optional perf profiling (dev-only): enable with DRAGON_PROFILE=1.
@@ -9114,6 +9258,7 @@ def main() -> None:
                 "profit_factor": "Profit Factor",
                 "cpc_index": "CPC Index",
                 "common_sense_ratio": "Common Sense Ratio",
+                "avg_position_time_s": "Avg Position Time",
             }
 
             roi_pct_formatter = JsCode(
@@ -9133,7 +9278,7 @@ def main() -> None:
                   const v = Number(params.value);
                   if (!isFinite(v)) { return ''; }
                                     const shown = (Math.abs(v) <= 1.0) ? (v * 100.0) : v;
-                                                                        return shown.toFixed(0) + '%';
+                                    return shown.toFixed(0) + '%';
                 }
                 """
             )
@@ -9147,19 +9292,24 @@ def main() -> None:
                 }
                 """
             )
-            date_formatter = JsCode(
+            avg_pos_time_formatter = JsCode(
                 """
                 function(params) {
-                  if (!params.value) { return ''; }
-                  const d = new Date(params.value);
-                  if (isNaN(d.getTime())) { return params.value; }
-                  const dd = String(d.getUTCDate()).padStart(2,'0');
-                  const mm = String(d.getUTCMonth()+1).padStart(2,'0');
-                  const yy = String(d.getUTCFullYear());
-                  return `${dd}-${mm}-${yy}`;
-                                }
-                                """
-                        )
+                    if (params.value === null || params.value === undefined || params.value === '') { return ''; }
+                    const v = Number(params.value);
+                    if (!isFinite(v) || v < 0) { return ''; }
+                    const secs = Math.floor(v);
+                    const days = Math.floor(secs / 86400);
+                    const hours = Math.floor((secs % 86400) / 3600);
+                    const mins = Math.floor((secs % 3600) / 60);
+                    if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+                    if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+                    if (mins > 0) return `${mins}m`;
+                    return '<1m';
+                }
+                """
+            )
+            ddmm_yy_formatter = _aggrid_ddmmyy_formatter()
 
             # Match Results/Runs Explorer pills for Timeframe + Direction.
             timeframe_style = aggrid_pill_style("timeframe")
@@ -9548,6 +9698,20 @@ def main() -> None:
                 "shortlist_note",
             ]
 
+            def _normalize_cfg_keys(raw: Any) -> List[str]:
+                out: List[str] = []
+                if isinstance(raw, (list, tuple)):
+                    for v in raw:
+                        s = str(v).strip()
+                        if s:
+                            out.append(s)
+                elif isinstance(raw, str) and raw.strip():
+                    out.append(raw.strip())
+                return out
+
+            config_keys_for_query = _normalize_cfg_keys(st.session_state.get("runs_explorer_config_cols"))
+            st.session_state["runs_explorer_config_keys_query"] = list(config_keys_for_query)
+
             extra_where = _runs_global_filters_to_extra_where(get_global_filters())
             if ui_filters:
                 extra_where.update(ui_filters)
@@ -9561,6 +9725,7 @@ def main() -> None:
                         filter_model=st.session_state.get("runs_explorer_filter_model"),
                         sort_model=st.session_state.get("runs_explorer_sort_model"),
                         visible_columns=runs_query_cols,
+                        config_keys=config_keys_for_query,
                         user_id=user_id,
                         extra_where=extra_where if extra_where else None,
                     )
@@ -9682,6 +9847,16 @@ def main() -> None:
 
             cfg_keys_all = sorted({k for cfg in flat_cfgs for k in (cfg.keys() if isinstance(cfg, dict) else [])})
 
+            try:
+                saved_cfg = st.session_state.get("runs_explorer_config_cols")
+                if isinstance(saved_cfg, (list, tuple)) and saved_cfg:
+                    for k in saved_cfg:
+                        ks = str(k).strip()
+                        if ks and ks not in cfg_keys_all:
+                            cfg_keys_all.append(ks)
+            except Exception:
+                pass
+
             metric_defaults = [
                 k
                 for k in ["net_profit", "roi_pct_on_margin", "net_return_pct", "max_drawdown_pct", "sharpe"]
@@ -9741,18 +9916,6 @@ def main() -> None:
                         format_func=_metric_label,
                     )
             with sel_cols[1]:
-                try:
-                    if "runs_explorer_config_cols" in st.session_state and isinstance(
-                        st.session_state.get("runs_explorer_config_cols"), list
-                    ):
-                        st.session_state["runs_explorer_config_cols"] = [
-                            str(x)
-                            for x in st.session_state["runs_explorer_config_cols"]
-                            if str(x) in set(cfg_keys_all)
-                        ]
-                except Exception:
-                    pass
-
                 if "runs_explorer_config_cols" in st.session_state:
                     selected_cfg_keys = st.multiselect(
                         "Config columns",
@@ -9780,6 +9943,26 @@ def main() -> None:
                         value=True,
                         key="runs_explorer_show_only_diff_cols",
                     )
+
+            try:
+                prev_cfg = st.session_state.get("runs_explorer_compare_last_cfg_keys")
+                prev_metric = st.session_state.get("runs_explorer_compare_last_metric_keys")
+                if prev_cfg != list(selected_cfg_keys or []) or prev_metric != list(selected_metric_keys or []):
+                    st.session_state.pop("runs_explorer_compare_columns_state_runtime", None)
+                st.session_state["runs_explorer_compare_last_cfg_keys"] = list(selected_cfg_keys or [])
+                st.session_state["runs_explorer_compare_last_metric_keys"] = list(selected_metric_keys or [])
+            except Exception:
+                pass
+
+            # If selected config columns changed, rerun once so SQL extractions include them.
+            try:
+                query_keys_snapshot = st.session_state.get("runs_explorer_config_keys_query") or []
+                if list(selected_cfg_keys or []) != list(query_keys_snapshot or []):
+                    st.session_state["runs_explorer_config_cols"] = list(selected_cfg_keys or [])
+                    st.session_state["runs_explorer_config_keys_query"] = list(selected_cfg_keys or [])
+                    st.rerun()
+            except Exception:
+                pass
 
             # --- Build dataframe ----------------------------------------
             base_rows: List[Dict[str, Any]] = []
@@ -9870,6 +10053,7 @@ def main() -> None:
                     "start_date": sd.date().isoformat() if sd else None,
                     "end_date": ed.date().isoformat() if ed else None,
                     "duration": _fmt_duration(sd, ed),
+                    "avg_position_time_s": b.get("avg_position_time_s"),
                     # Keep common metric fields available for filtering/formatting even if not selected.
                     "net_return_pct": b.get("net_return_pct"),
                     "roi_pct_on_margin": b.get("roi_pct_on_margin"),
@@ -9885,7 +10069,10 @@ def main() -> None:
                     col = cfg_field_by_key.get(k)
                     if not col:
                         continue
-                    row[col] = cf.get(k) if isinstance(cf, dict) else None
+                    if isinstance(b, dict) and col in b:
+                        row[col] = b.get(col)
+                    else:
+                        row[col] = cf.get(k) if isinstance(cf, dict) else None
                 base_rows.append(row)
 
             df = pd.DataFrame(base_rows)
@@ -9942,6 +10129,7 @@ def main() -> None:
                 "start_date",
                 "end_date",
                 "duration",
+                "avg_position_time_s",
                 "symbol",
                 "timeframe",
                 "direction",
@@ -10125,6 +10313,7 @@ def main() -> None:
                     hide=("start_date" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
+                    valueFormatter=ddmm_yy_formatter,
                     cellClass="ag-center-aligned-cell",
                 )
             if "end_date" in df.columns:
@@ -10136,6 +10325,7 @@ def main() -> None:
                     hide=("end_date" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
+                    valueFormatter=ddmm_yy_formatter,
                     cellClass="ag-center-aligned-cell",
                 )
             if "duration" in df.columns:
@@ -10147,6 +10337,17 @@ def main() -> None:
                     hide=("duration" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
+                    cellClass="ag-center-aligned-cell",
+                )
+            if "avg_position_time_s" in df.columns:
+                gb.configure_column(
+                    "avg_position_time_s",
+                    headerName=header_map.get("avg_position_time_s", "Avg Position Time"),
+                    width=150,
+                    hide=("avg_position_time_s" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                    valueFormatter=avg_pos_time_formatter,
                     cellClass="ag-center-aligned-cell",
                 )
             if "symbol" in df.columns:
@@ -10296,12 +10497,15 @@ def main() -> None:
                 )
 
             # Restore persisted column sizing/order for this compare grid.
+            runtime_state = st.session_state.get("runs_explorer_compare_columns_state_runtime")
             saved_state = st.session_state.get("runs_explorer_compare_columns_state")
             columns_state = None
-            if isinstance(saved_state, list) and saved_state:
+            state_source = runtime_state if isinstance(runtime_state, list) and runtime_state else saved_state
+            if isinstance(state_source, list) and state_source:
                 try:
                     sanitized: list[dict] = []
-                    for item in saved_state:
+                    valid_cols = set(df.columns.tolist())
+                    for item in state_source:
                         if not isinstance(item, dict):
                             continue
                         d = dict(item)
@@ -10310,10 +10514,21 @@ def main() -> None:
                         col_id = d.get("colId") or d.get("col_id") or d.get("field")
                         if not col_id:
                             continue
+                        if str(col_id) not in valid_cols:
+                            continue
                         sanitized.append(d)
                     columns_state = sanitized or None
                 except Exception:
                     columns_state = None
+
+            def _cols_signature(cols: Sequence[str]) -> str:
+                try:
+                    payload = "|".join([str(c) for c in cols if c])
+                    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+                except Exception:
+                    return "default"
+
+            grid_key = f"runs_explorer_compare_grid__{_cols_signature(list(selected_metric_keys or []) + list(selected_cfg_keys or []))}"
 
             grid = AgGrid(
                 df,
@@ -10327,9 +10542,32 @@ def main() -> None:
                 height=620,
                 theme="dark",
                 custom_css=_aggrid_dark_custom_css(),
-                key="runs_explorer_compare_grid",
+                key=grid_key,
                 columns_state=columns_state,
             )
+
+            # Persist runtime column sizing so filtering/toggling doesn't reset widths.
+            try:
+                runtime_cols = None
+                if hasattr(grid, "columns_state"):
+                    runtime_cols = getattr(grid, "columns_state")
+                if not runtime_cols and hasattr(grid, "get"):
+                    runtime_cols = grid.get("columns_state")
+                if isinstance(runtime_cols, list) and runtime_cols:
+                    sanitized_runtime: list[dict] = []
+                    valid_cols = set(df.columns.tolist())
+                    for item in runtime_cols:
+                        if not isinstance(item, dict):
+                            continue
+                        d = dict(item)
+                        d.pop("hide", None)
+                        col_id = d.get("colId") or d.get("col_id") or d.get("field")
+                        if not col_id or str(col_id) not in valid_cols:
+                            continue
+                        sanitized_runtime.append(d)
+                    st.session_state["runs_explorer_compare_columns_state_runtime"] = sanitized_runtime
+            except Exception:
+                pass
 
             grid_filter_model, grid_sort_model = _extract_aggrid_models(grid)
             if grid_filter_model is not None or grid_sort_model is not None:
@@ -10710,39 +10948,38 @@ def main() -> None:
 
                 row = st.columns(3)
                 with row[0]:
-                    max_entries, max_entries_sweep = render_sweepable_number(
-                        "bt_max_entries",
+                    max_entries = st.number_input(
                         "Max entries",
-                        default_value=int(st.session_state.get("bt_max_entries", 5)),
-                        sweep_field_key="general.max_entries",
-                        help="Maximum number of entries (initial + DCA) allowed per position.",
+                        value=int(st.session_state.get("bt_max_entries", 5)),
                         min_value=1,
                         step=1,
+                        key=_wkey("bt_max_entries"),
+                        on_change=_sync_model_from_widget,
+                        args=("bt_max_entries",),
+                        help="Maximum number of entries (initial + DCA) allowed per position.",
                     )
                 with row[1]:
-                    entry_cooldown, entry_cooldown_sweep = render_sweepable_number(
-                        "bt_entry_cooldown_min",
+                    entry_cooldown = st.number_input(
                         "Entry cooldown (min)",
-                        default_value=int(st.session_state.get("bt_entry_cooldown_min", 10)),
-                        sweep_field_key="general.entry_cooldown_min",
-                        help="Minimum minutes to wait before placing another entry/DCA order.",
+                        value=int(st.session_state.get("bt_entry_cooldown_min", 10)),
                         min_value=0,
                         step=1,
+                        key=_wkey("bt_entry_cooldown_min"),
+                        on_change=_sync_model_from_widget,
+                        args=("bt_entry_cooldown_min",),
+                        help="Minimum minutes to wait before placing another entry/DCA order.",
                     )
                 with row[2]:
-                    entry_timeout, entry_timeout_sweep = render_sweepable_number(
-                        "bt_entry_timeout_min",
+                    entry_timeout = st.number_input(
                         "Entry timeout (min)",
-                        default_value=int(st.session_state.get("bt_entry_timeout_min", 10)),
-                        sweep_field_key="general.entry_timeout_min",
-                        help="Cancel/abandon an unfilled entry after this many minutes.",
+                        value=int(st.session_state.get("bt_entry_timeout_min", 10)),
                         min_value=0,
                         step=1,
+                        key=_wkey("bt_entry_timeout_min"),
+                        on_change=_sync_model_from_widget,
+                        args=("bt_entry_timeout_min",),
+                        help="Cancel/abandon an unfilled entry after this many minutes.",
                     )
-
-                _track_sweep("bt_max_entries", "general.max_entries", max_entries_sweep)
-                _track_sweep("bt_entry_cooldown_min", "general.entry_cooldown_min", entry_cooldown_sweep)
-                _track_sweep("bt_entry_timeout_min", "general.entry_timeout_min", entry_timeout_sweep)
 
                 global_dyn_pct = st.number_input(
                     "Global dynamic activation band (%)",
@@ -10972,20 +11209,20 @@ def main() -> None:
 
                 with st.container(border=True):
                     st.markdown("#### MACD")
+                    macd_interval, macd_interval_sweep = render_sweepable_number(
+                        "bt_macd_interval_min",
+                        "MACD interval (min)",
+                        default_value=int(st.session_state.get("bt_macd_interval_min", 360)),
+                        sweep_field_key="macd.interval_min",
+                        help="How often MACD updates (in minutes).",
+                        min_value=1,
+                        step=1,
+                    )
+                    _track_sweep("bt_macd_interval_min", "macd.interval_min", macd_interval_sweep)
 
-                    macd_cols = st.columns(2)
-                    with macd_cols[0]:
-                        macd_interval, macd_interval_sweep = render_sweepable_number(
-                            "bt_macd_interval_min",
-                            "MACD interval (min)",
-                            default_value=int(st.session_state.get("bt_macd_interval_min", 360)),
-                            sweep_field_key="macd.interval_min",
-                            help="How often MACD updates (in minutes).",
-                            min_value=1,
-                            step=1,
-                        )
-                    with macd_cols[1]:
-                        macd_fast = st.number_input(
+                    with st.expander("MACD (advanced)", expanded=False):
+                        macd_adv = st.columns(3)
+                        macd_fast = macd_adv[0].number_input(
                             "MACD fast",
                             min_value=1,
                             step=1,
@@ -10994,27 +11231,24 @@ def main() -> None:
                             on_change=_sync_model_from_widget,
                             args=("bt_macd_fast",),
                         )
-                    _track_sweep("bt_macd_interval_min", "macd.interval_min", macd_interval_sweep)
-
-                    macd_cols2 = st.columns(2)
-                    macd_slow = macd_cols2[0].number_input(
-                        "MACD slow",
-                        min_value=1,
-                        step=1,
-                        value=int(st.session_state.get("bt_macd_slow", 26)),
-                        key=_wkey("bt_macd_slow"),
-                        on_change=_sync_model_from_widget,
-                        args=("bt_macd_slow",),
-                    )
-                    macd_signal = macd_cols2[1].number_input(
-                        "MACD signal",
-                        min_value=1,
-                        step=1,
-                        value=int(st.session_state.get("bt_macd_signal", 7)),
-                        key=_wkey("bt_macd_signal"),
-                        on_change=_sync_model_from_widget,
-                        args=("bt_macd_signal",),
-                    )
+                        macd_slow = macd_adv[1].number_input(
+                            "MACD slow",
+                            min_value=1,
+                            step=1,
+                            value=int(st.session_state.get("bt_macd_slow", 26)),
+                            key=_wkey("bt_macd_slow"),
+                            on_change=_sync_model_from_widget,
+                            args=("bt_macd_slow",),
+                        )
+                        macd_signal = macd_adv[2].number_input(
+                            "MACD signal",
+                            min_value=1,
+                            step=1,
+                            value=int(st.session_state.get("bt_macd_signal", 7)),
+                            key=_wkey("bt_macd_signal"),
+                            on_change=_sync_model_from_widget,
+                            args=("bt_macd_signal",),
+                        )
 
                 with st.container(border=True):
                     st.markdown("#### RSI")
@@ -11043,27 +11277,28 @@ def main() -> None:
                     _track_sweep("bt_rsi_interval_min", "rsi.interval_min", rsi_interval_sweep)
                     _track_sweep("bt_rsi_length", "rsi.length", rsi_length_sweep)
 
-                    rsi_levels = st.columns(2)
-                    rsi_buy_level = rsi_levels[0].number_input(
-                        "RSI buy level",
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=1.0,
-                        value=float(st.session_state.get("bt_rsi_buy_level", 30.0)),
-                        key=_wkey("bt_rsi_buy_level"),
-                        on_change=_sync_model_from_widget,
-                        args=("bt_rsi_buy_level",),
-                    )
-                    rsi_sell_level = rsi_levels[1].number_input(
-                        "RSI sell level",
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=1.0,
-                        value=float(st.session_state.get("bt_rsi_sell_level", 70.0)),
-                        key=_wkey("bt_rsi_sell_level"),
-                        on_change=_sync_model_from_widget,
-                        args=("bt_rsi_sell_level",),
-                    )
+                    with st.expander("RSI (advanced)", expanded=False):
+                        rsi_levels = st.columns(2)
+                        rsi_buy_level = rsi_levels[0].number_input(
+                            "RSI buy level",
+                            min_value=0.0,
+                            max_value=100.0,
+                            step=1.0,
+                            value=float(st.session_state.get("bt_rsi_buy_level", 30.0)),
+                            key=_wkey("bt_rsi_buy_level"),
+                            on_change=_sync_model_from_widget,
+                            args=("bt_rsi_buy_level",),
+                        )
+                        rsi_sell_level = rsi_levels[1].number_input(
+                            "RSI sell level",
+                            min_value=0.0,
+                            max_value=100.0,
+                            step=1.0,
+                            value=float(st.session_state.get("bt_rsi_sell_level", 70.0)),
+                            key=_wkey("bt_rsi_sell_level"),
+                            on_change=_sync_model_from_widget,
+                            args=("bt_rsi_sell_level",),
+                        )
 
             with st.container(border=True):
                 st.markdown("### DCA")
@@ -11101,15 +11336,6 @@ def main() -> None:
                 _track_sweep("bt_deviation_multiplier", "dca.deviation_multiplier", dev_multiplier_sweep)
                 _track_sweep("bt_volume_multiplier", "dca.volume_multiplier", vol_multiplier_sweep)
 
-                plot_dca_levels = st.checkbox(
-                    "Plot DCA levels",
-                    value=bool(st.session_state.get("bt_plot_dca_levels", False)),
-                    key=_wkey("bt_plot_dca_levels"),
-                    on_change=_sync_model_from_widget,
-                    args=("bt_plot_dca_levels",),
-                    help="Visual aid in charts: overlay expected DCA levels (if supported by the chart renderer).",
-                )
-
             with st.container(border=True):
                 st.markdown("### Exits")
 
@@ -11129,6 +11355,7 @@ def main() -> None:
                     format_func=lambda v: "Percent" if v == StopLossMode.PCT.value else "ATR",
                 )
                 sl_mode_selected = str(st.session_state.get("bt_sl_mode", StopLossMode.PCT.value) or StopLossMode.PCT.value).strip().upper()
+                show_tp_atr_period_in_sl = sl_mode_selected == StopLossMode.ATR.value
 
                 if sl_mode_selected == StopLossMode.ATR.value:
                     atr_cols = st.columns(2)
@@ -11236,8 +11463,7 @@ def main() -> None:
                 st.session_state["bt_use_atr_tp"] = tp_mode_selected == TakeProfitMode.ATR.value
 
                 if tp_mode_selected == TakeProfitMode.ATR.value:
-                    atr_cols = st.columns(2)
-                    with atr_cols[0]:
+                    if show_tp_atr_period_in_sl:
                         tp_atr_multiple, tp_atr_multiple_sweep = render_sweepable_number(
                             "bt_tp_atr_multiple",
                             "TP (ATR×)",
@@ -11247,18 +11473,31 @@ def main() -> None:
                             min_value=0.0,
                             step=0.5,
                         )
-                    with atr_cols[1]:
-                        tp_atr_period, tp_atr_period_sweep = render_sweepable_number(
-                            "bt_tp_atr_period",
-                            "ATR period",
-                            default_value=int(st.session_state.get("bt_tp_atr_period", 14)),
-                            sweep_field_key="exits.tp_atr_period",
-                            help="Shared ATR lookback period used for ATR SL/TP.",
-                            min_value=1,
-                            step=1,
-                        )
+                        st.caption("ATR period is shared with Stop Loss settings above.")
+                    else:
+                        atr_cols = st.columns(2)
+                        with atr_cols[0]:
+                            tp_atr_multiple, tp_atr_multiple_sweep = render_sweepable_number(
+                                "bt_tp_atr_multiple",
+                                "TP (ATR×)",
+                                default_value=float(st.session_state.get("bt_tp_atr_multiple", 10.0)),
+                                sweep_field_key="exits.tp_atr_multiple",
+                                help="Take profit distance in ATR multiples.",
+                                min_value=0.0,
+                                step=0.5,
+                            )
+                        with atr_cols[1]:
+                            tp_atr_period, tp_atr_period_sweep = render_sweepable_number(
+                                "bt_tp_atr_period",
+                                "ATR period",
+                                default_value=int(st.session_state.get("bt_tp_atr_period", 14)),
+                                sweep_field_key="exits.tp_atr_period",
+                                help="Shared ATR lookback period used for ATR SL/TP.",
+                                min_value=1,
+                                step=1,
+                            )
+                        _track_sweep("bt_tp_atr_period", "exits.tp_atr_period", tp_atr_period_sweep)
                     _track_sweep("bt_tp_atr_multiple", "exits.tp_atr_multiple", tp_atr_multiple_sweep)
-                    _track_sweep("bt_tp_atr_period", "exits.tp_atr_period", tp_atr_period_sweep)
                 else:
                     fixed_tp_pct, fixed_tp_sweep = render_sweepable_number(
                         "bt_fixed_tp_pct",
@@ -11306,7 +11545,7 @@ def main() -> None:
 
                 # Ensure downstream variables always exist.
                 ccxt_exchange_id = ccxt_symbol = ccxt_timeframe = ""
-                exchange_id = "woo"
+                exchange_id = "woox"
                 symbol = "ETH/USDT:USDT"
                 timeframe = "1h"
                 market_type = "Perps"
@@ -11318,12 +11557,39 @@ def main() -> None:
                 candle_count = int(st.session_state.get("synthetic_candle_count", 300))
 
                 if data_source == "Crypto (CCXT)":
-                    exchange_options = ["woo", "binance", "bybit", "okx", "kraken", "Custom…"]
-                    exchange_choice = st.selectbox("Exchange", exchange_options, index=0, key="ccxt_exchange_choice")
+                    exchange_options = ["WooX", "Binance", "Bybit", "OKX", "Kraken", "Custom…"]
+                    exchange_label_map = {
+                        "woox": "WooX",
+                        "woo": "WooX",
+                        "binance": "Binance",
+                        "bybit": "Bybit",
+                        "okx": "OKX",
+                        "kraken": "Kraken",
+                    }
+                    current_choice_raw = str(st.session_state.get("ccxt_exchange_choice") or "").strip()
+                    if current_choice_raw in exchange_options:
+                        current_choice = current_choice_raw
+                    else:
+                        current_norm = normalize_exchange_id(current_choice_raw) or current_choice_raw.lower()
+                        current_choice = exchange_label_map.get(current_norm, "WooX")
+                        if current_choice:
+                            st.session_state["ccxt_exchange_choice"] = current_choice
+
+                    exchange_choice = st.selectbox(
+                        "Exchange",
+                        exchange_options,
+                        index=exchange_options.index(current_choice) if current_choice in exchange_options else 0,
+                        key="ccxt_exchange_choice",
+                    )
                     if exchange_choice == "Custom…":
-                        exchange_id = st.text_input("Custom exchange id", value="woo", key="ccxt_exchange_custom")
+                        exchange_id = st.text_input(
+                            "Custom exchange id",
+                            value=str(st.session_state.get("ccxt_exchange_custom") or "woox"),
+                            key="ccxt_exchange_custom",
+                        )
                     else:
                         exchange_id = exchange_choice
+                    exchange_id = normalize_exchange_id(exchange_id) or (str(exchange_id or "").strip().lower())
 
                     market_type = st.selectbox(
                         "Market type",
@@ -11340,7 +11606,8 @@ def main() -> None:
                     except Exception as e:
                         st.warning(f"Could not load CCXT metadata for '{exchange_id}': {e}")
 
-                    symbol_candidates = sorted(list(markets.keys())) if markets else ["ETH/USDT:USDT"]
+                    raw_symbol_candidates = sorted(list(markets.keys())) if markets else ["ETH/USDT:USDT"]
+                    symbol_candidates = _dedupe_symbol_candidates(raw_symbol_candidates, markets)
                     preferred_symbol = "ETH/USDT:USDT"
                     symbol_default = st.session_state.get("ccxt_symbol") or preferred_symbol
                     if symbol_default in symbol_candidates:
@@ -11411,7 +11678,7 @@ def main() -> None:
                             try:
                                 cats = list_categories(
                                     str(user_id or "").strip() or "admin@local",
-                                    str(ccxt_exchange_id or exchange_id or "").strip(),
+                                    str(exchange_id or "").strip(),
                                 )
                             except Exception:
                                 cats = []
@@ -11507,7 +11774,7 @@ def main() -> None:
                         key="ccxt_timeframe",
                     )
 
-                    ccxt_exchange_id = exchange_id
+                    ccxt_exchange_id = exchange_id_for_ccxt(exchange_id)
                     ccxt_symbol = symbol
                     ccxt_timeframe = timeframe
 
@@ -11528,10 +11795,10 @@ def main() -> None:
                 if data_source == "Crypto (CCXT)":
                     ccxt_range_mode = _segmented_or_radio(
                         "Range",
-                        options=["Bars", "Duration", "Start/End"],
-                        index=["Bars", "Duration", "Start/End"].index(
+                        options=["Bars", "Duration", "Start/End", "Periods"],
+                        index=["Bars", "Duration", "Start/End", "Periods"].index(
                             st.session_state.get("ccxt_range_mode", "Duration")
-                            if st.session_state.get("ccxt_range_mode", "Duration") in {"Bars", "Duration", "Start/End"}
+                            if st.session_state.get("ccxt_range_mode", "Duration") in {"Bars", "Duration", "Start/End", "Periods"}
                             else "Duration"
                         ),
                         key="ccxt_range_mode",
@@ -11560,6 +11827,42 @@ def main() -> None:
                             index=duration_index,
                             key="ccxt_duration_label",
                         )
+                    elif ccxt_range_mode == "Periods":
+                        periods = []
+                        try:
+                            with open_db_connection() as _p_conn:
+                                periods = list_saved_periods(_p_conn, user_id)
+                        except Exception:
+                            periods = []
+                        period_labels = []
+                        period_id_by_label: Dict[str, int] = {}
+                        for p in periods or []:
+                            pid = p.get("id")
+                            name = str(p.get("name") or "").strip()
+                            if pid is None or not name:
+                                continue
+                            label = f"{name} (#{pid})"
+                            period_labels.append(label)
+                            period_id_by_label[label] = int(pid)
+                        if not period_labels:
+                            st.warning("No saved periods found. Create one in Settings → Periods.")
+                            start_dt = None
+                            end_dt = None
+                        else:
+                            selected_label = st.selectbox(
+                                "Period",
+                                options=period_labels,
+                                index=0,
+                                key="ccxt_period_label",
+                            )
+                            selected_id = period_id_by_label.get(selected_label)
+                            selected_row = next((p for p in periods if int(p.get("id")) == int(selected_id)), None)
+                            start_dt = _normalize_timestamp((selected_row or {}).get("start_ts"))
+                            end_dt = _normalize_timestamp((selected_row or {}).get("end_ts"))
+                            if start_dt and end_dt:
+                                st.caption(
+                                    f"{start_dt.astimezone(timezone.utc).isoformat()} → {end_dt.astimezone(timezone.utc).isoformat()}"
+                                )
                     else:
                         default_end = datetime.now(timezone.utc)
                         default_start = default_end - timedelta(days=7)
@@ -11683,11 +11986,8 @@ def main() -> None:
                 tp_mode_selected = str(st.session_state.get("bt_tp_mode", TakeProfitMode.ATR.value) or TakeProfitMode.ATR.value).strip().upper()
 
                 sweep_field_map: Dict[str, str] = {
-                    "bt_max_entries": "general.max_entries",
                     "bt_initial_entry_balance_pct": "general.initial_entry_balance_pct",
                     "bt_initial_entry_fixed_usd": "general.initial_entry_fixed_usd",
-                    "bt_entry_timeout_min": "general.entry_timeout_min",
-                    "bt_entry_cooldown_min": "general.entry_cooldown_min",
                     "bt_base_deviation_pct": "dca.base_deviation_pct",
                     "bt_deviation_multiplier": "dca.deviation_multiplier",
                     "bt_volume_multiplier": "dca.volume_multiplier",
@@ -11766,7 +12066,6 @@ def main() -> None:
                 "allow_short": bool(allow_short),
                 "lock_atr_on_entry_for_dca": bool(lock_atr_on_entry),
                 "use_avg_entry_for_dca_base": bool(use_avg_entry),
-                "plot_dca_levels": bool(plot_dca_levels),
                 "use_ma_direction": bool(st.session_state.get("bt_use_ma_direction", False)),
 
                 "sl_mode": sl_mode_selected,
@@ -12249,140 +12548,144 @@ def main() -> None:
                 render_live_bot_detail(int(selected_bot_id_int))
             return
 
-            st.subheader(f"Create bot from run #{target_run_id}")
-            run_row: Optional[Dict[str, Any]] = get_backtest_run(target_run_id)
-            config_dict: Optional[Dict[str, Any]] = None
-            metadata: Dict[str, Any] = {}
-            if run_row:
-                metadata = _extract_metadata(run_row)
-                config_dict = _extract_config_dict(run_row)
-                if not config_dict:
-                    st.error("Run found but missing config snapshot; cannot create a bot from it.")
-                    config_dict = None
-            else:
-                st.warning("Run not found. Check the run ID and try again.")
+        st.subheader(f"Create bot from run #{target_run_id}")
+        run_row: Optional[Dict[str, Any]] = get_backtest_run(target_run_id)
+        config_dict: Optional[Dict[str, Any]] = None
+        metadata: Dict[str, Any] = {}
+        if run_row:
+            metadata = _extract_metadata(run_row)
+            config_dict = _extract_config_dict(run_row)
+            if not config_dict:
+                st.error("Run found but missing config snapshot; cannot create a bot from it.")
                 config_dict = None
+        else:
+            st.warning("Run not found. Check the run ID and try again.")
+            config_dict = None
 
-            if config_dict:
-                symbol_default = run_row.get("symbol") or metadata.get("symbol") or ""
-                timeframe_default = run_row.get("timeframe") or metadata.get("timeframe") or "1m"
-                exchange_default = metadata.get("exchange_id") or "woox"
-                prefer_bbo_default = bool(metadata.get("prefer_bbo_maker", st.session_state.get("prefer_bbo_maker", True)))
-                bbo_level_default = int(metadata.get("bbo_queue_level", st.session_state.get("bbo_queue_level", 1)) or 1)
-                bot_name_default = f"Bot {run_row.get('id')}" if run_row.get("id") is not None else "New bot"
+        if config_dict:
+            symbol_default = run_row.get("symbol") if isinstance(run_row, dict) else None
+            symbol_default = symbol_default or metadata.get("symbol") or ""
+            timeframe_default = run_row.get("timeframe") if isinstance(run_row, dict) else None
+            timeframe_default = timeframe_default or metadata.get("timeframe") or "1m"
+            exchange_default = metadata.get("exchange_id") or "woox"
+            prefer_bbo_default = bool(metadata.get("prefer_bbo_maker", st.session_state.get("prefer_bbo_maker", True)))
+            bbo_level_default = int(metadata.get("bbo_queue_level", st.session_state.get("bbo_queue_level", 1)) or 1)
+            bot_name_default = (
+                f"Bot {run_row.get('id')}" if isinstance(run_row, dict) and run_row.get("id") is not None else "New bot"
+            )
 
-                general_cfg = (config_dict.get("general") or {}) if isinstance(config_dict, dict) else {}
-                allow_long = bool(general_cfg.get("allow_long", True))
-                allow_short = bool(general_cfg.get("allow_short", False))
-                init_entry_mode_default = _safe_initial_entry_sizing_mode(general_cfg.get("initial_entry_sizing_mode")).value
-                init_entry_pct_default = float(general_cfg.get("initial_entry_balance_pct") or 10.0)
-                init_entry_usd_default = float(general_cfg.get("initial_entry_fixed_usd") or 100.0)
-                entry_cd_default = int(general_cfg.get("entry_cooldown_min") or 10)
-                entry_to_default = int(general_cfg.get("entry_timeout_min") or 10)
-                exit_to_default = int(general_cfg.get("exit_timeout_min") or entry_to_default)
-                derived = derive_primary_position_side_from_allow_flags(allow_long=allow_long, allow_short=allow_short)
+            general_cfg = (config_dict.get("general") or {}) if isinstance(config_dict, dict) else {}
+            allow_long = bool(general_cfg.get("allow_long", True))
+            allow_short = bool(general_cfg.get("allow_short", False))
+            init_entry_mode_default = _safe_initial_entry_sizing_mode(general_cfg.get("initial_entry_sizing_mode")).value
+            init_entry_pct_default = float(general_cfg.get("initial_entry_balance_pct") or 10.0)
+            init_entry_usd_default = float(general_cfg.get("initial_entry_fixed_usd") or 100.0)
+            entry_cd_default = int(general_cfg.get("entry_cooldown_min") or 10)
+            entry_to_default = int(general_cfg.get("entry_timeout_min") or 10)
+            exit_to_default = int(general_cfg.get("exit_timeout_min") or entry_to_default)
+            derived = derive_primary_position_side_from_allow_flags(allow_long=allow_long, allow_short=allow_short)
 
-                with st.expander("Strategy config (from run)", expanded=False):
-                    render_dragon_strategy_config_view(config_dict, key_prefix=f"run_{target_run_id}")
+            with st.expander("Strategy config (from run)", expanded=False):
+                render_dragon_strategy_config_view(config_dict, key_prefix=f"run_{target_run_id}")
 
-                st.caption("Strategy config will be reused from the backtest; only entry/timeout sizing fields below are editable.")
-                bot_name = st.text_input("Bot name", value=bot_name_default, key="live_bot_name")
-                exchange_val = st.text_input("Exchange ID", value=exchange_default, key="live_bot_exchange")
-                symbol_val = st.text_input("Symbol", value=symbol_default or "PERP_BTC_USDT", key="live_bot_symbol")
-                timeframe_val = st.text_input("Timeframe", value=timeframe_default or "1m", key="live_bot_timeframe")
-                prefer_bbo_live = st.checkbox(
-                    "Prefer maker via BBO",
-                    value=prefer_bbo_default,
-                    help="Use BID/ASK queueing when supported (WooX).",
-                    key="live_bot_prefer_bbo",
+            st.caption("Strategy config will be reused from the backtest; only entry/timeout sizing fields below are editable.")
+            bot_name = st.text_input("Bot name", value=bot_name_default, key="live_bot_name")
+            exchange_val = st.text_input("Exchange ID", value=exchange_default, key="live_bot_exchange")
+            symbol_val = st.text_input("Symbol", value=symbol_default or "PERP_BTC_USDT", key="live_bot_symbol")
+            timeframe_val = st.text_input("Timeframe", value=timeframe_default or "1m", key="live_bot_timeframe")
+            prefer_bbo_live = st.checkbox(
+                "Prefer maker via BBO",
+                value=prefer_bbo_default,
+                help="Use BID/ASK queueing when supported (WooX).",
+                key="live_bot_prefer_bbo",
+            )
+            bbo_level_live = st.selectbox(
+                "BBO queue level",
+                options=[1, 2, 3, 4, 5],
+                index=max(0, min(4, bbo_level_default - 1)),
+                key="live_bot_bbo_level",
+            )
+
+            init_entry_mode_live = st.radio(
+                "Initial entry sizing",
+                options=[InitialEntrySizingMode.PCT_BALANCE.value, InitialEntrySizingMode.FIXED_USD.value],
+                index=0
+                if str(st.session_state.get("live_bot_initial_entry_sizing_mode", init_entry_mode_default)) == InitialEntrySizingMode.PCT_BALANCE.value
+                else 1,
+                key="live_bot_initial_entry_sizing_mode",
+                format_func=lambda v: "Percent of portfolio" if v == InitialEntrySizingMode.PCT_BALANCE.value else "Fixed $ amount",
+            )
+
+            if str(init_entry_mode_live) == InitialEntrySizingMode.FIXED_USD.value:
+                init_entry_usd_live = st.number_input(
+                    "Initial entry ($ notional)",
+                    min_value=0.0,
+                    step=10.0,
+                    value=float(st.session_state.get("live_bot_initial_entry_fixed_usd", init_entry_usd_default)),
+                    key="live_bot_initial_entry_fixed_usd",
+                    help="Size of the first entry as a fixed $ notional amount (USD/USDT).",
                 )
-                bbo_level_live = st.selectbox(
-                    "BBO queue level",
-                    options=[1, 2, 3, 4, 5],
-                    index=max(0, min(4, bbo_level_default - 1)),
-                    key="live_bot_bbo_level",
+                init_entry_pct_live = float(st.session_state.get("live_bot_initial_entry_balance_pct", init_entry_pct_default))
+            else:
+                init_entry_pct_live = st.number_input(
+                    "Initial entry (% of balance)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=1.0,
+                    value=float(st.session_state.get("live_bot_initial_entry_balance_pct", init_entry_pct_default)),
+                    key="live_bot_initial_entry_balance_pct",
+                    help="Strategy sizes the first entry as this % of broker.balance (live uses DRAGON_LIVE_BALANCE or _risk.balance_override).",
+                )
+                init_entry_usd_live = float(st.session_state.get("live_bot_initial_entry_fixed_usd", init_entry_usd_default))
+
+            row_timeouts = st.columns(3)
+            with row_timeouts[0]:
+                entry_cooldown_live = st.number_input(
+                    "Entry cooldown (min)",
+                    min_value=0,
+                    step=1,
+                    value=int(st.session_state.get("live_bot_entry_cooldown_min", entry_cd_default)),
+                    key="live_bot_entry_cooldown_min",
+                )
+            with row_timeouts[1]:
+                entry_timeout_live = st.number_input(
+                    "Entry timeout (min)",
+                    min_value=0,
+                    step=1,
+                    value=int(st.session_state.get("live_bot_entry_timeout_min", entry_to_default)),
+                    key="live_bot_entry_timeout_min",
+                )
+            with row_timeouts[2]:
+                exit_timeout_live = st.number_input(
+                    "Exit timeout (min)",
+                    min_value=0,
+                    step=1,
+                    value=int(st.session_state.get("live_bot_exit_timeout_min", exit_to_default)),
+                    key="live_bot_exit_timeout_min",
                 )
 
-                init_entry_mode_live = st.radio(
-                    "Initial entry sizing",
-                    options=[InitialEntrySizingMode.PCT_BALANCE.value, InitialEntrySizingMode.FIXED_USD.value],
-                    index=0
-                    if str(st.session_state.get("live_bot_initial_entry_sizing_mode", init_entry_mode_default)) == InitialEntrySizingMode.PCT_BALANCE.value
-                    else 1,
-                    key="live_bot_initial_entry_sizing_mode",
-                    format_func=lambda v: "Percent of portfolio" if v == InitialEntrySizingMode.PCT_BALANCE.value else "Fixed $ amount",
+            with _job_conn() as conn:
+                accounts_for_user = get_account_snapshots(conn, user_id, exchange_id=str(exchange_default).strip().lower(), include_deleted=False)
+            active_accounts = [a for a in accounts_for_user if str(a.get("status") or "").strip().lower() == "active"]
+            acct_ids = [int(a.get("id")) for a in active_accounts if a.get("id") is not None]
+            if not acct_ids:
+                st.warning("No active accounts available. Create one in Tools → Accounts.")
+                selected_account_id = None
+            else:
+                def _fmt_acct_id(aid: int) -> str:
+                    row = next((a for a in active_accounts if int(a.get("id")) == int(aid)), None)
+                    if not row:
+                        return f"#{aid}"
+                    label = (row.get("label") or "").strip() or f"#{aid}"
+                    ex = (row.get("exchange_id") or "").strip()
+                    return f"{label} ({ex})"
+
+                selected_account_id = st.selectbox(
+                    "Account",
+                    options=acct_ids,
+                    format_func=_fmt_acct_id,
+                    key="live_bot_account_id",
                 )
-
-                if str(init_entry_mode_live) == InitialEntrySizingMode.FIXED_USD.value:
-                    init_entry_usd_live = st.number_input(
-                        "Initial entry ($ notional)",
-                        min_value=0.0,
-                        step=10.0,
-                        value=float(st.session_state.get("live_bot_initial_entry_fixed_usd", init_entry_usd_default)),
-                        key="live_bot_initial_entry_fixed_usd",
-                        help="Size of the first entry as a fixed $ notional amount (USD/USDT).",
-                    )
-                    init_entry_pct_live = float(st.session_state.get("live_bot_initial_entry_balance_pct", init_entry_pct_default))
-                else:
-                    init_entry_pct_live = st.number_input(
-                        "Initial entry (% of balance)",
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=1.0,
-                        value=float(st.session_state.get("live_bot_initial_entry_balance_pct", init_entry_pct_default)),
-                        key="live_bot_initial_entry_balance_pct",
-                        help="Strategy sizes the first entry as this % of broker.balance (live uses DRAGON_LIVE_BALANCE or _risk.balance_override).",
-                    )
-                    init_entry_usd_live = float(st.session_state.get("live_bot_initial_entry_fixed_usd", init_entry_usd_default))
-
-                row_timeouts = st.columns(3)
-                with row_timeouts[0]:
-                    entry_cooldown_live = st.number_input(
-                        "Entry cooldown (min)",
-                        min_value=0,
-                        step=1,
-                        value=int(st.session_state.get("live_bot_entry_cooldown_min", entry_cd_default)),
-                        key="live_bot_entry_cooldown_min",
-                    )
-                with row_timeouts[1]:
-                    entry_timeout_live = st.number_input(
-                        "Entry timeout (min)",
-                        min_value=0,
-                        step=1,
-                        value=int(st.session_state.get("live_bot_entry_timeout_min", entry_to_default)),
-                        key="live_bot_entry_timeout_min",
-                    )
-                with row_timeouts[2]:
-                    exit_timeout_live = st.number_input(
-                        "Exit timeout (min)",
-                        min_value=0,
-                        step=1,
-                        value=int(st.session_state.get("live_bot_exit_timeout_min", exit_to_default)),
-                        key="live_bot_exit_timeout_min",
-                    )
-
-                with _job_conn() as conn:
-                    accounts_for_user = get_account_snapshots(conn, user_id, exchange_id=str(exchange_default).strip().lower(), include_deleted=False)
-                active_accounts = [a for a in accounts_for_user if str(a.get("status") or "").strip().lower() == "active"]
-                acct_ids = [int(a.get("id")) for a in active_accounts if a.get("id") is not None]
-                if not acct_ids:
-                    st.warning("No active accounts available. Create one in Tools → Accounts.")
-                    selected_account_id = None
-                else:
-                    def _fmt_acct_id(aid: int) -> str:
-                        row = next((a for a in active_accounts if int(a.get("id")) == int(aid)), None)
-                        if not row:
-                            return f"#{aid}"
-                        label = (row.get("label") or "").strip() or f"#{aid}"
-                        ex = (row.get("exchange_id") or "").strip()
-                        return f"{label} ({ex})"
-
-                    selected_account_id = st.selectbox(
-                        "Account",
-                        options=acct_ids,
-                        format_func=_fmt_acct_id,
-                        key="live_bot_account_id",
-                    )
                 desired_status_label = st.selectbox(
                     "Desired status",
                     ["running", "paused", "stopped"],
@@ -12551,11 +12854,11 @@ def main() -> None:
                                 credentials_id=None,
                             )
                             created_bot_ids.append(int(bot_id))
-                            link_bot_to_run(conn, bot_id, str(run_id_input.strip()))
+                            link_bot_to_run(conn, bot_id, str(target_run_id).strip())
                             payload_live = {
                                 "job_type": "live_bot",
                                 "bot_id": bot_id,
-                                "run_id": run_id_input.strip(),
+                                "run_id": str(target_run_id).strip(),
                                 "exchange_id": exchange_val,
                                 "symbol": symbol_val,
                                 "timeframe": timeframe_val,
@@ -12566,7 +12869,7 @@ def main() -> None:
                             }
                             job_id = create_job(conn, "live_bot", payload_live, bot_id=bot_id)
                             created_job_ids.append(int(job_id))
-                            set_job_link(conn, job_id, run_id=str(run_id_input.strip()))
+                            set_job_link(conn, job_id, run_id=str(target_run_id).strip())
 
                     if len(created_bot_ids) == 1:
                         st.success(f"Bot #{created_bot_ids[0]} created and live job #{created_job_ids[0]} queued.")
@@ -12574,8 +12877,8 @@ def main() -> None:
                     else:
                         st.success(f"Bots created: {', '.join([f'#{x}' for x in created_bot_ids])}.")
                     st.rerun()
-            else:
-                st.info("Enter a valid run ID to load its config and create a bot.")
+        else:
+            st.info("Enter a valid run ID to load its config and create a bot.")
 
     # Runs Explorer page removed (Results now covers this functionality).
 
@@ -12958,7 +13261,7 @@ def main() -> None:
                 df["created_at"] = [_ui_local_dt_ampm(v, tz) for v in df["created_at"].tolist()]
             for _c in ("start_date", "end_date"):
                 if _c in df.columns:
-                    df[_c] = [_ui_local_date_iso(v, tz) for v in df[_c].tolist()]
+                    df[_c] = [_ui_local_date_dmy(v, tz) for v in df[_c].tolist()]
         except Exception:
             pass
 
@@ -13317,7 +13620,13 @@ def main() -> None:
             ".ag-body-viewport": {
                 # Hint to the browser for form controls/scrollbars in dark mode.
                 "color-scheme": "dark",
+                "background-color": "#1D2737",
             },
+            ".ag-body": {"background-color": "#1D2737"},
+            ".ag-center-cols-viewport": {"background-color": "#1D2737"},
+            ".ag-center-cols-container": {"background-color": "#1D2737"},
+            ".ag-overlay-no-rows-center": {"background-color": "#1D2737", "color": "#CBD5E1"},
+            ".ag-overlay-loading-center": {"background-color": "#1D2737", "color": "#CBD5E1"},
             # Column menu + filter popups (match dark theme; some AG Grid parts ignore vars depending on bundled theme)
             ".ag-popup": {"color-scheme": "dark"},
             ".ag-popup-child": {
@@ -14503,84 +14812,7 @@ def main() -> None:
             """
         )
 
-        metrics_gradient_style = JsCode(
-            """
-            function(params) {
-                const col = (params && params.colDef && params.colDef.field) ? params.colDef.field.toString() : '';
-                const v = Number(params.value);
-                if (!isFinite(v)) { return {}; }
-
-                const greenText = '#7ee787';
-                const redText = '#ff7b72';
-                const neutralText = '#cbd5e1';
-                const greenRgb = '46,160,67';
-                const redRgb = '248,81,73';
-
-                function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
-                function alphaFromT(t) { return 0.10 + (0.22 * clamp01(t)); }
-                function styleGoodBad(isGood, t) {
-                    const a = alphaFromT(t);
-                    if (isGood === true) return { color: greenText, backgroundColor: `rgba(${greenRgb},${a})`, textAlign: 'center' };
-                    if (isGood === false) return { color: redText, backgroundColor: `rgba(${redRgb},${a})`, textAlign: 'center' };
-                    return { color: neutralText, textAlign: 'center' };
-                }
-
-                function asRatio(x) {
-                    if (!isFinite(x)) { return x; }
-                    return (Math.abs(x) <= 1.0) ? x : (x / 100.0);
-                }
-
-                if (col === 'max_drawdown_pct') {
-                    const r = asRatio(v);
-                    const t = clamp01(r / 0.30);
-                    return styleGoodBad(false, t);
-                }
-                if (col === 'net_return_pct') {
-                    const r = asRatio(v);
-                    const t = clamp01(Math.abs(r) / 0.50);
-                    if (r > 0) return styleGoodBad(true, t);
-                    if (r < 0) return styleGoodBad(false, t);
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                if (col === 'roi_pct_on_margin') {
-                    // v is already a percent (e.g. 100.0 means +100%)
-                    const t = clamp01(Math.abs(v) / 200.0);
-                    if (v > 0) return styleGoodBad(true, t);
-                    if (v < 0) return styleGoodBad(false, t);
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                if (col === 'win_rate') {
-                    const r = asRatio(v);
-                    const dist = Math.abs(r - 0.5);
-                    const t = clamp01(dist / 0.25);
-                    return styleGoodBad(r >= 0.5, t);
-                }
-                if (['profit_factor', 'cpc_index', 'common_sense_ratio'].includes(col)) {
-                    const dist = Math.abs(v - 1.0);
-                    const t = clamp01(dist / 1.0);
-                    return styleGoodBad(v >= 1.0, t);
-                }
-                if (['sharpe', 'sortino'].includes(col)) {
-                    if (v >= 1.0) {
-                        const t = clamp01((v - 1.0) / 2.0);
-                        return styleGoodBad(true, t);
-                    }
-                    if (v < 0.0) {
-                        const t = clamp01(Math.abs(v) / 1.5);
-                        return styleGoodBad(false, t);
-                    }
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                if (col === 'net_profit') {
-                    const t = clamp01(Math.abs(v) / 1000.0);
-                    if (v > 0) return styleGoodBad(true, t);
-                    if (v < 0) return styleGoodBad(false, t);
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                return {};
-            }
-            """
-        )
+        metrics_gradient_style = JsCode(_aggrid_metrics_gradient_style_js())
 
         timeframe_style = JsCode(
             r"""
@@ -15409,6 +15641,13 @@ def main() -> None:
         if _list_sweeps_with_counts is None:
             from project_dragon.storage import list_sweeps_with_run_counts as _list_sweeps_with_counts  # type: ignore
 
+        # Reconcile sweeps that were running/paused across restarts.
+        try:
+            with open_db_connection() as _recon_conn:
+                reconcile_sweep_statuses(_recon_conn, user_id=user_id)
+        except Exception:
+            pass
+
         sweeps = _list_sweeps_with_counts(user_id=user_id, limit=100, offset=0)
         if not sweeps:
             st.info("No sweeps recorded yet.")
@@ -15923,10 +16162,10 @@ def main() -> None:
                 tz = _ui_display_tz()
                 rng = df_sweeps.apply(lambda r: _extract_sweep_range(dict(r)), axis=1)
                 df_sweeps["start_date"] = [
-                    (_ui_local_date_iso(sd, tz) if sd else None) for sd, _ in rng
+                    (_ui_local_date_dmy(sd, tz) if sd else None) for sd, _ in rng
                 ]
                 df_sweeps["end_date"] = [
-                    (_ui_local_date_iso(ed, tz) if ed else None) for _, ed in rng
+                    (_ui_local_date_dmy(ed, tz) if ed else None) for _, ed in rng
                 ]
                 df_sweeps["duration"] = [_fmt_td(sd, ed) for sd, ed in rng]
         except Exception:
@@ -16623,40 +16862,7 @@ def main() -> None:
             """
         )
 
-        ddmm_yy_formatter = JsCode(
-            """
-            function(params) {
-                try {
-                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
-                    const s = v.toString().trim();
-                    if (!s) return '';
-
-                    // Fast-path for YYYY-MM-DD.
-                    const m = s.match(/^([0-9]{4})-([0-9]{2})-([0-9]{2})/);
-                    if (m) {
-                        return `${m[3]}/${m[2]}/${m[1].slice(2)}`;
-                    }
-
-                    let d;
-                    if (/^[0-9]+$/.test(s)) {
-                        const n = parseInt(s, 10);
-                        d = new Date(n > 1000000000000 ? n : (n * 1000));
-                    } else {
-                        d = new Date(s);
-                    }
-                    if (isNaN(d.getTime())) return s;
-
-                    const dd = String(d.getUTCDate()).padStart(2, '0');
-                    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-                    const yy = String(d.getUTCFullYear()).slice(2);
-                    return `${dd}/${mm}/${yy}`;
-                } catch (e) {
-                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
-                    return v;
-                }
-            }
-            """
-        )
+        ddmm_yy_formatter = _aggrid_ddmmyy_formatter()
 
         asset_renderer_sweeps = JsCode(
             """
@@ -16700,62 +16906,74 @@ def main() -> None:
             """
         )
 
-        if "id" in df_sweeps_display.columns:
-            gb_s.configure_column("id", headerName="Sweep ID", width=110, filter=False, hide=("id" not in visible_cols_sweeps))
-        if "name" in df_sweeps_display.columns:
-            gb_s.configure_column("name", headerName="Name", width=220, filter=True, hide=("name" not in visible_cols_sweeps))
-        if "status" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "status",
-                headerName="Status",
-                width=130,
-                filter=True,
-                cellStyle=aggrid_pill_style("status"),
-                cellClass="ag-center-aligned-cell",
-                hide=("status" not in visible_cols_sweeps),
-            )
-        if "symbol" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "symbol",
-                headerName="Asset",
-                width=200,
-                filter=sym_filter,
-                cellRenderer=asset_renderer_sweeps,
-                valueGetter=asset_market_getter,
-                checkboxSelection=True,
-                headerCheckboxSelection=False,
-                hide=("symbol" not in visible_cols_sweeps),
-            )
-        if "timeframe" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "timeframe",
-                headerName="Timeframe",
-                width=110,
-                filter=sym_filter,
-                cellStyle=timeframe_style_sweeps_overview,
-                cellClass="ag-center-aligned-cell",
-                hide=("timeframe" not in visible_cols_sweeps),
-            )
-        if "direction" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "direction",
-                headerName="Direction",
-                width=120,
-                filter=sym_filter,
-                cellStyle=direction_style_sweeps_overview,
-                cellRenderer=direction_renderer_sweeps_overview,
-                cellClass="ag-center-aligned-cell",
-                hide=("direction" not in visible_cols_sweeps),
-            )
+        metrics_gradient_style = JsCode(
+            """
+            function(params) {
+                const col = (params && params.colDef && params.colDef.field) ? params.colDef.field.toString() : '';
+                const v = Number(params.value);
+                if (!isFinite(v)) { return {}; }
 
-        if "sweep_category" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "sweep_category",
-                headerName="Category",
-                width=160,
-                filter=sym_filter,
-                hide=("sweep_category" not in visible_cols_sweeps),
-            )
+                const greenText = '#7ee787';
+                const redText = '#ff7b72';
+                const neutralText = '#cbd5e1';
+                const greenRgb = '46,160,67';
+                const redRgb = '248,81,73';
+
+                function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
+                function alphaFromT(t) { const tt = clamp01(t); return 0.10 + (0.22 * tt); }
+                function styleGoodBad(isGood, t) {
+                    const a = alphaFromT(t);
+                    if (isGood === true) return { color: greenText, backgroundColor: `rgba(${greenRgb},${a})`, textAlign: 'center' };
+                    if (isGood === false) return { color: redText, backgroundColor: `rgba(${redRgb},${a})`, textAlign: 'center' };
+                    return { color: neutralText, textAlign: 'center' };
+                }
+
+                function asRatio(x) {
+                    if (!isFinite(x)) { return x; }
+                    return (Math.abs(x) <= 1.0) ? x : (x / 100.0);
+                }
+
+                if (col === 'best_net_return_pct') {
+                    const r = asRatio(v);
+                    const t = clamp01(Math.abs(r) / 0.50);
+                    if (r > 0) return styleGoodBad(true, t);
+                    if (r < 0) return styleGoodBad(false, t);
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                if (col === 'best_roi_pct_on_margin') {
+                    // v is already a percent
+                    const t = clamp01(Math.abs(v) / 200.0);
+                    if (v > 0) return styleGoodBad(true, t);
+                    if (v < 0) return styleGoodBad(false, t);
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                if (col === 'best_sharpe') {
+                    if (v >= 1.0) {
+                        const t = clamp01((v - 1.0) / 2.0);
+                        return styleGoodBad(true, t);
+                    }
+                    if (v < 0.0) {
+                        const t = clamp01(Math.abs(v) / 1.5);
+                        return styleGoodBad(false, t);
+                    }
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                if (col === 'best_cpc_index') {
+                    // CPC Index is unitless; treat >1 as stronger.
+                    if (v >= 1.0) {
+                        const t = clamp01((v - 1.0) / 2.0);
+                        return styleGoodBad(true, t);
+                    }
+                    if (v < 0.0) {
+                        const t = clamp01(Math.abs(v) / 1.5);
+                        return styleGoodBad(false, t);
+                    }
+                    return { color: neutralText, textAlign: 'center' };
+                }
+                return {};
+            }
+            """
+        )
 
         if "run_count" in df_sweeps_display.columns:
             gb_s.configure_column(
@@ -17065,6 +17283,15 @@ def main() -> None:
             st.markdown("---")
             st.markdown(f"### Selected sweep: {sweep_row.get('name')} (#{selected_sweep_id})")
 
+            derived_status_label: Optional[str] = None
+            try:
+                if not df_sweeps.empty and "id" in df_sweeps.columns and "status" in df_sweeps.columns:
+                    m = df_sweeps[df_sweeps["id"].astype(str) == str(selected_sweep_id)]
+                    if not m.empty:
+                        derived_status_label = str(m.iloc[0].get("status") or "").strip() or None
+            except Exception:
+                derived_status_label = None
+
             # --- Sweep control plane (pause/resume/cancel) ----------------
             try:
                 with open_db_connection() as _ctrl_conn:
@@ -17127,38 +17354,45 @@ def main() -> None:
                 elif parent_status in {"failed", "error"}:
                     state_label = "Error"
 
+                if derived_status_label:
+                    state_label = derived_status_label
+
+                is_terminal = str(state_label or "").strip().lower() in {"done", "failed", "cancelled"}
+
                 st.caption(f"Sweep control: state={state_label} (parent_job_id={parent_job_id}, status={parent_status})")
+                if not is_terminal:
+                    c1, c2, c3, c4 = st.columns([1, 1, 1, 3], gap="small")
+                    with c1:
+                        pause_btn = st.button("Pause", key=f"sweep_pause_{selected_sweep_id}", disabled=bool(cancel_req) or bool(pause_req))
+                    with c2:
+                        resume_btn = st.button("Resume", key=f"sweep_resume_{selected_sweep_id}", disabled=bool(cancel_req) or (not bool(pause_req)))
+                    with c3:
+                        cancel_btn = st.button(
+                            "Cancel",
+                            key=f"sweep_cancel_{selected_sweep_id}",
+                            disabled=bool(cancel_req),
+                            help="Stops new child job claims; running children may finish (v1).",
+                        )
 
-                c1, c2, c3, c4 = st.columns([1, 1, 1, 3], gap="small")
-                with c1:
-                    pause_btn = st.button("Pause", key=f"sweep_pause_{selected_sweep_id}", disabled=bool(cancel_req) or bool(pause_req))
-                with c2:
-                    resume_btn = st.button("Resume", key=f"sweep_resume_{selected_sweep_id}", disabled=bool(cancel_req) or (not bool(pause_req)))
-                with c3:
-                    cancel_btn = st.button(
-                        "Cancel",
-                        key=f"sweep_cancel_{selected_sweep_id}",
-                        disabled=bool(cancel_req),
-                        help="Stops new child job claims; running children may finish (v1).",
-                    )
+                    if pause_btn:
+                        with open_db_connection() as _ctrl_conn:
+                            set_job_pause_requested(_ctrl_conn, parent_job_id, True)
+                        st.success("Pause requested.")
+                        st.rerun()
 
-                if pause_btn:
-                    with open_db_connection() as _ctrl_conn:
-                        set_job_pause_requested(_ctrl_conn, parent_job_id, True)
-                    st.success("Pause requested.")
-                    st.rerun()
+                    if resume_btn:
+                        with open_db_connection() as _ctrl_conn:
+                            set_job_pause_requested(_ctrl_conn, parent_job_id, False)
+                        st.success("Resumed.")
+                        st.rerun()
 
-                if resume_btn:
-                    with open_db_connection() as _ctrl_conn:
-                        set_job_pause_requested(_ctrl_conn, parent_job_id, False)
-                    st.success("Resumed.")
-                    st.rerun()
-
-                if cancel_btn:
-                    with open_db_connection() as _ctrl_conn:
-                        set_job_cancel_requested(_ctrl_conn, parent_job_id, True)
-                    st.success("Cancel requested.")
-                    st.rerun()
+                    if cancel_btn:
+                        with open_db_connection() as _ctrl_conn:
+                            set_job_cancel_requested(_ctrl_conn, parent_job_id, True)
+                        st.success("Cancel requested.")
+                        st.rerun()
+                else:
+                    st.caption("Sweep completed. Controls are hidden for terminal sweeps.")
 
             try:
                 definition = json.loads(sweep_row.get("sweep_definition_json", "{}"))
@@ -17183,6 +17417,43 @@ def main() -> None:
             selected_sweep_run_count = 0
 
         st.markdown(f"### Runs in selected sweep: {int(selected_sweep_run_count)}")
+
+        # Shared filters (Results/Runs Explorer/Sweeps runs) for consistency.
+        with open_db_connection() as _filter_conn:
+            options_extra = _runs_global_filters_to_extra_where(get_global_filters())
+            options_extra["sweep_id"] = str(selected_sweep_id)
+            symbol_opts = list_backtest_run_symbols(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            tf_opts = list_backtest_run_timeframes(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            strat_opts = list_backtest_run_strategies_filtered(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+            bounds = get_runs_numeric_bounds(
+                _filter_conn,
+                extra_where=options_extra if options_extra else None,
+                user_id=user_id,
+            )
+        # Default Run type to Sweep for this grid.
+        if f"sweeps_runs_run_type" not in st.session_state:
+            st.session_state["sweeps_runs_run_type"] = "Sweep"
+        run_filters = _runs_server_filter_controls(
+            "sweeps_runs",
+            include_run_type=True,
+            on_change=None,
+            symbol_options=symbol_opts,
+            strategy_options=strat_opts,
+            timeframe_options=tf_opts,
+            bounds=bounds,
+        )
 
         # Load per-user persisted grid preferences for the Sweeps > Runs grid once per session.
         if not st.session_state.get("sweeps_runs_prefs_loaded", False):
@@ -17616,74 +17887,7 @@ def main() -> None:
             }
             """
         )
-        metrics_gradient_style = JsCode(
-            """
-            function(params) {
-                const col = (params && params.colDef && params.colDef.field) ? params.colDef.field.toString() : '';
-                const v = Number(params.value);
-                if (!isFinite(v)) { return {}; }
-                const greenText = '#7ee787';
-                const redText = '#ff7b72';
-                const neutralText = '#cbd5e1';
-                const greenRgb = '46,160,67';
-                const redRgb = '248,81,73';
-                function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
-                function alphaFromT(t) { const tt = clamp01(t); return 0.10 + (0.22 * tt); }
-                function styleGoodBad(isGood, t) {
-                    const a = alphaFromT(t);
-                    if (isGood === true) return { color: greenText, backgroundColor: `rgba(${greenRgb},${a})`, textAlign: 'center' };
-                    if (isGood === false) return { color: redText, backgroundColor: `rgba(${redRgb},${a})`, textAlign: 'center' };
-                    return { color: neutralText, textAlign: 'center' };
-                }
-
-                function asRatio(x) {
-                    if (!isFinite(x)) { return x; }
-                    return (Math.abs(x) <= 1.0) ? x : (x / 100.0);
-                }
-                if (col === 'net_return_pct') {
-                    const r = asRatio(v);
-                    const t = clamp01(Math.abs(r) / 0.50);
-                    if (r > 0) return styleGoodBad(true, t);
-                    if (r < 0) return styleGoodBad(false, t);
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                if (col === 'win_rate') {
-                    const r = asRatio(v);
-                    const dist = Math.abs(r - 0.5);
-                    const t = clamp01(dist / 0.25);
-                    return styleGoodBad(r >= 0.5, t);
-                }
-                if (['profit_factor','cpc_index','common_sense_ratio'].includes(col)) {
-                    const dist = Math.abs(v - 1.0);
-                    const t = clamp01(dist / 1.0);
-                    return styleGoodBad(v >= 1.0, t);
-                }
-                if (['sharpe','sortino'].includes(col)) {
-                    if (v >= 1.0) {
-                        const t = clamp01((v - 1.0) / 2.0);
-                        return styleGoodBad(true, t);
-                    }
-                    if (v < 0.0) {
-                        const t = clamp01(Math.abs(v) / 1.5);
-                        return styleGoodBad(false, t);
-                    }
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                if (col === 'net_profit') {
-                    const t = clamp01(Math.abs(v) / 1000.0);
-                    if (v > 0) return styleGoodBad(true, t);
-                    if (v < 0) return styleGoodBad(false, t);
-                    return { color: neutralText, textAlign: 'center' };
-                }
-                if (col === 'max_drawdown_pct') {
-                    const r = asRatio(v);
-                    const t = clamp01(r / 0.30);
-                    return styleGoodBad(false, t);
-                }
-                return {};
-            }
-            """
-        )
+        metrics_gradient_style = JsCode(_aggrid_metrics_gradient_style_js())
         dd_style = JsCode(
             """
             function(params) {
@@ -17780,6 +17984,7 @@ def main() -> None:
                 "start_date",
                 headerName=header_map.get("start_date", "Start"),
                 width=110,
+                valueFormatter=ddmm_yy_formatter,
                 hide=("start_date" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
@@ -17789,6 +17994,7 @@ def main() -> None:
                 "end_date",
                 headerName=header_map.get("end_date", "End"),
                 width=110,
+                valueFormatter=ddmm_yy_formatter,
                 hide=("end_date" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
@@ -18730,6 +18936,93 @@ def main() -> None:
                         help="Applies to all timestamps in the UI. Stored per user. DB remains UTC.",
                         key="settings_display_timezone",
                     )
+
+                with st.container(border=True):
+                    st.markdown("### Periods")
+                    periods = list_saved_periods(conn, user_id)
+                    if periods:
+                        df_periods = pd.DataFrame(periods)
+                        show_cols = [c for c in ["name", "start_ts", "end_ts", "updated_at"] if c in df_periods.columns]
+                        st.dataframe(df_periods[show_cols], hide_index=True, width="stretch")
+                    else:
+                        st.info("No saved periods yet.")
+
+                    period_labels = []
+                    period_id_by_label: Dict[str, int] = {}
+                    for p in periods or []:
+                        pid = p.get("id")
+                        name = str(p.get("name") or "").strip()
+                        if pid is None or not name:
+                            continue
+                        label = f"{name} (#{pid})"
+                        period_labels.append(label)
+                        period_id_by_label[label] = int(pid)
+
+                    selected_label = st.selectbox(
+                        "Saved periods",
+                        options=["(new)"] + period_labels,
+                        index=0,
+                        key="settings_period_selected",
+                    )
+                    selected_id = period_id_by_label.get(selected_label) if selected_label != "(new)" else None
+                    selected_row = None
+                    if selected_id is not None:
+                        selected_row = next((p for p in periods if int(p.get("id")) == int(selected_id)), None)
+
+                    name_default = str((selected_row or {}).get("name") or "") if selected_row else ""
+                    start_default = _normalize_timestamp((selected_row or {}).get("start_ts")) or datetime.now(timezone.utc) - timedelta(days=7)
+                    end_default = _normalize_timestamp((selected_row or {}).get("end_ts")) or datetime.now(timezone.utc)
+
+                    period_name = st.text_input("Name", value=name_default, key="settings_period_name")
+                    start_dt = st.datetime_input("Start (UTC)", value=start_default, key="settings_period_start")
+                    end_dt = st.datetime_input("End (UTC)", value=end_default, key="settings_period_end")
+                    if start_dt and end_dt and start_dt >= end_dt:
+                        st.warning("End time must be after start time.")
+
+                    btns = st.columns(3)
+                    with btns[0]:
+                        if st.button("Save period", key="settings_period_save"):
+                            if not str(period_name or "").strip():
+                                st.error("Name is required.")
+                            elif start_dt >= end_dt:
+                                st.error("End time must be after start time.")
+                            else:
+                                create_saved_period(
+                                    conn,
+                                    user_id=user_id,
+                                    name=str(period_name).strip(),
+                                    start_ts=start_dt.astimezone(timezone.utc).isoformat(),
+                                    end_ts=end_dt.astimezone(timezone.utc).isoformat(),
+                                )
+                                st.success("Saved period.")
+                                st.rerun()
+                    with btns[1]:
+                        if st.button("Update", key="settings_period_update", disabled=selected_id is None):
+                            if selected_id is None:
+                                st.error("Select a period to update.")
+                            elif not str(period_name or "").strip():
+                                st.error("Name is required.")
+                            elif start_dt >= end_dt:
+                                st.error("End time must be after start time.")
+                            else:
+                                update_saved_period(
+                                    conn,
+                                    user_id=user_id,
+                                    period_id=int(selected_id),
+                                    name=str(period_name).strip(),
+                                    start_ts=start_dt.astimezone(timezone.utc).isoformat(),
+                                    end_ts=end_dt.astimezone(timezone.utc).isoformat(),
+                                )
+                                st.success("Updated period.")
+                                st.rerun()
+                    with btns[2]:
+                        if st.button("Delete", key="settings_period_delete", disabled=selected_id is None):
+                            if selected_id is None:
+                                st.error("Select a period to delete.")
+                            else:
+                                delete_saved_period(conn, user_id=user_id, period_id=int(selected_id))
+                                st.success("Deleted period.")
+                                st.rerun()
 
             with right_col:
                 with st.container(border=True):

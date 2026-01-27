@@ -39,11 +39,34 @@ ICONS: dict[str, str] = {
 
 
 def _repo_root() -> Path:
+    env_root = os.environ.get("PROJECT_DRAGON_ROOT") or os.environ.get("DRAGON_ASSETS_ROOT")
+    if env_root:
+        try:
+            p = Path(env_root).expanduser().resolve()
+            if p.exists():
+                return p
+        except Exception:
+            pass
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for base in candidates:
+        for parent in [base] + list(base.parents):
+            if (parent / "app" / "assets" / "ui_icons" / "tabler").exists():
+                return parent
+
     return Path(__file__).resolve().parents[3]
 
 
 def _tabler_root() -> Path:
     return _repo_root() / "app" / "assets" / "ui_icons" / "tabler"
+
+
+def tabler_assets_available() -> bool:
+    try:
+        root = _tabler_root()
+        return root.exists()
+    except Exception:
+        return False
 
 
 def _read_text(path: Path) -> str:

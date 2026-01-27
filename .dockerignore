@@ -7,5 +7,3 @@ __pycache__/
 data/
 logs/
 *.db
-*.sqlite
-*.sqlite3
