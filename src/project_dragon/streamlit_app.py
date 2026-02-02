@@ -15087,41 +15087,53 @@ def main() -> None:
                     & df["sweep_category_id"].notna()
                 )
                 if mask.any():
-                    df_cat = df.loc[mask].copy()
-                    with open_db_connection() as _cat_conn:
-                        for ex_id, idxs in df_cat.groupby("sweep_exchange_id").groups.items():
-                            ex_norm = str(ex_id or "").strip()
-                            if not ex_norm:
-                                continue
-                            raw_ids = df_cat.loc[list(idxs), "sweep_category_id"].tolist()
-                            ids: list[int] = []
-                            for v in raw_ids or []:
-                                try:
-                                    if v is None:
-                                        continue
-                                    ids.append(int(v))
-                                except Exception:
-                                    continue
-                            ids = sorted(set([i for i in ids if i > 0]))
-                            if not ids:
-                                continue
-                            placeholders = ",".join(["?"] * len(ids))
+                    df_cat = df.loc[mask, ["sweep_exchange_id", "sweep_category_id"]].copy()
+                    pairs: list[tuple[str, int]] = []
+                    for row in df_cat.itertuples(index=False):
+                        ex_id = str(getattr(row, "sweep_exchange_id", "") or "").strip()
+                        if not ex_id:
+                            continue
+                        try:
+                            cat_id = int(getattr(row, "sweep_category_id", None))
+                        except Exception:
+                            continue
+                        if cat_id <= 0:
+                            continue
+                        pairs.append((ex_id, cat_id))
+                    pairs = sorted(set(pairs))
+                    if pairs:
+                        placeholders = ",".join(["(?, ?)"] * len(pairs))
+                        params: list[Any] = [str(user_id or "").strip() or "admin@local"]
+                        for ex_id, cat_id in pairs:
+                            params.extend([ex_id, cat_id])
+                        with open_db_connection() as _cat_conn:
                             rows_cat = _cat_conn.execute(
-                                f"SELECT id, name FROM asset_categories WHERE user_id = ? AND exchange_id = ? AND id IN ({placeholders})",
-                                tuple([str(user_id or "").strip() or "admin@local", ex_norm] + ids),
+                                f"SELECT exchange_id, id, name FROM asset_categories WHERE user_id = ? AND (exchange_id, id) IN ({placeholders})",
+                                tuple(params),
                             ).fetchall()
-                            id_to_name: dict[int, str] = {}
-                            for r in rows_cat or []:
-                                try:
-                                    id_to_name[int(r[0])] = str(r[1] or "").strip()
-                                except Exception:
-                                    continue
-                            if not id_to_name:
+                        id_to_name: dict[tuple[str, int], str] = {}
+                        for r in rows_cat or []:
+                            try:
+                                ex_id = str(r[0] or "").strip()
+                                cat_id = int(r[1])
+                                name = str(r[2] or "").strip()
+                                if ex_id and cat_id > 0:
+                                    id_to_name[(ex_id, cat_id)] = name
+                            except Exception:
                                 continue
-                            df.loc[df.index.isin(df_cat.loc[list(idxs)].index), "category"] = df.loc[
-                                df.index.isin(df_cat.loc[list(idxs)].index),
-                                "sweep_category_id",
-                            ].map(lambda x: id_to_name.get(int(x), "") if x is not None else "")
+                        if id_to_name:
+                            def _lookup_category(ex_id: Any, cat_id: Any) -> str:
+                                try:
+                                    ex_norm = str(ex_id or "").strip()
+                                    cid = int(cat_id)
+                                except Exception:
+                                    return ""
+                                return id_to_name.get((ex_norm, cid), "")
+
+                            df.loc[mask, "category"] = df.loc[mask].apply(
+                                lambda r: _lookup_category(r.get("sweep_exchange_id"), r.get("sweep_category_id")),
+                                axis=1,
+                            )
         except Exception:
             _results_log.warning("Results prep: failed to map categories", exc_info=True)
 

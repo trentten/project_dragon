@@ -69,12 +69,6 @@ def _write_saved_filter_presets(*, conn: Any, user_id: str, scope_key: str, pres
         return
 
 
-@dataclass(frozen=True)
-class TableFilterResult:
-    df: pd.DataFrame
-    active_filters: Dict[str, Any]
-
-
 def _as_filter_def(name: str, spec: Union[FilterType, Mapping[str, Any], FilterDef]) -> FilterDef:
     if isinstance(spec, FilterDef):
         return spec
