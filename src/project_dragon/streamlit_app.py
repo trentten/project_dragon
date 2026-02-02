@@ -1437,42 +1437,6 @@ def _aggrid_metrics_gradient_style_js() -> str:
             }
             """
 
-def _aggrid_ddmmyy_formatter() -> Any:
-    return JsCode(
-        """
-            function(params) {
-                try {
-                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
-                    const s = v.toString().trim();
-                    if (!s) return '';
-
-                    // Fast-path for YYYY-MM-DD.
-                    const m = s.match(/^([0-9]{4})-([0-9]{2})-([0-9]{2})/);
-                    if (m) {
-                        return `${m[3]}/${m[2]}/${m[1].slice(2)}`;
-                    }
-
-                    let d;
-                    if (/^[0-9]+$/.test(s)) {
-                        const n = parseInt(s, 10);
-                        d = new Date(n > 1000000000000 ? n : (n * 1000));
-                    } else {
-                        d = new Date(s);
-                    }
-                    if (isNaN(d.getTime())) return s;
-
-                    const dd = String(d.getUTCDate()).padStart(2, '0');
-                    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-                    const yy = String(d.getUTCFullYear()).slice(2);
-                    return `${dd}/${mm}/${yy}`;
-                } catch (e) {
-                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
-                    return v;
-                }
-            }
-            """
-    )
-
 def _sanitize_widget_choice(
     state: MutableMapping[str, Any],
     key: str,
@@ -9631,67 +9595,7 @@ def main() -> None:
                 }
                 """
             )
-            ddmm_yy_formatter = _aggrid_ddmmyy_formatter()
-
             # Match Results/Runs Explorer pills for Timeframe + Direction.
-            timeframe_style = aggrid_pill_style("timeframe")
-
-            direction_style = JsCode(
-                """
-                function(params) {
-                    const v = (params.value || '').toString().toLowerCase();
-                    if (v.includes('long')) {
-                        return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                    }
-                    if (v.includes('short')) {
-                        return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                    }
-                    return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                }
-                """
-            )
-
-            direction_renderer = JsCode(
-                """
-                class DirectionRenderer {
-                    init(params) {
-                        const raw = (params && params.value) ? params.value.toString() : '';
-                        const v = raw.toLowerCase();
-                        const wrap = document.createElement('div');
-                        wrap.style.display = 'flex';
-                        wrap.style.alignItems = 'center';
-                        wrap.style.justifyContent = 'center';
-                        wrap.style.gap = '6px';
-                        wrap.style.width = '100%';
-
-                        const arrow = document.createElement('span');
-                        arrow.style.fontWeight = '900';
-                        arrow.style.fontSize = '12px';
-                        if (v.includes('long')) {
-                            arrow.innerText = '▲';
-                            arrow.style.color = '#7ee787';
-                        } else if (v.includes('short')) {
-                            arrow.innerText = '▼';
-                            arrow.style.color = '#ff7b72';
-                        } else {
-                            arrow.innerText = '';
-                            arrow.style.color = '#cbd5e1';
-                        }
-
-                        const text = document.createElement('span');
-                        text.innerText = raw;
-                        text.style.fontWeight = '500';
-                        text.style.color = '#FFFFFF';
-
-                        wrap.appendChild(arrow);
-                        wrap.appendChild(text);
-                        this.eGui = wrap;
-                    }
-                    getGui() { return this.eGui; }
-                    refresh(params) { return false; }
-                }
-                """
-            )
             metrics_gradient_style = JsCode(
                 """
                 function(params) {
@@ -9777,65 +9681,6 @@ def main() -> None:
                 }
                 """
             )
-            timeframe_style = aggrid_pill_style("timeframe")
-
-            direction_style = JsCode(
-                """
-                function(params) {
-                    const v = (params.value || '').toString().toLowerCase();
-                    if (v.includes('long')) {
-                        return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                    }
-                    if (v.includes('short')) {
-                        return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                    }
-                    return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                }
-                """
-            )
-
-            direction_renderer = JsCode(
-                """
-                class DirectionRenderer {
-                    init(params) {
-                        const raw = (params && params.value) ? params.value.toString() : '';
-                        const v = raw.toLowerCase();
-                        const wrap = document.createElement('div');
-                        wrap.style.display = 'flex';
-                        wrap.style.alignItems = 'center';
-                        wrap.style.justifyContent = 'center';
-                        wrap.style.gap = '6px';
-                        wrap.style.width = '100%';
-
-                        const arrow = document.createElement('span');
-                        arrow.style.fontWeight = '900';
-                        arrow.style.fontSize = '12px';
-                        if (v.includes('long')) {
-                            arrow.innerText = '▲';
-                            arrow.style.color = '#7ee787';
-                        } else if (v.includes('short')) {
-                            arrow.innerText = '▼';
-                            arrow.style.color = '#ff7b72';
-                        } else {
-                            arrow.innerText = '';
-                            arrow.style.color = '#cbd5e1';
-                        }
-
-                        const text = document.createElement('span');
-                        text.innerText = raw;
-                        text.style.fontWeight = '500';
-                        text.style.color = '#FFFFFF';
-
-                        wrap.appendChild(arrow);
-                        wrap.appendChild(text);
-                        this.eGui = wrap;
-                    }
-                    getGui() { return this.eGui; }
-                    refresh(params) { return false; }
-                }
-                """
-            )
-
             def _pretty_label(s: str) -> str:
                 raw = (s or "").strip()
                 if not raw:
@@ -10611,6 +10456,68 @@ def main() -> None:
                 except Exception:
                     return default
 
+            shared_col_defs: list[dict[str, Any]] = []
+            if "start_date" in df.columns:
+                shared_col_defs.append(
+                    col_date_ddmmyy(
+                        "start_date",
+                        header_map.get("start_date", "Start"),
+                        pinned="left",
+                        width=_rx_w("start_date", 110),
+                        hide=("start_date" not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
+                    )
+                )
+            if "end_date" in df.columns:
+                shared_col_defs.append(
+                    col_date_ddmmyy(
+                        "end_date",
+                        header_map.get("end_date", "End"),
+                        pinned="left",
+                        width=_rx_w("end_date", 110),
+                        hide=("end_date" not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
+                    )
+                )
+            if "timeframe" in df.columns:
+                shared_col_defs.append(
+                    col_timeframe_pill(
+                        field="timeframe",
+                        header=header_map.get("timeframe", "Timeframe"),
+                        pinned="left",
+                        width=_rx_w("timeframe", 90),
+                        hide=("timeframe" not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
+                    )
+                )
+            if "direction" in df.columns:
+                shared_col_defs.append(
+                    col_direction_pill(
+                        field="direction",
+                        header=header_map.get("direction", "Direction"),
+                        pinned="left",
+                        width=_rx_w("direction", 100),
+                        hide=("direction" not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
+                    )
+                )
+            if "avg_position_time" in df.columns:
+                shared_col_defs.append(
+                    col_avg_position_time(
+                        field="avg_position_time",
+                        header=header_map.get("avg_position_time", "Avg Position Time"),
+                        width=_rx_w("avg_position_time", 150),
+                        hide=("avg_position_time" not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
+                    )
+                )
+            apply_columns(gb, shared_col_defs, saved_widths=_rx_widths)
+
             # Identity columns (match Results page formatting)
             if "run_id" in df.columns:
                 gb.configure_column(
@@ -10630,30 +10537,6 @@ def main() -> None:
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                 )
-            if "start_date" in df.columns:
-                gb.configure_column(
-                    "start_date",
-                    headerName=header_map.get("start_date", "Start"),
-                    pinned="left",
-                    width=_rx_w("start_date", 110),
-                    hide=("start_date" not in visible_cols),
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                    valueFormatter=ddmm_yy_formatter,
-                    cellClass="ag-center-aligned-cell",
-                )
-            if "end_date" in df.columns:
-                gb.configure_column(
-                    "end_date",
-                    headerName=header_map.get("end_date", "End"),
-                    pinned="left",
-                    width=_rx_w("end_date", 110),
-                    hide=("end_date" not in visible_cols),
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                    valueFormatter=ddmm_yy_formatter,
-                    cellClass="ag-center-aligned-cell",
-                )
             if "duration" in df.columns:
                 gb.configure_column(
                     "duration",
@@ -10661,16 +10544,6 @@ def main() -> None:
                     pinned="left",
                     width=_rx_w("duration", 105),
                     hide=("duration" not in visible_cols),
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                    cellClass="ag-center-aligned-cell",
-                )
-            if "avg_position_time" in df.columns:
-                gb.configure_column(
-                    "avg_position_time",
-                    headerName=header_map.get("avg_position_time", "Avg Position Time"),
-                    width=_rx_w("avg_position_time", 150),
-                    hide=("avg_position_time" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                     cellClass="ag-center-aligned-cell",
@@ -10688,31 +10561,6 @@ def main() -> None:
                     valueGetter=asset_market_getter,
                     checkboxSelection=True,
                     headerCheckboxSelection=True,
-                )
-            if "timeframe" in df.columns:
-                gb.configure_column(
-                    "timeframe",
-                    headerName=header_map.get("timeframe", "Timeframe"),
-                    pinned="left",
-                    width=_rx_w("timeframe", 90),
-                    cellStyle=timeframe_style,
-                    cellClass="ag-center-aligned-cell",
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                    hide=("timeframe" not in visible_cols),
-                )
-            if "direction" in df.columns:
-                gb.configure_column(
-                    "direction",
-                    headerName=header_map.get("direction", "Direction"),
-                    pinned="left",
-                    width=_rx_w("direction", 100),
-                    cellStyle=direction_style,
-                    cellRenderer=direction_renderer,
-                    cellClass="ag-center-aligned-cell",
-                    wrapHeaderText=True,
-                    autoHeaderHeight=True,
-                    hide=("direction" not in visible_cols),
                 )
             if "strategy" in df.columns:
                 gb.configure_column(
@@ -13483,49 +13331,6 @@ def main() -> None:
                         """
                 )
 
-        timeframe_style = JsCode(
-                        """
-                        function(params) {
-                            const raw = (params.value || '').toString().trim().toLowerCase();
-                            if (!raw) { return {}; }
-
-                            function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
-
-                            const m = raw.match(/^(\\d+)([mhdw])$/);
-                            if (!m) { return { color: '#b6d4fe', backgroundColor: 'rgba(56,139,253,0.16)', fontWeight: '800', textAlign: 'center' }; }
-                            const n = Number(m[1]);
-                            const u = m[2];
-                            if (!isFinite(n) || n <= 0) { return {}; }
-
-                            let minutes = n;
-                            if (u === 'h') minutes = n * 60;
-                            else if (u === 'd') minutes = n * 1440;
-                            else if (u === 'w') minutes = n * 10080;
-
-                            const t = clamp01(Math.log10(minutes + 1) / Math.log10(10080 + 1));
-                            // Stronger gradient for readability across timeframes.
-                            const alpha = 0.10 + (0.30 * t);
-                            return { color: '#b6d4fe', backgroundColor: `rgba(56,139,253,${alpha})`, fontWeight: '800', textAlign: 'center' };
-                        }
-                        """
-                )
-
-        direction_style = JsCode(
-                        """
-                        function(params) {
-                            const v = (params.value || '').toString().toLowerCase();
-                            // Keep direction cells in the same blue/green family as the table.
-                            if (v.includes('long')) {
-                                return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '800', textAlign: 'center' };
-                            }
-                            if (v.includes('short')) {
-                                return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '800', textAlign: 'center' };
-                            }
-                            return { color: '#FFFFFF', fontWeight: '800', textAlign: 'center' };
-                        }
-                        """
-                )
-
         # Default ordering: CPC Index desc (falls back to current ordering if missing).
         # Do this before computing pre_selected row indices.
         try:
@@ -13570,20 +13375,6 @@ def main() -> None:
             }
             """
         )
-        date_formatter = JsCode(
-            """
-            function(params) {
-              if (!params.value) { return ''; }
-              const d = new Date(params.value);
-              if (isNaN(d.getTime())) { return params.value; }
-              const dd = String(d.getUTCDate()).padStart(2,'0');
-              const mm = String(d.getUTCMonth()+1).padStart(2,'0');
-              const yy = String(d.getUTCFullYear());
-              return `${dd}-${mm}-${yy}`;
-            }
-            """
-        )
-
         def _escape_js_template_literal2(s: str) -> str:
             return (s or "").replace("`", "\\`").replace("${", "\\${")
 
@@ -14028,65 +13819,40 @@ def main() -> None:
                 if col in {"timeframe", "direction"}:
                     continue
                 col_filter = sym_filter if col in {"symbol", "timeframe", "direction", "strategy"} else True
-                if col == "direction":
+                if col == "strategy":
                     gb.configure_column(
                         col,
-                        headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                        headerName=header_map.get("strategy", "Strategy"),
                         width=_w(col, width),
-                        cellStyle=direction_style,
-                        cellRenderer=direction_renderer,
                         filter=col_filter,
                         hide=(col not in visible_cols),
                         wrapHeaderText=True,
                         autoHeaderHeight=True,
-                        cellClass="ag-center-aligned-cell",
+                    )
+                elif col == "sweep_name":
+                    gb.configure_column(
+                        col,
+                        headerName=header_map.get("sweep_name", "Sweep"),
+                        width=_w(col, width),
+                        filter=True,
+                        hide=(col not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
                     )
                 else:
-                    if col == "timeframe":
-                        gb.configure_column(
-                            col,
-                            headerName=header_map.get("timeframe", "Timeframe"),
-                            width=_w(col, width),
-                            filter=col_filter,
-                            cellStyle=timeframe_style,
-                            hide=(col not in visible_cols),
-                            wrapHeaderText=True,
-                            autoHeaderHeight=True,
-                            cellClass="ag-center-aligned-cell",
-                        )
-                    elif col == "strategy":
-                        gb.configure_column(
-                            col,
-                            headerName=header_map.get("strategy", "Strategy"),
-                            width=_w(col, width),
-                            filter=col_filter,
-                            hide=(col not in visible_cols),
-                            wrapHeaderText=True,
-                            autoHeaderHeight=True,
-                        )
-                    elif col == "sweep_name":
-                        gb.configure_column(
-                            col,
-                            headerName=header_map.get("sweep_name", "Sweep"),
-                            width=_w(col, width),
-                            filter=True,
-                            hide=(col not in visible_cols),
-                            wrapHeaderText=True,
-                            autoHeaderHeight=True,
-                        )
-                    else:
-                        gb.configure_column(
-                            col,
-                            headerName=header_map.get(col, str(col).replace("_", " ").title()),
-                            width=_w(col, width),
-                            filter=col_filter,
-                            hide=(col not in visible_cols),
-                            wrapHeaderText=True,
-                            autoHeaderHeight=True,
-                            cellRenderer=asset_renderer if col == "symbol" else None,
-                            valueGetter=asset_market_getter if col == "symbol" else None,
-                            checkboxSelection=True if col == "symbol" else None,
-                            headerCheckboxSelection=True if col == "symbol" else None,
+                    gb.configure_column(
+                        col,
+                        headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                        width=_w(col, width),
+                        filter=col_filter,
+                        hide=(col not in visible_cols),
+                        wrapHeaderText=True,
+                        autoHeaderHeight=True,
+                        cellRenderer=asset_renderer if col == "symbol" else None,
+                        valueGetter=asset_market_getter if col == "symbol" else None,
+                        checkboxSelection=True if col == "symbol" else None,
+                        headerCheckboxSelection=True if col == "symbol" else None,
+                    )
                         )
 
         for col in ("net_return_pct", "max_drawdown_pct", "max_drawdown", "win_rate"):
@@ -15259,30 +15025,6 @@ def main() -> None:
         except Exception:
             pass
 
-        ddmm_yy_formatter = JsCode(
-            """
-            function(params) {
-                try {
-                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
-                    if (!v) return '';
-                    let d = v;
-                    if (typeof v === 'string' || v instanceof String) {
-                        d = new Date(v);
-                    } else if (!(v instanceof Date)) {
-                        d = new Date(v);
-                    }
-                    if (isNaN(d)) return v;
-                    const dd = String(d.getDate()).padStart(2, '0');
-                    const mm = String(d.getMonth() + 1).padStart(2, '0');
-                    const yy = String(d.getFullYear()).slice(-2);
-                    return `${dd}/${mm}/${yy}`;
-                } catch (e) {
-                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
-                    return v;
-                }
-            }
-            """
-        )
         date_comparator = JsCode(
             """
             function(a, b) {
@@ -15463,54 +15205,6 @@ def main() -> None:
         actions_js_results = actions_js_results.replace("__FOLDER_SVG__", folder_svg_js_results)
         actions_renderer = JsCode(actions_js_results)
 
-        direction_renderer = JsCode(
-            """
-            class DirectionRenderer {
-                init(params) {
-                    const raw = (params && params.value) ? params.value.toString() : '';
-                    const v = raw.toLowerCase();
-
-                    const wrap = document.createElement('div');
-                    wrap.style.display = 'flex';
-                    wrap.style.alignItems = 'center';
-                    wrap.style.justifyContent = 'center';
-                    wrap.style.gap = '4px';
-                    wrap.style.width = '100%';
-
-                    const arrow = document.createElement('span');
-                    arrow.style.fontWeight = '900';
-                    arrow.style.fontSize = '12px';
-
-                    if (v.includes('long')) {
-                        arrow.innerText = '▲';
-                        arrow.style.color = '#7ee787';
-                    } else if (v.includes('short')) {
-                        arrow.innerText = '▼';
-                        arrow.style.color = '#ff7b72';
-                    } else {
-                        arrow.innerText = '';
-                        arrow.style.color = '#cbd5e1';
-                    }
-
-                    const text = document.createElement('span');
-                    text.innerText = raw;
-                    text.style.fontWeight = '500';
-                    text.style.color = '#FFFFFF';
-
-                    wrap.appendChild(arrow);
-                    wrap.appendChild(text);
-                    this.eGui = wrap;
-                }
-                getGui() {
-                    return this.eGui;
-                }
-                refresh(params) {
-                    return false;
-                }
-            }
-            """
-        )
-
         dd_style = JsCode(
             """
             function(params) {
@@ -15524,55 +15218,6 @@ def main() -> None:
         )
 
         metrics_gradient_style = JsCode(_aggrid_metrics_gradient_style_js())
-
-        timeframe_style = JsCode(
-            r"""
-            function(params) {
-                const raw = (params.value || '').toString().trim().toLowerCase();
-                if (!raw) { return {}; }
-                function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
-                const m = raw.match(/^(\d+)([mhdw])$/);
-                if (!m) { return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.10)', fontWeight: '500', textAlign: 'center' }; }
-                const n = Number(m[1]);
-                const u = m[2];
-                if (!isFinite(n) || n <= 0) { return {}; }
-                let minutes = n;
-                if (u === 'h') minutes = n * 60;
-                else if (u === 'd') minutes = n * 1440;
-                else if (u === 'w') minutes = n * 10080;
-
-                // Semantics: larger timeframes "healthier" (green).
-                if (minutes >= 240) {
-                    const t = clamp01(Math.log10(minutes + 1) / Math.log10(10080 + 1));
-                    const alpha = 0.12 + (0.16 * t);
-                    return { color: '#7ee787', backgroundColor: `rgba(46,160,67,${alpha})`, fontWeight: '500', textAlign: 'center' };
-                }
-                if (minutes >= 15) {
-                    const t = clamp01(Math.log10(minutes + 1) / Math.log10(240 + 1));
-                    const alpha = 0.12 + (0.14 * t);
-                    return { color: '#facc15', backgroundColor: `rgba(250,204,21,${alpha})`, fontWeight: '500', textAlign: 'center' };
-                }
-                const t = clamp01(Math.log10(minutes + 1) / Math.log10(15 + 1));
-                const alpha = 0.12 + (0.12 * t);
-                return { color: '#b6d4fe', backgroundColor: `rgba(56,139,253,${alpha})`, fontWeight: '500', textAlign: 'center' };
-            }
-            """
-        )
-
-        direction_style = JsCode(
-            """
-            function(params) {
-                const v = (params.value || '').toString().toLowerCase();
-                if (v.includes('long')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                }
-                if (v.includes('short')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                }
-                return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-            }
-            """
-        )
 
         pct_formatter = JsCode(
             """
@@ -15595,20 +15240,6 @@ def main() -> None:
             }
             """
         )
-        date_formatter = JsCode(
-            """
-            function(params) {
-              if (!params.value) { return ''; }
-              const d = new Date(params.value);
-              if (isNaN(d.getTime())) { return params.value; }
-              const dd = String(d.getUTCDate()).padStart(2,'0');
-              const mm = String(d.getUTCMonth()+1).padStart(2,'0');
-              const yy = String(d.getUTCFullYear());
-              return `${dd}-${mm}-${yy}`;
-            }
-            """
-        )
-
         def _escape_js_template_literal3(s: str) -> str:
             return (s or "").replace("`", "\\`").replace("${", "\\${")
 
@@ -17282,22 +16913,7 @@ def main() -> None:
         # NOTE: Use section-local variable names. The Sweeps page also defines
         # `timeframe_style` later for the Runs grid; reusing the same name here
         # causes an UnboundLocalError (Python treats it as a local assigned later).
-        timeframe_style_sweeps_overview = aggrid_pill_style("timeframe")
         status_style_sweeps_overview = aggrid_pill_style("status")
-        direction_style_sweeps_overview = JsCode(
-            """
-            function(params) {
-                const v = (params.value || '').toString().toLowerCase();
-                if (v.includes('long')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                }
-                if (v.includes('short')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-                }
-                return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
-            }
-            """
-        )
 
         sweeps_header_overrides = {
             "id": "ID",
@@ -17360,48 +16976,6 @@ def main() -> None:
                 return int(_sweeps_widths.get(str(col), default))
             except Exception:
                 return default
-        direction_renderer_sweeps_overview = JsCode(
-            """
-            class DirectionRenderer {
-                init(params) {
-                    const raw = (params && params.value) ? params.value.toString() : '';
-                    const v = raw.toLowerCase();
-                    const wrap = document.createElement('div');
-                    wrap.style.display = 'flex';
-                    wrap.style.alignItems = 'center';
-                    wrap.style.justifyContent = 'center';
-                    wrap.style.gap = '6px';
-                    wrap.style.width = '100%';
-
-                    const arrow = document.createElement('span');
-                    arrow.style.fontWeight = '900';
-                    arrow.style.fontSize = '12px';
-                    if (v.includes('long')) {
-                        arrow.innerText = '▲';
-                        arrow.style.color = '#7ee787';
-                    } else if (v.includes('short')) {
-                        arrow.innerText = '▼';
-                        arrow.style.color = '#ff7b72';
-                    } else {
-                        arrow.innerText = '';
-                        arrow.style.color = '#cbd5e1';
-                    }
-
-                    const text = document.createElement('span');
-                    text.innerText = raw;
-                    text.style.fontWeight = '500';
-                    text.style.color = '#FFFFFF';
-
-                    wrap.appendChild(arrow);
-                    wrap.appendChild(text);
-                    this.eGui = wrap;
-                }
-                getGui() { return this.eGui; }
-                refresh(params) { return false; }
-            }
-            """
-        )
-
         roi_pct_formatter = JsCode(
             """
             function(params) {
@@ -17582,20 +17156,6 @@ def main() -> None:
             """
         )
 
-        date_formatter = JsCode(
-            """
-            function(params) {
-              if (!params.value) { return ''; }
-              const d = new Date(params.value);
-              if (isNaN(d.getTime())) { return params.value; }
-              const dd = String(d.getUTCDate()).padStart(2,'0');
-              const mm = String(d.getUTCMonth()+1).padStart(2,'0');
-              const yy = String(d.getUTCFullYear());
-              return `${dd}-${mm}-${yy}`;
-            }
-            """
-        )
-
         gb_s = GridOptionsBuilder.from_dataframe(df_sweeps_display)
         gb_s.configure_default_column(filter=True, sortable=True, resizable=True)
         gb_s.configure_selection(
@@ -17754,8 +17314,6 @@ def main() -> None:
             """
         )
 
-        ddmm_yy_formatter = _aggrid_ddmmyy_formatter()
-
         asset_renderer_sweeps = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
         metrics_gradient_style = JsCode(
@@ -17880,6 +17438,57 @@ def main() -> None:
                 hide=("jobs_failed" not in visible_cols_sweeps),
             )
 
+        shared_col_defs: list[dict[str, Any]] = []
+        if "timeframe" in df_sweeps_display.columns:
+            shared_col_defs.append(
+                col_timeframe_pill(
+                    field="timeframe",
+                    header=_sweeps_header_label("timeframe"),
+                    width=_sweeps_w("timeframe", 95),
+                    filter=sym_filter,
+                    hide=("timeframe" not in visible_cols_sweeps),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "direction" in df_sweeps_display.columns:
+            shared_col_defs.append(
+                col_direction_pill(
+                    field="direction",
+                    header=_sweeps_header_label("direction"),
+                    width=_sweeps_w("direction", 110),
+                    filter=sym_filter,
+                    hide=("direction" not in visible_cols_sweeps),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "start_date" in df_sweeps_display.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "start_date",
+                    _sweeps_header_label("start_date"),
+                    width=_sweeps_w("start_date", 110),
+                    filter=True,
+                    hide=("start_date" not in visible_cols_sweeps),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "end_date" in df_sweeps_display.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "end_date",
+                    _sweeps_header_label("end_date"),
+                    width=_sweeps_w("end_date", 110),
+                    filter=True,
+                    hide=("end_date" not in visible_cols_sweeps),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        apply_columns(gb_s, shared_col_defs, saved_widths=_sweeps_widths)
+
         if "id" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "id",
@@ -17919,31 +17528,6 @@ def main() -> None:
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
-        if "timeframe" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "timeframe",
-                headerName=_sweeps_header_label("timeframe"),
-                width=_sweeps_w("timeframe", 95),
-                filter=sym_filter,
-                cellStyle=timeframe_style_sweeps_overview,
-                cellClass="ag-center-aligned-cell",
-                hide=("timeframe" not in visible_cols_sweeps),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
-        if "direction" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "direction",
-                headerName=_sweeps_header_label("direction"),
-                width=_sweeps_w("direction", 110),
-                filter=sym_filter,
-                cellStyle=direction_style_sweeps_overview,
-                cellRenderer=direction_renderer_sweeps_overview,
-                cellClass="ag-center-aligned-cell",
-                hide=("direction" not in visible_cols_sweeps),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
         if "status" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "status",
@@ -17964,28 +17548,6 @@ def main() -> None:
                 width=_sweeps_w("created_at", 160),
                 filter=True,
                 hide=("created_at" not in visible_cols_sweeps),
-            )
-
-        if "start_date" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "start_date",
-                headerName=_sweeps_header_label("start_date"),
-                width=_sweeps_w("start_date", 110),
-                filter=True,
-                valueFormatter=ddmm_yy_formatter,
-                cellClass="ag-center-aligned-cell",
-                hide=("start_date" not in visible_cols_sweeps),
-            )
-
-        if "end_date" in df_sweeps_display.columns:
-            gb_s.configure_column(
-                "end_date",
-                headerName=_sweeps_header_label("end_date"),
-                width=_sweeps_w("end_date", 110),
-                filter=True,
-                valueFormatter=ddmm_yy_formatter,
-                cellClass="ag-center-aligned-cell",
-                hide=("end_date" not in visible_cols_sweeps),
             )
 
         if "best_net_return_pct" in df_sweeps_display.columns:
@@ -18754,45 +18316,6 @@ def main() -> None:
 
         asset_renderer = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
-        direction_renderer = JsCode(
-            """
-            class DirectionRenderer {
-                init(params) {
-                    const raw = (params && params.value) ? params.value.toString() : '';
-                    const v = raw.toLowerCase();
-                    const wrap = document.createElement('div');
-                    wrap.style.display = 'flex';
-                    wrap.style.alignItems = 'center';
-                    wrap.style.justifyContent = 'center';
-                    wrap.style.gap = '6px';
-                    wrap.style.width = '100%';
-                    const arrow = document.createElement('span');
-                    arrow.style.fontWeight = '900';
-                    arrow.style.fontSize = '12px';
-                    if (v.includes('long')) {
-                        arrow.innerText = '▲';
-                        arrow.style.color = '#7ee787';
-                    } else if (v.includes('short')) {
-                        arrow.innerText = '▼';
-                        arrow.style.color = '#ff7b72';
-                    } else {
-                        arrow.innerText = '';
-                        arrow.style.color = '#cbd5e1';
-                    }
-                    const text = document.createElement('span');
-                    text.innerText = raw;
-                    text.style.fontWeight = '800';
-                    text.style.color = '#FFFFFF';
-                    wrap.appendChild(arrow);
-                    wrap.appendChild(text);
-                    this.eGui = wrap;
-                }
-                getGui() { return this.eGui; }
-                refresh(params) { return false; }
-            }
-            """
-        )
-
         pct_formatter = JsCode(
             """
             function(params) {
@@ -18814,34 +18337,6 @@ def main() -> None:
             }
             """
         )
-        date_formatter = JsCode(
-            """
-            function(params) {
-              if (!params.value) { return ''; }
-              const d = new Date(params.value);
-              if (isNaN(d.getTime())) { return params.value; }
-              const dd = String(d.getUTCDate()).padStart(2,'0');
-              const mm = String(d.getUTCMonth()+1).padStart(2,'0');
-              const yy = String(d.getUTCFullYear());
-              return `${dd}-${mm}-${yy}`;
-            }
-            """
-        )
-
-        direction_style = JsCode(
-            """
-            function(params) {
-                const v = (params.value || '').toString().toLowerCase();
-                if (v.includes('long')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center' };
-                }
-                if (v.includes('short')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center' };
-                }
-                return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center' };
-            }
-            """
-        )
         metrics_gradient_style = JsCode(_aggrid_metrics_gradient_style_js())
         dd_style = JsCode(
             """
@@ -18855,39 +18350,6 @@ def main() -> None:
             }
             """
         )
-        timeframe_style = JsCode(
-            r"""
-            function(params) {
-                const raw = (params.value || '').toString().trim().toLowerCase();
-                if (!raw) { return {}; }
-                function clamp01(x) { return Math.max(0.0, Math.min(1.0, x)); }
-                const m = raw.match(/^(\d+)([mhdw])$/);
-                if (!m) { return { color: '#cbd5e1', backgroundColor: 'rgba(148,163,184,0.10)', fontWeight: '500', textAlign: 'center' }; }
-                const n = Number(m[1]);
-                const u = m[2];
-                if (!isFinite(n) || n <= 0) { return {}; }
-                let minutes = n;
-                if (u === 'h') minutes = n * 60;
-                else if (u === 'd') minutes = n * 1440;
-                else if (u === 'w') minutes = n * 10080;
-
-                if (minutes >= 240) {
-                    const t = clamp01(Math.log10(minutes + 1) / Math.log10(10080 + 1));
-                    const alpha = 0.12 + (0.16 * t);
-                    return { color: '#7ee787', backgroundColor: `rgba(46,160,67,${alpha})`, fontWeight: '500', textAlign: 'center' };
-                }
-                if (minutes >= 15) {
-                    const t = clamp01(Math.log10(minutes + 1) / Math.log10(240 + 1));
-                    const alpha = 0.12 + (0.14 * t);
-                    return { color: '#facc15', backgroundColor: `rgba(250,204,21,${alpha})`, fontWeight: '500', textAlign: 'center' };
-                }
-                const t = clamp01(Math.log10(minutes + 1) / Math.log10(15 + 1));
-                const alpha = 0.12 + (0.12 * t);
-                return { color: '#b6d4fe', backgroundColor: `rgba(56,139,253,${alpha})`, fontWeight: '500', textAlign: 'center' };
-            }
-            """
-        )
-
         # Presentation-only: convert date columns to local strings before AGGrid.
         # For the Sweeps > Runs grid, show Run Date as DD/MM hh:mm AM/PM.
         try:
