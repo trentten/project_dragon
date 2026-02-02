@@ -15024,34 +15024,6 @@ def main() -> None:
             if "duration" not in df.columns:
                 df["duration"] = ""
 
-        # Derive Start/End/Duration columns from stored run fields if present.
-        try:
-            if {"start_time", "end_time"}.issubset(set(df.columns)):
-                sdt = pd.to_datetime(df["start_time"], errors="coerce", utc=True)
-                edt = pd.to_datetime(df["end_time"], errors="coerce", utc=True)
-                df["start_date"] = sdt.dt.date.astype(str).where(sdt.notna(), None)
-                df["end_date"] = edt.dt.date.astype(str).where(edt.notna(), None)
-                dur = (edt - sdt)
-
-                def _fmt_td(x: Any) -> str:
-                    try:
-                        if x is None or pd.isna(x):
-                            return ""
-                        secs = float(getattr(x, "total_seconds", lambda: 0.0)())
-                        if secs <= 0:
-                            return ""
-                        days = int(secs // 86400)
-                        hours = int((secs % 86400) // 3600)
-                        if days > 0:
-                            return f"{days}d {hours}h" if hours else f"{days}d"
-                        mins = int((secs % 3600) // 60)
-                        return f"{hours}h {mins}m" if hours else f"{mins}m"
-                    except Exception:
-                        return ""
-
-                df["duration"] = dur.map(_fmt_td)
-        except Exception:
-            pass
         if "direction" not in df.columns:
             try:
                 if "config_json" in df.columns:
@@ -15061,9 +15033,6 @@ def main() -> None:
             except Exception:
                 _results_log.warning("Results prep: failed to infer direction", exc_info=True)
                 df["direction"] = ""
-
-        if "avg_position_time" not in df.columns:
-            df["avg_position_time"] = "—"
 
         if "avg_position_time" not in df.columns:
             df["avg_position_time"] = "—"
@@ -15105,12 +15074,6 @@ def main() -> None:
                 df["asset_display"] = df["symbol"].fillna("").astype(str)
             except Exception:
                 _results_log.warning("Results prep: failed to build asset_display", exc_info=True)
-                df["asset_display"] = df.get("symbol", "")
-
-        if "asset_display" not in df.columns:
-            try:
-                df["asset_display"] = df["symbol"].fillna("").astype(str)
-            except Exception:
                 df["asset_display"] = df.get("symbol", "")
 
         # Category should reflect the sweep's category (not global membership):
@@ -15187,9 +15150,6 @@ def main() -> None:
 
         # Remove sweep-internal columns from the Sweeps > Runs grid.
         # These can otherwise show up as default columns even if we don't include them in the column picker.
-        df = df.drop(columns=["sweep_exchange_id", "sweep_scope", "sweep_category_id"], errors="ignore")
-
-        # Remove sweep-internal columns from the Sweeps > Runs grid (they're not useful in UI).
         df = df.drop(columns=["sweep_exchange_id", "sweep_scope", "sweep_category_id"], errors="ignore")
 
         preferred = [
