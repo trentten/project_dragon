@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
+import math
+
+from project_dragon.ui_formatters import format_duration_dhm
 from typing import Any, Optional, Union
 
 try:
@@ -155,6 +158,10 @@ def fmt_dt_short(value: Any, tz: tzinfo) -> str:
     dt_local = to_local_display(value, tz)
     if dt_local is None:
         return "—"
+    try:
+        return dt_local.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "—"
 
 
 def fmt_date(value: Any, tz: tzinfo) -> str:
@@ -172,6 +179,31 @@ def fmt_date(value: Any, tz: tzinfo) -> str:
         return dt_local.strftime("%Y-%m-%d %H:%M")
     except Exception:
         return "—"
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    """Format a duration in seconds for UI display.
+
+    Rules:
+    - None/NaN/<=0 -> ""
+    - < 60s -> "{n}s"
+    - < 3600s -> "{m}m {s}s"
+    - < 86400s -> "{h}h {m}m"
+    - >= 86400s -> "{d}d {h}h"
+    """
+
+
+
+    if seconds is None:
+        return ""
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(s) or s <= 0:
+        return ""
+
+    return format_duration_dhm(s, empty_for_none=True)
 
 
 def fmt_age(value: Any, now: Any, tz: tzinfo) -> str:
