@@ -18210,6 +18210,9 @@ def main() -> None:
         # Ensure positional indices for preselection.
         df = df.reset_index(drop=True)
 
+        # Remove asset_display from Sweeps > Runs payload (Assets column uses helper inputs).
+        df = df.drop(columns=["asset_display"], errors="ignore")
+
         # Preselect active run (from deep link or last chosen) in the runs grid.
         wanted_run_id = str(st.session_state.get("sweeps_active_run_id") or "").strip()
         if not wanted_run_id:
@@ -18248,7 +18251,6 @@ def main() -> None:
                 "base_asset",
                 "quote_asset",
                 "asset",
-                "asset_display",
                 "market",
                 "avg_position_time_seconds",
             }
@@ -18293,8 +18295,8 @@ def main() -> None:
         asset_market_getter = asset_market_getter_js(
             symbol_field="symbol",
             market_field="market",
-            base_asset_field="asset_display",
-            asset_field="asset_display",
+            base_asset_field="base_asset",
+            asset_field="asset",
         )
 
         roi_pct_formatter = JsCode(
