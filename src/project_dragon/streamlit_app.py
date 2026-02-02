@@ -16559,6 +16559,15 @@ def main() -> None:
             except Exception:
                 df_sweeps["asset_label"] = df_sweeps.get("asset", "")
 
+            try:
+                base_label = df_sweeps.get("asset_label")
+                if base_label is not None:
+                    df_sweeps["asset_display"] = base_label.where(base_label.astype(str).str.strip() != "", df_sweeps.get("asset_display", ""))
+                if "asset_display" in df_sweeps.columns:
+                    df_sweeps["asset_display"] = df_sweeps["asset_display"].fillna("").astype(str)
+            except Exception:
+                df_sweeps["asset_display"] = df_sweeps.get("asset_display", df_sweeps.get("symbol", ""))
+
         # Optional: compute per-sweep best metrics (from all runs; filter applies only to run grid)
         # Do this via SQL aggregation to keep the Sweeps page fast even with many runs.
         try:
@@ -17279,8 +17288,8 @@ def main() -> None:
         asset_market_getter = asset_market_getter_js(
             symbol_field="symbol",
             market_field="market",
-            base_asset_field="asset_label",
-            asset_field="asset_label",
+            base_asset_field="asset_display",
+            asset_field="asset_display",
         )
 
         # Date formatting (UTC) for sweeps overview.
