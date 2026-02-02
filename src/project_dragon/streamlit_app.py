@@ -13853,7 +13853,6 @@ def main() -> None:
                         checkboxSelection=True if col == "symbol" else None,
                         headerCheckboxSelection=True if col == "symbol" else None,
                     )
-                        )
 
         for col in ("net_return_pct", "max_drawdown_pct", "max_drawdown", "win_rate"):
             if col in df.columns:
@@ -16541,30 +16540,16 @@ def main() -> None:
             except Exception:
                 df_sweeps["asset_display"] = df_sweeps.get("symbol", "")
 
-            def _asset_label_for_row(row: dict) -> str:
-                scope_val = str(row.get("sweep_scope") or "").strip().lower()
-                if scope_val == "multi_asset_category":
-                    return str(row.get("sweep_category") or "").strip()
-                if scope_val == "multi_asset_manual":
-                    return str(row.get("asset") or "").strip()
-                # single asset: base asset derived from symbol
-                display = str(row.get("asset_display") or "").strip()
-                if display:
-                    return display
-                sym = str(row.get("symbol") or "").strip()
-                return _base_from_symbol(sym)
-
             try:
-                df_sweeps["asset_label"] = df_sweeps.apply(lambda r: _asset_label_for_row(dict(r)), axis=1)
-            except Exception:
-                df_sweeps["asset_label"] = df_sweeps.get("asset", "")
-
-            try:
-                base_label = df_sweeps.get("asset_label")
-                if base_label is not None:
-                    df_sweeps["asset_display"] = base_label.where(base_label.astype(str).str.strip() != "", df_sweeps.get("asset_display", ""))
                 if "asset_display" in df_sweeps.columns:
                     df_sweeps["asset_display"] = df_sweeps["asset_display"].fillna("").astype(str)
+                asset_fallback = df_sweeps.get("asset")
+                if asset_fallback is not None:
+                    df_sweeps["asset_display"] = df_sweeps.get("asset_display", "")
+                    df_sweeps["asset_display"] = df_sweeps["asset_display"].where(
+                        df_sweeps["asset_display"].astype(str).str.strip() != "",
+                        asset_fallback.fillna("").astype(str),
+                    )
             except Exception:
                 df_sweeps["asset_display"] = df_sweeps.get("asset_display", df_sweeps.get("symbol", ""))
 
@@ -17289,7 +17274,7 @@ def main() -> None:
             symbol_field="symbol",
             market_field="market",
             base_asset_field="asset_display",
-            asset_field="asset_display",
+            asset_field="asset",
         )
 
         # Date formatting (UTC) for sweeps overview.
