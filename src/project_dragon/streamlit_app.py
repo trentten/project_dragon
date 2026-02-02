@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import threading
 import time
 import traceback
@@ -26,155 +27,104 @@ import logging
 import streamlit as st
 
 try:
-    from project_dragon._version import __version__  # type: ignore
-except Exception:  # pragma: no cover
-    __version__ = "0"  # type: ignore
-
-try:
     from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, GridUpdateMode, JsCode  # type: ignore
 except Exception:  # pragma: no cover
     AgGrid = None  # type: ignore
     DataReturnMode = None  # type: ignore
+    GridOptionsBuilder = None  # type: ignore
     GridUpdateMode = None  # type: ignore
     JsCode = None  # type: ignore
 
 try:
-    import ccxt  # type: ignore
+    from project_dragon._version import __version__  # type: ignore
 except Exception:  # pragma: no cover
-    ccxt = None  # type: ignore
+    __version__ = "0"  # type: ignore
 
-from project_dragon.brokers.woox_client import WooXAPIError, WooXClient
-from project_dragon.brokers.woox_broker import WooXBroker
-from project_dragon.config_dragon import (
-    BBandsConfig,
-    DcaSettings,
-    DragonAlgoConfig,
-    DynamicActivationConfig,
-    ExitSettings,
-    GeneralSettings,
-    InitialEntrySizingMode,
-    MACDConfig,
-    OrderStyle,
-    RSIConfig,
-    StopLossMode,
-    TakeProfitMode,
-    TrendFilterConfig,
-    dragon_config_example,
-)
-from project_dragon.crypto import CryptoConfigError, decrypt_str, mask_api_key
-from project_dragon.candle_cache import get_run_details_candles_analysis_window
-from project_dragon.data_online import get_candles_with_cache, get_woox_market_catalog, load_ccxt_candles
-from project_dragon.domain import BacktestResult, Candle, Trade
-from project_dragon.indicators import htf_ma_mapping
-from project_dragon.engine import BacktestConfig, BacktestEngine
-from project_dragon.backtest_core import compute_analysis_window
-from project_dragon.live.trade_config import (
-    derive_primary_position_side_from_allow_flags,
-    normalize_primary_position_side,
-)
-from project_dragon.storage import (
-    SweepMeta,
-    add_bot_event,
-    bulk_enqueue_backtest_run_jobs,
-    claim_job,
-    count_backtest_runs_missing_details,
-    count_bots_for_account,
-    create_bot,
-    create_category,
-    create_credential,
-    create_job,
-    create_sweep,
-    count_runs_matching_filters,
-    clear_run_details_payloads,
-    dedupe_sweep_runs,
-    delete_credential,
-    delete_category,
-    delete_runs_and_children,
-    get_category_symbols,
-    get_account_snapshots,
-    get_app_settings,
-    get_backtest_run,
-    get_backtest_run_chart_artifacts,
-    get_backtest_run_job_counts_by_sweep,
-    get_backtest_run_job_counts_by_parent,
-    get_bot,
-    get_bot_context,
-    get_bot_snapshot,
-    get_bot_snapshots,
-    get_cached_coverage,
-    get_credential,
-    get_current_user_email,
-    get_symbols_primary_category_map,
-    get_sweep,
-    get_sweep_parent_jobs_by_sweep,
-    set_job_pause_requested,
-    set_job_cancel_requested,
-    execute_fetchall,
-    get_job,
-    get_or_create_user_id,
-    get_user_setting,
-    list_saved_periods,
-    create_saved_period,
-    update_saved_period,
-    delete_saved_period,
-    get_saved_period,
-    init_db,
-    link_bot_to_run,
-    list_assets,
-    list_assets_server_side,
-    debug_assets_server_side_query,
-    list_asset_symbols,
-    list_bot_events,
-    list_bot_fills,
-    list_bots,
-    list_bots_with_accounts,
-    list_cached_coverages,
-    list_categories,
-    list_credentials,
-    list_jobs,
-    list_runs_server_side,
-    list_runs_for_sweep,
-    list_sweeps,
-    list_sweeps_with_run_counts,
-    get_sweep_run_count,
-    list_ledger,
-    list_positions_history,
-    load_backtest_runs,
-    load_cached_range,
-    open_db_connection,
-    reconcile_inprocess_jobs_after_restart,
-    reconcile_sweep_statuses,
-    sample_backtest_runs_missing_details,
-    save_backtest_run,
-    save_backtest_run_details_for_existing_run,
-    seed_asset_categories_if_empty,
-    set_setting,
-    set_assets_status,
-    set_bot_desired_action,
-    set_bot_status,
-    set_category_membership,
-    set_job_link,
-    set_user_setting,
-    sum_ledger,
-    update_bot,
-    update_job,
-    update_sweep_status,
-    upsert_asset,
-    upsert_assets_bulk,
-    upsert_candles,
-    request_cancel_job,
-)
-from project_dragon.storage import (
-    load_backtest_runs_explorer_rows,
-    get_runs_explorer_rows,
-    list_backtest_run_strategies,
-    list_backtest_run_symbols,
-    list_backtest_run_timeframes,
-    list_backtest_run_strategies_filtered,
-    get_runs_numeric_bounds,
-    set_user_run_shortlists,
-    sync_symbol_icons_from_spothq_pack,
-)
+
+# Friendly column headings used across multiple AGGrid tables.
+# Keep this lightweight: only override where a generic snake_case title
+# isn't good enough.
+COL_LABELS: dict[str, str] = {
+    "id": "ID",
+    "run_id": "Run ID",
+    "bot_id": "Bot ID",
+    "created_at": "Run Date",
+    "start_date": "Start",
+    "end_date": "End",
+    "duration": "Duration",
+    "symbol": "Asset",
+    "symbol_full": "Symbol (raw)",
+    "icon_uri": "Icon URI",
+    "market": "Market",
+    "category": "Category",
+    "timeframe": "Timeframe",
+    "direction": "Direction",
+    "strategy": "Strategy",
+    "sweep_name": "Sweep",
+    "start_time": "Start Time",
+    "end_time": "End Time",
+    "net_return_pct": "Net Return",
+    "roi_pct_on_margin": "ROI",
+    "max_drawdown_pct": "Max Drawdown",
+    "win_rate": "Win Rate",
+    "net_profit": "Net Profit",
+    "sharpe": "Sharpe",
+    "sortino": "Sortino",
+    "profit_factor": "Profit Factor",
+    "cpc_index": "CPC Index",
+    "common_sense_ratio": "Common Sense Ratio",
+    "avg_position_time": "Avg Position Time",
+    "avg_position_time_seconds": "Avg Position Time (s)",
+    "shortlist": "Shortlist",
+    "shortlist_note": "Shortlist Note",
+    "actions": "Actions",
+}
+
+
+_ACRONYMS: dict[str, str] = {
+    "api": "API",
+    "atr": "ATR",
+    "bb": "BB",
+    "bbo": "BBO",
+    "cpc": "CPC",
+    "dca": "DCA",
+    "ema": "EMA",
+    "id": "ID",
+    "ma": "MA",
+    "macd": "MACD",
+    "pnl": "PnL",
+    "roi": "ROI",
+    "rsi": "RSI",
+    "sma": "SMA",
+    "tp": "TP",
+    "sl": "SL",
+    "usd": "USD",
+    "usdt": "USDT",
+}
+
+
+def snake_to_title(name: Any) -> str:
+    s = str(name)
+    if not s:
+        return ""
+
+    parts = [p for p in s.replace("-", "_").split("_") if p]
+    out: list[str] = []
+    for p in parts:
+        key = p.lower()
+        if key == "pct":
+            out.append("%")
+        elif key in _ACRONYMS:
+            out.append(_ACRONYMS[key])
+        else:
+            out.append(p[:1].upper() + p[1:])
+    return " ".join(out)
+
+
+def col_label(field: Any) -> str:
+    s = str(field)
+    return COL_LABELS.get(s, snake_to_title(s))
+
 
 from project_dragon.runs_explorer import (
     STRATEGY_CONFIG_KEYS,
@@ -189,6 +139,7 @@ from project_dragon.ui.icons import (
     st_tabler_icon,
     tabler_svg_to_data_uri,
     tabler_assets_available,
+    tabler_icon_inventory,
 )
 from project_dragon.ui.ui_filters import render_table_filters
 from project_dragon.ui.components import (
@@ -198,10 +149,95 @@ from project_dragon.ui.components import (
     render_card,
     render_kpi_tile,
 )
+from project_dragon.ui.asset_icons import asset_market_getter_js, asset_renderer_js
+from project_dragon.ui.grid_columns import (
+    apply_columns,
+    col_avg_position_time,
+    col_date_ddmmyy,
+    col_direction_pill,
+    col_shortlist,
+    col_shortlist_note,
+    col_timeframe_pill,
+)
+from project_dragon.ui_formatters import format_duration_dhm
 from project_dragon.ui.global_filters import apply_global_filters, ensure_global_filters_initialized, get_global_filters, set_global_filters
+from project_dragon.storage import (
+    count_backtest_runs_missing_details,
+    count_bots_for_account,
+    create_job,
+    create_sweep,
+    SweepMeta,
+    update_run_shortlist_fields,
+    update_job,
+    execute_fetchall,
+    get_table_columns,
+    get_backtest_run_chart_artifacts,
+    get_backtest_run,
+    get_backtest_run_job_counts_by_parent,
+    get_backtest_run_job_counts_by_sweep,
+    get_app_settings,
+    get_cached_coverage,
+    get_current_user_email,
+    get_database_url,
+    get_account_snapshots,
+    get_or_create_user_id,
+    get_user_setting,
+    init_db,
+    is_postgres_dsn,
+    list_backtest_run_symbols,
+    list_backtest_run_timeframes,
+    list_backtest_run_strategies_filtered,
+    list_runs_server_side,
+    load_backtest_runs_explorer_rows,
+    get_runs_numeric_bounds,
+    list_saved_periods,
+    list_credentials,
+    list_cached_coverages,
+    list_bots,
+    get_sweep_parent_jobs_by_sweep,
+    open_db_connection,
+    purge_old_candles,
+    sample_backtest_runs_missing_details,
+    set_setting,
+    set_user_setting,
+    create_saved_period,
+    update_saved_period,
+    delete_saved_period,
+    upsert_asset,
+    seed_asset_categories_if_empty,
+    upsert_assets_bulk,
+    create_category,
+    set_assets_status,
+    sync_symbol_icons_from_spothq_pack,
+)
+from project_dragon.config_dragon import (
+    DcaSettings,
+    DynamicActivationConfig,
+    DragonAlgoConfig,
+    BBandsConfig,
+    ExitSettings,
+    GeneralSettings,
+    InitialEntrySizingMode,
+    MACDConfig,
+    OrderStyle,
+    RSIConfig,
+    StopLossMode,
+    TakeProfitMode,
+    TrendFilterConfig,
+)
+from project_dragon.domain import BacktestResult, Candle, Trade
+from project_dragon.data_online import get_candles_with_cache, get_woox_market_catalog
 from project_dragon.strategy_dragon import DragonDcaAtrStrategy
 
-from project_dragon.time_utils import DEFAULT_DISPLAY_TZ_NAME, fmt_date, fmt_dt, fmt_dt_short, get_display_tz_name, to_local_display
+from project_dragon.time_utils import (
+    DEFAULT_DISPLAY_TZ_NAME,
+    fmt_date,
+    fmt_dt,
+    fmt_dt_short,
+    format_duration,
+    get_display_tz_name,
+    to_local_display,
+)
 
 try:
     from zoneinfo import ZoneInfo
@@ -559,83 +595,13 @@ def _render_live_bots_aggrid(df: pd.DataFrame, *, grid_key: str = "live_bots_ove
     df = df[[c for c in ordered_cols if c in df.columns]]
 
     # Results-style Asset renderer for the bots Symbol column (icon + label).
-    asset_market_getter = JsCode(
-        """
-        function(params) {
-            try {
-                const data = (params && params.data) ? params.data : {};
-                const rawSym = (data.Symbol !== undefined && data.Symbol !== null) ? data.Symbol.toString() : '';
-                const rawMarket = (data.market !== undefined && data.market !== null) ? data.market.toString() : '';
-
-                function inferBaseAsset(sym) {
-                    const s = (sym || '').toString().trim();
-                    if (!s) return '';
-                    if (s.indexOf('/') >= 0) return s.split('/', 1)[0].trim().toUpperCase();
-                    const up = s.toUpperCase();
-                    if (up.indexOf('PERP_') === 0 || up.indexOf('SPOT_') === 0) {
-                        const parts = up.split('_').filter(Boolean);
-                        return (parts.length >= 2) ? parts[1].trim() : up;
-                    }
-                    if (s.indexOf('-') >= 0) return s.split('-', 1)[0].trim().toUpperCase();
-                    return up;
-                }
-
-                const base = (data.base_asset !== undefined && data.base_asset !== null && data.base_asset.toString().trim())
-                    ? data.base_asset.toString().trim().toUpperCase()
-                    : inferBaseAsset(rawSym);
-                const mkt = (rawMarket || '').toString().trim().toUpperCase();
-                return (base && mkt) ? `${base} - ${mkt}` : base;
-            } catch (e) {
-                const v = (params && params.value !== undefined && params.value !== null) ? params.value.toString() : '';
-                return v;
-            }
-        }
-        """
+    asset_market_getter = asset_market_getter_js(
+        symbol_field="Symbol",
+        market_field="market",
+        base_asset_field="base_asset",
+        asset_field="asset",
     )
-
-    asset_renderer = JsCode(
-        """
-        class AssetRenderer {
-            init(params) {
-                const label = (params && params.value !== undefined && params.value !== null)
-                    ? params.value.toString()
-                    : '';
-                const uri = (params && params.data && params.data.icon_uri) ? params.data.icon_uri.toString() : '';
-
-                const wrap = document.createElement('div');
-                wrap.style.display = 'flex';
-                wrap.style.alignItems = 'center';
-                wrap.style.gap = '8px';
-                wrap.style.width = '100%';
-
-                if (uri) {
-                    const img = document.createElement('img');
-                    img.src = uri;
-                    img.style.width = '18px';
-                    img.style.height = '18px';
-                    img.style.borderRadius = '3px';
-                    img.style.display = 'block';
-                    wrap.appendChild(img);
-                } else {
-                    const spacer = document.createElement('div');
-                    spacer.style.width = '18px';
-                    spacer.style.height = '18px';
-                    wrap.appendChild(spacer);
-                }
-
-                const text = document.createElement('span');
-                text.innerText = label;
-                text.style.fontWeight = '500';
-                text.style.color = '#FFFFFF';
-                wrap.appendChild(text);
-
-                this.eGui = wrap;
-            }
-            getGui() { return this.eGui; }
-            refresh(params) { return false; }
-        }
-        """
-    )
+    asset_renderer = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
     health_renderer = JsCode(
         """
@@ -913,7 +879,7 @@ def _aggrid_dark_custom_css() -> dict:
             "--ag-row-border-color": "#2f2f30",
             "--ag-cell-horizontal-padding": "10px",
             "--ag-border-radius": "6px",
-            "--ag-row-hover-color": "rgba(242, 242, 242, 0.05)",
+            "--ag-row-hover-color": "rgba(242, 140, 40, 0.10)",
             "--ag-selected-row-background-color": "rgba(242, 140, 40, 0.14)",
             "--ag-control-panel-background-color": "#262627",
             "--ag-menu-background-color": "#262627",
@@ -928,6 +894,10 @@ def _aggrid_dark_custom_css() -> dict:
             "font-family": "Roboto,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif",
         },
         ".ag-root-wrapper-body": {"background-color": "#262627"},
+        ".ag-body-viewport": {"background-color": "#262627"},
+        ".ag-body": {"background-color": "#262627"},
+        ".ag-center-cols-viewport": {"background-color": "#262627"},
+        ".ag-center-cols-container": {"background-color": "#262627"},
         ".ag-header": {
             "border-bottom": "1px solid rgba(255,255,255,0.10)",
             "background-color": "#2d2d2e",
@@ -948,6 +918,8 @@ def _aggrid_dark_custom_css() -> dict:
             "font-variant-numeric": "tabular-nums",
             "color": "rgba(242,242,242,0.96)",
         },
+        ".ag-row-hover .ag-cell": {"background-color": "rgba(242, 140, 40, 0.10)"},
+        ".ag-row-hover.ag-row-selected .ag-cell": {"background-color": "rgba(242, 140, 40, 0.14)"},
         # Actions column: tighter padding so icon buttons fit without a huge column.
         ".ag-cell[col-id='actions']": {"padding-left": "2px", "padding-right": "2px"},
         ".ag-cell-wrapper": {"align-items": "center", "height": "100%"},
@@ -1007,6 +979,31 @@ def _extract_aggrid_models(grid: Any) -> tuple[Optional[dict], Optional[list]]:
     except Exception:
         pass
     return None, None
+
+
+def _extract_aggrid_columns_state(grid: Any) -> Optional[list]:
+    try:
+        if hasattr(grid, "columns_state"):
+            cols = getattr(grid, "columns_state")
+            if isinstance(cols, list) and cols:
+                return cols
+        if isinstance(grid, dict):
+            cols = grid.get("columns_state") or grid.get("columnsState") or grid.get("column_state") or grid.get("columnState")
+            if isinstance(cols, list) and cols:
+                return cols
+            state = grid.get("grid_state") or grid.get("gridState")
+            if isinstance(state, dict):
+                cols = (
+                    state.get("columnState")
+                    or state.get("columnsState")
+                    or state.get("column_state")
+                    or state.get("columns_state")
+                )
+                if isinstance(cols, list) and cols:
+                    return cols
+    except Exception:
+        pass
+    return None
 
 def _extract_ma_periods_from_config_dict(config_dict: Optional[Dict[str, Any]]) -> List[int]:
     if not isinstance(config_dict, dict):
@@ -3384,6 +3381,7 @@ def render_live_bot_detail(bot_id: int) -> None:
                 icon_html = render_tabler_icon(icon_name, size_px=20, color=icon_color, variant="filled", as_img=True)
             except Exception:
                 icon_html = ""
+            escaped_title = html.escape(bot_title)
             st.markdown(
                 """
                 <style>
@@ -3395,7 +3393,7 @@ def render_live_bot_detail(bot_id: int) -> None:
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f"<div class='dragon-bot-title-row'><div>{icon_html}</div><div class='dragon-bot-title'>{html.escape(bot_title)}</div></div>",
+                f"<div class='dragon-bot-title-row'><div>{icon_html}</div><div class='dragon-bot-title'>{escaped_title}</div></div>",
                 unsafe_allow_html=True,
             )
             st.caption(
@@ -4103,7 +4101,6 @@ def render_live_bot_detail(bot_id: int) -> None:
             st.dataframe(_df_local_times(pd.DataFrame(rows)), hide_index=True, width="stretch")
         else:
             st.info("No ledger rows yet.")
-
     with tab_events:
         if events:
             st.dataframe(_df_local_times(pd.DataFrame(events)), hide_index=True, width="stretch")
@@ -4587,15 +4584,117 @@ def build_config(form_inputs: Dict[str, Any]) -> DragonAlgoConfig:
         rsi=rsi,
     )
 def normalize_exchange_id(exchange_id: str) -> str:
-    ex = (str(exchange_id or "").strip().lower() or "")
-    if ex in {"woo", "woox", "woo-x", "woo_x"}:
-        return "woox"
-    return ex
+    from project_dragon.exchange_normalization import canonical_exchange_id
+
+    return canonical_exchange_id(exchange_id)
 
 
 def exchange_id_for_ccxt(exchange_id: str) -> str:
     ex = normalize_exchange_id(exchange_id)
     return "woo" if ex == "woox" else ex
+
+
+def normalize_symbol_to_asset_key(symbol: str) -> str:
+    s = str(symbol or "").strip()
+    if not s:
+        return ""
+
+    # Strip CCXT suffixes like :USDT
+    if ":" in s:
+        s = s.split(":", 1)[0]
+
+    up = s.upper().strip()
+    if up.startswith("PERP_") or up.startswith("SPOT_"):
+        parts = [p for p in up.split("_") if p]
+        if len(parts) >= 2:
+            up = parts[1]
+        else:
+            up = up.replace("PERP_", "").replace("SPOT_", "")
+
+    if "/" in up:
+        base = up.split("/", 1)[0].strip()
+    elif "-" in up:
+        base = up.split("-", 1)[0].strip()
+    elif "_" in up:
+        base = up.split("_", 1)[0].strip()
+    else:
+        base = up
+
+    # Handle concatenated symbols like ETHUSDT.
+    if base == up and up.isalnum():
+        quote_suffixes = [
+            "USDT",
+            "USDC",
+            "BUSD",
+            "USD",
+            "BTC",
+            "ETH",
+            "BNB",
+            "DAI",
+            "EUR",
+            "GBP",
+            "JPY",
+            "KRW",
+            "TRY",
+            "AUD",
+            "CAD",
+            "CHF",
+        ]
+        for suf in sorted(quote_suffixes, key=len, reverse=True):
+            if up.endswith(suf) and len(up) > len(suf):
+                base = up[: -len(suf)]
+                break
+
+    base = re.sub(r"^\d+", "", base)
+    return base.strip().upper()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _lookup_symbol_icon_uri(symbol: str, exchange_id: Optional[str] = None) -> str:
+    asset_key = normalize_symbol_to_asset_key(symbol)
+    if not asset_key:
+        return ""
+    try:
+        with open_db_connection() as conn:
+            row = conn.execute(
+                "SELECT icon_uri FROM symbols WHERE base_asset = ? AND icon_uri IS NOT NULL AND TRIM(icon_uri) != '' LIMIT 1",
+                (asset_key,),
+            ).fetchone()
+            if row:
+                return str(row[0] or "").strip()
+
+            lookup_symbol = str(symbol or "").strip()
+            if lookup_symbol and exchange_id:
+                ex_norm = normalize_exchange_id(str(exchange_id))
+                if ex_norm == "woox":
+                    up = lookup_symbol.upper()
+                    if up.startswith("PERP_") or up.startswith("SPOT_"):
+                        try:
+                            from project_dragon.data_online import woox_symbol_to_ccxt_symbol
+
+                            lookup_symbol, _ = woox_symbol_to_ccxt_symbol(up)
+                        except Exception:
+                            pass
+
+            if lookup_symbol:
+                row = conn.execute(
+                    "SELECT icon_uri FROM symbols WHERE exchange_symbol = ? AND icon_uri IS NOT NULL AND TRIM(icon_uri) != '' LIMIT 1",
+                    (lookup_symbol,),
+                ).fetchone()
+                if row:
+                    return str(row[0] or "").strip()
+    except Exception:
+        return ""
+    try:
+        from project_dragon.ui.crypto_icons import icon_bytes_to_data_uri, resolve_crypto_icon
+
+        resolved = resolve_crypto_icon(asset_key)
+        if resolved:
+            mime, b = resolved
+            return icon_bytes_to_data_uri(mime, b)
+    except Exception:
+        return ""
+    return ""
 
 
 def _dedupe_symbol_candidates(symbols: list[str], markets: Optional[dict] = None) -> list[str]:
@@ -5469,29 +5568,7 @@ def format_money(value: float | int | None, *, decimals: int = 2) -> str:
 
 
 def format_duration(seconds: float | int | None) -> str:
-    if seconds is None:
-        return "—"
-    try:
-        s = float(seconds)
-    except (TypeError, ValueError):
-        return "—"
-    if not math.isfinite(s) or s < 0:
-        return "—"
-    # Keep it compact and TradeStream-ish.
-    total = int(round(s))
-    days = total // 86400
-    rem = total % 86400
-    hours = rem // 3600
-    rem = rem % 3600
-    minutes = rem // 60
-    secs = rem % 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    if minutes > 0:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
+    return format_duration_dhm(seconds)
 
 
 def get_value_color(metric_name: str, value: Any) -> str:
@@ -5680,7 +5757,7 @@ def render_run_stats(run_row: Dict[str, Any]) -> None:
     profit_factor = _safe_float(metrics.get("profit_factor"))
     trades = _safe_float(metrics.get("total_trades", metrics.get("trades")))
     win_rate = _safe_float(metrics.get("win_rate", metrics.get("win_pct")))
-    avg_pos_time_s = _safe_float(metrics.get("avg_position_time_s"))
+    avg_pos_time_seconds = _safe_float(metrics.get("avg_position_time_seconds", metrics.get("avg_position_time_s")))
     csr = _safe_float(metrics.get("common_sense_ratio"))
     cpc = _safe_float(metrics.get("cpc_index"))
 
@@ -5756,22 +5833,10 @@ def render_run_stats(run_row: Dict[str, Any]) -> None:
             st.markdown("**Activity**")
             st.write(f"Trades: **{fmt_int(trades)}**")
 
-            if avg_pos_time_s is not None:
-                try:
-                    secs = float(avg_pos_time_s)
-                    if secs >= 0:
-                        days = int(secs // 86400)
-                        hours = int((secs % 86400) // 3600)
-                        mins = int((secs % 3600) // 60)
-                        if days > 0:
-                            hold_txt = f"{days}d {hours}h" if hours else f"{days}d"
-                        elif hours > 0:
-                            hold_txt = f"{hours}h {mins}m" if mins else f"{hours}h"
-                        else:
-                            hold_txt = f"{mins}m" if mins else "<1m"
-                        st.write(f"Avg Pos Time: **{hold_txt}**")
-                except Exception:
-                    pass
+            if avg_pos_time_seconds is not None:
+                hold_txt = format_duration(avg_pos_time_seconds)
+                if hold_txt:
+                    st.write(f"Avg Pos Time: **{hold_txt}**")
 
             for label, key, dec in (
                 ("Wins", "wins", 0),
@@ -5780,6 +5845,73 @@ def render_run_stats(run_row: Dict[str, Any]) -> None:
                 v = _safe_float(metrics.get(key))
                 if v is not None:
                     st.write(f"{label}: **{fmt_num(v, dec)}**")
+
+        with st.container(border=True):
+            st.markdown("**Shortlist**")
+            shortlist_key = f"run_details_shortlist_flag_{run_id}"
+            shortlist_note_key = f"run_details_shortlist_note_{run_id}"
+            shortlist_default = bool(run_row.get("shortlist"))
+            shortlist_note_default = str(run_row.get("shortlist_note") or "")
+
+            def _persist_shortlist_from_state() -> None:
+                rid = str(run_id or "").strip()
+                if not rid:
+                    st.session_state[f"run_details_shortlist_status_{run_id}"] = "Run not available."
+                    return
+                try:
+                    flag = bool(st.session_state.get(shortlist_key))
+                    note = str(st.session_state.get(shortlist_note_key) or "")
+                    update_run_shortlist_fields(
+                        rid,
+                        shortlist=flag,
+                        shortlist_note=note,
+                        user_id=user_id,
+                    )
+                    run_row["shortlist"] = bool(flag)
+                    run_row["shortlist_note"] = str(note or "")
+                    st.session_state[f"run_details_shortlist_status_{run_id}"] = "Saved."
+                except Exception as exc:
+                    st.session_state[f"run_details_shortlist_status_{run_id}"] = f"Save failed: {exc}"
+
+            def _persist_shortlist_from_state() -> None:
+                rid = str(run_id or "").strip()
+                if not rid:
+                    st.session_state[f"run_details_shortlist_status_{run_id}"] = "Run not available."
+                    return
+                try:
+                    flag = bool(st.session_state.get(shortlist_key))
+                    note = str(st.session_state.get(shortlist_note_key) or "")
+                    update_run_shortlist_fields(
+                        rid,
+                        shortlist=flag,
+                        shortlist_note=note,
+                        user_id=user_id,
+                    )
+                    run_row["shortlist"] = bool(flag)
+                    run_row["shortlist_note"] = str(note or "")
+                    st.session_state[f"run_details_shortlist_status_{run_id}"] = "Saved."
+                except Exception as exc:
+                    st.session_state[f"run_details_shortlist_status_{run_id}"] = f"Save failed: {exc}"
+
+            shortlist_flag = st.checkbox(
+                "Shortlist this run",
+                value=shortlist_default,
+                key=shortlist_key,
+                disabled=not bool(run_id),
+                on_change=_persist_shortlist_from_state,
+            )
+            shortlist_note = st.text_area(
+                "Note",
+                value=shortlist_note_default,
+                key=shortlist_note_key,
+                height=90,
+                placeholder="Why this run is shortlisted…",
+                disabled=not bool(run_id),
+                on_change=_persist_shortlist_from_state,
+            )
+            status_msg = st.session_state.get(f"run_details_shortlist_status_{run_id}")
+            if status_msg:
+                st.caption(str(status_msg))
 
         with st.container(border=True):
             st.markdown("**Run window**")
@@ -6345,6 +6477,8 @@ def render_run_detail_from_db(
         subtitle_parts = [p for p in [strategy, symbol, timeframe, direction, market, account] if p]
         if subtitle_parts:
             st.caption(" • ".join(subtitle_parts))
+        if rid:
+            st.caption(f"Run ID: {rid}")
 
         # Run window: Start/End/Duration (only here; do not repeat elsewhere)
         if start_dt and end_dt:
@@ -6364,7 +6498,7 @@ def render_run_detail_from_db(
             window_parts.append(f"Bars: {fmt_int(_safe_float(bars_cnt))}")
         st.caption(" · ".join(window_parts))
 
-    trades_df = pd.DataFrame()
+    trades_df = pd.DataFrame(columns=["timestamp", "side", "price", "size", "pnl", "note", "index"])
     trades_payload = hydrated.get("trades_json") or hydrated.get("trades")
 
     tf_for_ma = str(hydrated.get("timeframe") or metadata.get("timeframe") or "")
@@ -6393,18 +6527,92 @@ def render_run_detail_from_db(
         run_id_for_key = str(hydrated.get("id") or "").strip() or "unknown"
         result_cache_key = f"run_details_result_cache__{run_id_for_key}"
         result: Optional[BacktestResult] = st.session_state.get(result_cache_key)
+        if result is not None and not isinstance(result, BacktestResult):
+            result = None
         recomputed_result: Optional[BacktestResult] = None
-        if result is None:
-            artifacts: Optional[Dict[str, Any]] = None
-            if run_id_for_key and conn is not None:
-                try:
-                    with _perf("run.charts.load_artifacts"):
-                        artifacts = get_backtest_run_chart_artifacts(run_id_for_key, conn=conn)
-                except Exception:
-                    artifacts = None
 
-            # Build a result from stored artifacts only (no network, no re-run).
-            if isinstance(artifacts, dict) and artifacts.get("equity_curve"):
+        artifacts: Optional[Dict[str, Any]] = None
+        if run_id_for_key and conn is not None:
+            try:
+                with _perf("run.charts.load_artifacts"):
+                    artifacts = get_backtest_run_chart_artifacts(run_id_for_key, conn=conn)
+            except Exception:
+                artifacts = None
+
+        debug_schema = None
+        debug_cols: list[str] = []
+        debug_row_exists = None
+        debug_required_cols = {}
+        if conn is not None:
+            try:
+                row = conn.execute("SELECT current_schema() AS schema").fetchone()
+                if row is not None:
+                    debug_schema = row[0]
+            except Exception:
+                debug_schema = None
+            try:
+                cols = sorted(get_table_columns(conn, "backtest_run_details"))
+                debug_cols = cols
+                debug_required_cols = {
+                    "equity_curve": ("equity_curve_json" in cols or "equity_curve_jsonb" in cols),
+                    "equity_timestamps": ("equity_timestamps_json" in cols or "equity_timestamps_jsonb" in cols),
+                    "extra_series": ("extra_series_json" in cols or "extra_series_jsonb" in cols),
+                }
+            except Exception:
+                debug_cols = []
+            try:
+                row2 = conn.execute(
+                    "SELECT 1 FROM backtest_run_details WHERE run_id = %s LIMIT 1",
+                    (run_id_for_key,),
+                ).fetchone()
+                debug_row_exists = bool(row2)
+            except Exception:
+                debug_row_exists = None
+
+            debug_artifact_probe = {}
+            try:
+                probe = conn.execute(
+                    """
+                    SELECT
+                        length(equity_curve_json) AS eq_text_len,
+                        length(equity_timestamps_json) AS ts_text_len,
+                        length(extra_series_json) AS extra_text_len,
+                        equity_curve_jsonb IS NULL AS eq_jsonb_null,
+                        equity_timestamps_jsonb IS NULL AS ts_jsonb_null,
+                        extra_series_jsonb IS NULL AS extra_jsonb_null
+                    FROM backtest_run_details
+                    WHERE run_id = %s
+                    """,
+                    (run_id_for_key,),
+                ).fetchone()
+                if probe is not None:
+                    debug_artifact_probe = {
+                        "eq_text_len": probe[0],
+                        "ts_text_len": probe[1],
+                        "extra_text_len": probe[2],
+                        "eq_jsonb_null": probe[3],
+                        "ts_jsonb_null": probe[4],
+                        "extra_jsonb_null": probe[5],
+                    }
+            except Exception as exc:
+                debug_artifact_probe = {"error": str(exc)}
+
+        artifacts_debug = {
+            "run_id": run_id_for_key,
+            "artifacts_loaded": bool(artifacts),
+            "equity_len": len(artifacts.get("equity_curve") or []) if isinstance(artifacts, dict) else 0,
+            "timestamps_len": len(artifacts.get("equity_timestamps") or []) if isinstance(artifacts, dict) else 0,
+            "candles_len": len(artifacts.get("candles") or []) if isinstance(artifacts, dict) else 0,
+            "extra_keys": list((artifacts.get("extra_series") or {}).keys()) if isinstance(artifacts, dict) else [],
+            "schema": debug_schema,
+            "details_row_exists": debug_row_exists,
+            "required_cols_present": debug_required_cols,
+            "details_cols": debug_cols,
+            "artifact_probe": debug_artifact_probe,
+        }
+
+        # Build a result from stored artifacts only (no network, no re-run).
+        if isinstance(artifacts, dict) and artifacts.get("equity_curve"):
                 equity_curve = artifacts.get("equity_curve") or []
                 extra_series = artifacts.get("extra_series") or {}
                 params = artifacts.get("params") or {}
@@ -6513,10 +6721,13 @@ def render_run_detail_from_db(
                     extra_series=extra_series if isinstance(extra_series, dict) else {},
                 )
 
-            st.session_state[result_cache_key] = result
+        st.session_state[result_cache_key] = result
 
         missing_trades = not bool(trades_payload)
         missing_artifacts = result is None
+        if missing_artifacts:
+            with st.expander("Charts debug", expanded=False):
+                st.json(artifacts_debug)
         if missing_trades or missing_artifacts:
             st.warning("Detailed data was removed. Basics are preserved.")
             recompute_cols = st.columns([1, 2, 2])
@@ -6761,9 +6972,9 @@ def render_run_detail_from_db(
         _add_float_row(
             exec_rows,
             label="Avg Pos Time",
-            keys=["avg_position_time_s"],
-            fmt_fn=_fmt_seconds_compact,
-            color_metric="avg_position_time_s",
+            keys=["avg_position_time_seconds", "avg_position_time_s"],
+            fmt_fn=format_duration,
+            color_metric="avg_position_time_seconds",
         )
 
         grouped_fixed: list[tuple[str, list[tuple[str, str, object, str]]]] = [
@@ -6905,6 +7116,8 @@ def render_run_detail_from_db(
     st.markdown("#### Trades")
     if not trades_df.empty:
         trades_table_df = trades_df.reset_index(drop=True).copy()
+        # Remove implicit index column from the Trades grid.
+        trades_table_df = trades_table_df.drop(columns=["index"], errors="ignore")
 
         # Presentation-only formatting: convert timestamps to display timezone and render
         # as a stable string to avoid browser/JS timezone interpretation.
@@ -7038,6 +7251,8 @@ if "render_run_stats" not in globals():
             st.info("No metrics available for this run.")
             return
 
+        run_id = run_row.get("id")
+
         cols = st.columns(4)
         cols[0].metric("Net profit", _fmt_num(metrics.get("net_profit"), 2))
         cols[1].metric("Max drawdown", _fmt_num(metrics.get("max_drawdown"), 2))
@@ -7055,6 +7270,33 @@ if "render_run_stats" not in globals():
             "Win rate",
             format_pct(_safe_float(metrics.get("win_rate", metrics.get("win_pct"))), assume_ratio_if_leq_1=True, decimals=0),
         )
+
+        with st.container(border=True):
+            st.markdown("**Shortlist**")
+            shortlist_key = f"run_details_shortlist_flag_{run_id}"
+            shortlist_note_key = f"run_details_shortlist_note_{run_id}"
+            shortlist_default = bool(run_row.get("shortlist"))
+            shortlist_note_default = str(run_row.get("shortlist_note") or "")
+
+            shortlist_flag = st.checkbox(
+                "Shortlist this run",
+                value=shortlist_default,
+                key=shortlist_key,
+                disabled=not bool(run_id),
+                on_change=_persist_shortlist_from_state,
+            )
+            shortlist_note = st.text_area(
+                "Note",
+                value=shortlist_note_default,
+                key=shortlist_note_key,
+                height=90,
+                placeholder="Why this run is shortlisted…",
+                disabled=not bool(run_id),
+                on_change=_persist_shortlist_from_state,
+            )
+            status_msg = st.session_state.get(f"run_details_shortlist_status_{run_id}")
+            if status_msg:
+                st.caption(str(status_msg))
 
 
 def _set_model_and_widget(key: str, value: Any) -> None:
@@ -7114,8 +7356,8 @@ def _apply_backtest_data_settings_to_ui(
     if str(st.session_state.get("data_source_mode") or "").strip() != "Crypto (CCXT)":
         return
 
-    ex_id = str(metadata.get("exchange_id") or "woo").strip() or "woo"
-    st.session_state["ccxt_exchange_choice"] = ex_id if ex_id in {"woo", "binance", "bybit", "okx", "kraken"} else "Custom…"
+    ex_id = normalize_exchange_id(str(metadata.get("exchange_id") or "woox").strip() or "woox") or "woox"
+    st.session_state["ccxt_exchange_choice"] = ex_id if ex_id in {"woox", "binance", "bybit", "okx", "kraken"} else "Custom…"
     if st.session_state["ccxt_exchange_choice"] == "Custom…":
         st.session_state["ccxt_exchange_custom"] = ex_id
 
@@ -7589,6 +7831,7 @@ def _reset_create_live_bot_form_state() -> None:
     """
 
     for k in (
+        "live_bot_strategy_name",
         "live_bot_name",
         "live_bot_exchange",
         "live_bot_symbol",
@@ -7826,12 +8069,59 @@ def render_dragon_strategy_config_view(config_dict: Dict[str, Any], *, key_prefi
 def main() -> None:
     icon_path = None
     try:
-        icon_candidate = Path(__file__).resolve().parents[2] / "app" / "assets" / "project_dragon_icon.svg"
-        if icon_candidate.exists():
-            icon_path = str(icon_candidate)
+        repo_root = None
+        try:
+            env_root = os.environ.get("PROJECT_DRAGON_ROOT") or os.environ.get("DRAGON_ASSETS_ROOT")
+            if env_root:
+                repo_root = Path(env_root).expanduser().resolve()
+        except Exception:
+            repo_root = None
+        if repo_root is None:
+            candidates = [Path.cwd(), Path(__file__).resolve()]
+            for base in candidates:
+                for parent in [base] + list(base.parents):
+                    if (parent / "app" / "assets").exists():
+                        repo_root = parent
+                        break
+                if repo_root is not None:
+                    break
+        if repo_root is None:
+            for fallback in (Path("/app"), Path("/workspaces/project_dragon")):
+                if (fallback / "app" / "assets").exists() or (fallback / "config").exists():
+                    repo_root = fallback
+                    break
+        if repo_root is None:
+            repo_root = Path(__file__).resolve().parents[2]
+
+        config_root = repo_root / "config"
+        override_candidates = [
+            config_root / "favicon.png",
+            config_root / "favicon.ico",
+        ]
+        asset_candidates = [
+            repo_root / "app" / "assets" / "project_dragon_favicon.png",
+            repo_root / "app" / "assets" / "project_dragon_icon.svg",
+        ]
+        icon_candidate = None
+        for c in override_candidates + asset_candidates:
+            if c.exists():
+                icon_candidate = c
+                break
+        if icon_candidate is not None:
+            try:
+                from PIL import Image  # type: ignore
+
+                icon_path = Image.open(str(icon_candidate))
+            except Exception:
+                icon_path = str(icon_candidate)
     except Exception:
         icon_path = None
     st.set_page_config(page_title="Project Dragon", layout="wide", page_icon=(icon_path or "🐉"))
+
+    dsn = str(get_database_url() or "").strip()
+    if not is_postgres_dsn(dsn):
+        st.error("DRAGON_DATABASE_URL must be set to a postgres:// or postgresql:// URL.")
+        st.stop()
 
     try:
         if not st.session_state.get("_tabler_assets_warned", False) and not tabler_assets_available():
@@ -7840,6 +8130,22 @@ def main() -> None:
                 "Ensure app/assets/ui_icons/tabler is present in the container."
             )
             st.session_state["_tabler_assets_warned"] = True
+    except Exception:
+        pass
+    try:
+        if not st.session_state.get("_tabler_assets_logged", False):
+            inv = tabler_icon_inventory()
+            try:
+                _ = get_tabler_svg("circle-check")
+                ok_icon = True
+            except Exception:
+                ok_icon = False
+            logging.getLogger(__name__).info(
+                "tabler_assets inventory=%s ok_icon=%s",
+                inv,
+                ok_icon,
+            )
+            st.session_state["_tabler_assets_logged"] = True
     except Exception:
         pass
     inject_trade_stream_css(max_width_px=1920)
@@ -8127,7 +8433,8 @@ def main() -> None:
             except Exception:
                 continue
             label = str(a.get("label") or f"#{aid}").strip() or f"#{aid}"
-            ex = str(a.get("exchange_id") or "").strip().upper()
+            ex_raw = str(a.get("exchange_id") or "").strip().lower()
+            ex = (normalize_exchange_id(ex_raw) or ex_raw).upper()
             opt = f"{label} ({ex} #{aid})" if ex else f"{label} (#{aid})"
             account_options.append(opt)
             account_id_by_label[opt] = aid
@@ -8142,12 +8449,20 @@ def main() -> None:
         # Exchanges (from accounts + bots)
         exchange_opts: List[str] = []
         try:
-            exchange_opts.extend([str(a.get("exchange_id") or "").strip().lower() for a in accounts or []])
+            exchange_opts.extend([
+                normalize_exchange_id(str(a.get("exchange_id") or "").strip().lower())
+                or str(a.get("exchange_id") or "").strip().lower()
+                for a in accounts or []
+            ])
         except Exception:
             pass
         try:
             bots_for_opts = get_bot_snapshots(_gf_conn, str(user_id_gf), limit=500)
-            exchange_opts.extend([str(b.get("exchange_id") or "").strip().lower() for b in bots_for_opts or []])
+            exchange_opts.extend([
+                normalize_exchange_id(str(b.get("exchange_id") or "").strip().lower())
+                or str(b.get("exchange_id") or "").strip().lower()
+                for b in bots_for_opts or []
+            ])
         except Exception:
             pass
         exchange_opts = sorted({e for e in exchange_opts if e})
@@ -8169,7 +8484,19 @@ def main() -> None:
         symbol_opts: List[str] = []
         try:
             bots_for_opts = bots_for_opts if "bots_for_opts" in locals() else get_bot_snapshots(_gf_conn, str(user_id_gf), limit=500)
-            symbol_opts.extend([str(b.get("symbol") or "").strip().upper() for b in bots_for_opts or []])
+            for b in bots_for_opts or []:
+                ex_raw = str(b.get("exchange_id") or "").strip().lower()
+                ex_norm = normalize_exchange_id(ex_raw) or ex_raw
+                sym_raw = str(b.get("symbol") or "").strip()
+                if not sym_raw:
+                    continue
+                try:
+                    from project_dragon.exchange_normalization import canonical_symbol
+
+                    sym_norm = canonical_symbol(ex_norm, sym_raw)
+                except Exception:
+                    sym_norm = sym_raw
+                symbol_opts.append(str(sym_norm or sym_raw).strip().upper())
         except Exception:
             pass
         symbol_opts = sorted({s for s in symbol_opts if s})
@@ -8953,7 +9280,8 @@ def main() -> None:
                 [
                     {
                         "ID": a.get("id"),
-                        "Exchange": a.get("exchange_id"),
+                        "Exchange": normalize_exchange_id(str(a.get("exchange_id") or "").strip())
+                        or str(a.get("exchange_id") or "").strip(),
                         "Label": a.get("label"),
                         "Status": a.get("status"),
                         "Credential ID": a.get("credential_id"),
@@ -8980,6 +9308,11 @@ def main() -> None:
             st.info("No trading accounts yet. Create one below.")
 
         st.markdown("#### Create account")
+        # Clear sensitive fields on the next rerun (must happen before widgets are created).
+        if st.session_state.get("acct_create_clear_fields"):
+            st.session_state["acct_create_api_key"] = ""
+            st.session_state["acct_create_api_secret"] = ""
+            st.session_state.pop("acct_create_clear_fields", None)
         ex_choice = st.selectbox("Exchange", options=["woox"], index=0, key="acct_create_exchange")
         label_val = st.text_input("Label", value="Default WooX", key="acct_create_label")
         api_key_val = st.text_input("API Key", value="", type="password", key="acct_create_api_key")
@@ -8994,6 +9327,10 @@ def main() -> None:
                     st.error("An account with this label already exists. Choose a different label or rotate keys on the existing account.")
                 else:
                     with _job_conn() as conn:
+                        try:
+                            _create_account = create_trading_account
+                        except NameError:
+                            from project_dragon.storage import create_trading_account as _create_account
                         cred_id = create_credential(
                             conn,
                             user_id=user_id,
@@ -9002,16 +9339,15 @@ def main() -> None:
                             api_key=str(api_key_val).strip(),
                             api_secret_plain=str(api_secret_val),
                         )
-                        acct_id = create_trading_account(
+                        acct_id = _create_account(
                             conn,
                             user_id=user_id,
                             exchange_id=str(ex_choice),
                             label=str(label_val).strip(),
                             credential_id=int(cred_id),
                         )
-                    # Clear sensitive fields from session state.
-                    st.session_state["acct_create_api_key"] = ""
-                    st.session_state["acct_create_api_secret"] = ""
+                    # Clear sensitive fields on next rerun (safe for widget-backed state).
+                    st.session_state["acct_create_clear_fields"] = True
                     st.success(f"Account #{acct_id} created")
                     st.rerun()
             except Exception as exc:
@@ -9024,7 +9360,8 @@ def main() -> None:
             for a in accounts_all:
                 aid = a.get("id")
                 label = (a.get("label") or "").strip() or f"#{aid}"
-                ex = (a.get("exchange_id") or "").strip() or "woox"
+                ex_raw = (a.get("exchange_id") or "").strip() or "woox"
+                ex = normalize_exchange_id(ex_raw) or ex_raw
                 status = (a.get("status") or "").strip().lower()
                 with st.expander(f"{label} • {ex} • {status}", expanded=False):
                     st.write(f"Account ID: **{aid}**")
@@ -9258,7 +9595,9 @@ def main() -> None:
                 "profit_factor": "Profit Factor",
                 "cpc_index": "CPC Index",
                 "common_sense_ratio": "Common Sense Ratio",
-                "avg_position_time_s": "Avg Position Time",
+                "avg_position_time": "Avg Position Time",
+                "shortlist": "Shortlist",
+                "shortlist_note": "Shortlist Note",
             }
 
             roi_pct_formatter = JsCode(
@@ -9289,23 +9628,6 @@ def main() -> None:
                   const v = Number(params.value);
                   if (!isFinite(v)) { return ''; }
                   return v.toFixed(2);
-                }
-                """
-            )
-            avg_pos_time_formatter = JsCode(
-                """
-                function(params) {
-                    if (params.value === null || params.value === undefined || params.value === '') { return ''; }
-                    const v = Number(params.value);
-                    if (!isFinite(v) || v < 0) { return ''; }
-                    const secs = Math.floor(v);
-                    const days = Math.floor(secs / 86400);
-                    const hours = Math.floor((secs % 86400) / 3600);
-                    const mins = Math.floor((secs % 3600) / 60);
-                    if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-                    if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
-                    if (mins > 0) return `${mins}m`;
-                    return '<1m';
                 }
                 """
             )
@@ -9595,6 +9917,20 @@ def main() -> None:
                     pass
                 st.session_state["runs_explorer_compare_prefs_loaded"] = True
 
+            # Load persisted layout state for the Runs Explorer grid once per session.
+            if not st.session_state.get("runs_explorer_columns_state_loaded", False):
+                try:
+                    with open_db_connection() as _prefs_conn:
+                        saved_state = get_user_setting(
+                            _prefs_conn, user_id, "ui.runs_explorer.columns_state", default=None
+                        )
+                    if isinstance(saved_state, list) and saved_state:
+                        st.session_state["runs_explorer_columns_state"] = saved_state
+                        st.session_state["runs_explorer_columns_state_last_persisted"] = saved_state
+                except Exception:
+                    pass
+                st.session_state["runs_explorer_columns_state_loaded"] = True
+
             # --- Results-style filters (top bar) -------------------------
             try:
                 all_strategies = list_backtest_run_strategies()
@@ -9684,7 +10020,9 @@ def main() -> None:
                 "profit_factor",
                 "cpc_index",
                 "common_sense_ratio",
-                "avg_position_time_s",
+                "avg_position_time_seconds",
+                "shortlist",
+                "shortlist_note",
                 "sweep_id",
                 "sweep_name",
                 "sweep_exchange_id",
@@ -9694,8 +10032,6 @@ def main() -> None:
                 "base_asset",
                 "quote_asset",
                 "icon_uri",
-                "shortlisted",
-                "shortlist_note",
             ]
 
             def _normalize_cfg_keys(raw: Any) -> List[str]:
@@ -9750,7 +10086,7 @@ def main() -> None:
             with _perf("runs_explorer_compare.build_filter_df"):
                 df_filter = pd.DataFrame(rows)
 
-            # Match Results semantics: base asset in `symbol`, raw exchange symbol in `symbol_full`.
+            # Keep raw exchange symbol in `symbol` and track it in `symbol_full` for display/debug.
             if "symbol" in df_filter.columns:
                 try:
                     df_filter["symbol_full"] = df_filter["symbol"].fillna("").astype(str)
@@ -9759,24 +10095,8 @@ def main() -> None:
             else:
                 df_filter["symbol_full"] = ""
 
-            if "base_asset" in df_filter.columns:
-                try:
-                    df_filter["symbol"] = df_filter["base_asset"].fillna("").astype(str).str.upper().replace({"NAN": ""})
-                except Exception:
-                    pass
-            else:
-                try:
-                    df_filter["symbol"] = (
-                        df_filter["symbol_full"]
-                        .fillna("")
-                        .astype(str)
-                        .str.upper()
-                        .str.replace("/", "-", regex=False)
-                        .str.split("-", n=1)
-                        .str[0]
-                    )
-                except Exception:
-                    df_filter["symbol"] = ""
+            if "symbol" not in df_filter.columns:
+                df_filter["symbol"] = ""
 
             if "strategy_name" in df_filter.columns and "strategy" not in df_filter.columns:
                 df_filter["strategy"] = df_filter["strategy_name"]
@@ -10038,10 +10358,14 @@ def main() -> None:
                 ed = _coerce_dt(b.get("end_time"))
                 if not sd and not ed:
                     sd, ed = _extract_range_from_cfg(cfg_obj)
+                avg_pos_seconds = b.get("avg_position_time_seconds")
+                if avg_pos_seconds is None:
+                    avg_pos_seconds = b.get("avg_position_time_s")
                 row: Dict[str, Any] = {
                     "run_id": b.get("run_id"),
                     "created_at": b.get("created_at"),
                     "symbol": b.get("symbol"),
+                    "asset_display": b.get("asset_display"),
                     "icon_uri": b.get("icon_uri"),
                     "base_asset": b.get("base_asset"),
                     "quote_asset": b.get("quote_asset"),
@@ -10053,7 +10377,10 @@ def main() -> None:
                     "start_date": sd.date().isoformat() if sd else None,
                     "end_date": ed.date().isoformat() if ed else None,
                     "duration": _fmt_duration(sd, ed),
-                    "avg_position_time_s": b.get("avg_position_time_s"),
+                    "avg_position_time_seconds": avg_pos_seconds,
+                    "avg_position_time": format_duration(avg_pos_seconds),
+                    "shortlist": bool(b.get("shortlist")) if b.get("shortlist") is not None else False,
+                    "shortlist_note": str(b.get("shortlist_note") or ""),
                     # Keep common metric fields available for filtering/formatting even if not selected.
                     "net_return_pct": b.get("net_return_pct"),
                     "roi_pct_on_margin": b.get("roi_pct_on_margin"),
@@ -10076,6 +10403,30 @@ def main() -> None:
                 base_rows.append(row)
 
             df = pd.DataFrame(base_rows)
+
+            if "asset_display" not in df.columns:
+                try:
+                    df["asset_display"] = df["symbol"].fillna("").astype(str)
+                except Exception:
+                    df["asset_display"] = df.get("symbol", "")
+            try:
+                from project_dragon.data_online import woox_symbol_to_ccxt_symbol
+
+                def _rx_normalize_asset_display(v: Any) -> str:
+                    s = str(v or "").strip()
+                    if not s:
+                        return ""
+                    if s.upper().startswith(("PERP_", "SPOT_")):
+                        try:
+                            display, _ = woox_symbol_to_ccxt_symbol(s)
+                            return str(display or s).strip()
+                        except Exception:
+                            return s
+                    return s
+
+                df["asset_display"] = df["asset_display"].apply(_rx_normalize_asset_display)
+            except Exception:
+                pass
 
             # Default ordering: CPC Index desc.
             try:
@@ -10121,6 +10472,9 @@ def main() -> None:
                     continue
 
             effective_cfg_keys = differing_cfg_keys if show_only_diff_cols else list(selected_cfg_keys)
+            if show_only_diff_cols and not differing_cfg_keys and selected_cfg_keys:
+                # If nothing differs on this page, still show explicitly selected config columns.
+                effective_cfg_keys = list(selected_cfg_keys)
             hidden_cols = [v for v in cfg_key_to_diff_field.values() if v in df.columns]
 
             ordered_cols: List[str] = [
@@ -10129,7 +10483,7 @@ def main() -> None:
                 "start_date",
                 "end_date",
                 "duration",
-                "avg_position_time_s",
+                "avg_position_time",
                 "symbol",
                 "timeframe",
                 "direction",
@@ -10143,6 +10497,20 @@ def main() -> None:
             # Run ID is an internal identifier for this view; keep it available for export
             # but do not show it as a visible/toggleable column.
             candidate_cols = [c for c in base_identity_cols if c not in {"market", "run_id"}]
+            for c in ("shortlist", "shortlist_note"):
+                if c in df.columns and c not in candidate_cols:
+                    candidate_cols.append(c)
+
+            # Migrate legacy Avg Position Time column key.
+            try:
+                persisted = st.session_state.get("runs_explorer_compare_visible_cols")
+                if isinstance(persisted, list) and "avg_position_time_s" in persisted:
+                    st.session_state["runs_explorer_compare_visible_cols"] = [
+                        ("avg_position_time" if c == "avg_position_time_s" else c) for c in persisted
+                    ]
+                persisted = st.session_state.get("runs_explorer_compare_visible_cols")
+            except Exception:
+                pass
 
             # If the user has interacted with the Visible columns popover, the per-column checkbox
             # widget values are the authoritative source (they persist across reruns).
@@ -10171,6 +10539,7 @@ def main() -> None:
 
             ordered_cols += [str(k) for k in selected_metric_keys]
             ordered_cols += [cfg_field_by_key[k] for k in effective_cfg_keys if cfg_field_by_key.get(k) in df.columns]
+            ordered_cols += [c for c in ("shortlist", "shortlist_note") if c in df.columns]
 
             # Keep internal identity fields even if not displayed so cell renderers/valueGetters
             # can build the same composite labels as the Results grid (e.g., Asset = "BTC - PERPS").
@@ -10183,91 +10552,20 @@ def main() -> None:
                     "base_asset",
                     "quote_asset",
                     "symbol_full",
+                    "asset_display",
                 )
                 if c in df.columns
             ]
             df = df[[c for c in (ordered_cols + internal_keep) if c in df.columns] + hidden_cols]
 
             # --- Results-style Asset renderer (icon + label) -----------
-            asset_market_getter = JsCode(
-                """
-                function(params) {
-                    try {
-                        const data = (params && params.data) ? params.data : {};
-                        const rawSym = (data.symbol !== undefined && data.symbol !== null) ? data.symbol.toString() : '';
-                        const rawMarket = (data.market !== undefined && data.market !== null) ? data.market.toString() : '';
-
-                        function inferBaseAsset(sym) {
-                            const s = (sym || '').toString().trim();
-                            if (!s) return '';
-                            if (s.indexOf('/') >= 0) return s.split('/', 1)[0].trim().toUpperCase();
-                            const up = s.toUpperCase();
-                            if (up.indexOf('PERP_') === 0 || up.indexOf('SPOT_') === 0) {
-                                const parts = up.split('_').filter(Boolean);
-                                return (parts.length >= 2) ? parts[1].trim() : up;
-                            }
-                            if (s.indexOf('-') >= 0) return s.split('-', 1)[0].trim().toUpperCase();
-                            return up;
-                        }
-
-                        const base = (data.base_asset !== undefined && data.base_asset !== null && data.base_asset.toString().trim())
-                            ? data.base_asset.toString().trim().toUpperCase()
-                            : ((data.asset !== undefined && data.asset !== null && data.asset.toString().trim())
-                                ? data.asset.toString().trim().toUpperCase()
-                                : inferBaseAsset(rawSym));
-                        const mkt = (rawMarket || '').toString().trim().toUpperCase();
-                        return (base && mkt) ? `${base} - ${mkt}` : base;
-                    } catch (e) {
-                        const v = (params && params.value !== undefined && params.value !== null) ? params.value.toString() : '';
-                        return v;
-                    }
-                }
-                """
+            asset_market_getter = asset_market_getter_js(
+                symbol_field="symbol",
+                market_field="market",
+                base_asset_field="asset_display",
+                asset_field="asset_display",
             )
-
-            asset_renderer = JsCode(
-                """
-                class AssetRenderer {
-                    init(params) {
-                        const label = (params && params.value !== undefined && params.value !== null)
-                            ? params.value.toString()
-                            : '';
-                        const uri = (params && params.data && params.data.icon_uri) ? params.data.icon_uri.toString() : '';
-
-                        const wrap = document.createElement('div');
-                        wrap.style.display = 'flex';
-                        wrap.style.alignItems = 'center';
-                        wrap.style.gap = '8px';
-                        wrap.style.width = '100%';
-
-                        if (uri) {
-                            const img = document.createElement('img');
-                            img.src = uri;
-                            img.style.width = '18px';
-                            img.style.height = '18px';
-                            img.style.borderRadius = '3px';
-                            img.style.display = 'block';
-                            wrap.appendChild(img);
-                        } else {
-                            const spacer = document.createElement('div');
-                            spacer.style.width = '18px';
-                            spacer.style.height = '18px';
-                            wrap.appendChild(spacer);
-                        }
-
-                        const text = document.createElement('span');
-                        text.innerText = label;
-                        text.style.fontWeight = '500';
-                        text.style.color = '#FFFFFF';
-                        wrap.appendChild(text);
-
-                        this.eGui = wrap;
-                    }
-                    getGui() { return this.eGui; }
-                    refresh(params) { return false; }
-                }
-                """
-            )
+            asset_renderer = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
             # --- Grid ----------------------------------------------------
             # Presentation-only: convert date columns to local strings before AGGrid.
@@ -10285,6 +10583,34 @@ def main() -> None:
             gb.configure_selection("multiple", use_checkbox=True)
             gb.configure_grid_options(headerHeight=58, rowHeight=38, suppressRowHoverHighlight=False, animateRows=False)
 
+            runtime_state = st.session_state.get("runs_explorer_compare_columns_state_runtime")
+            saved_state = st.session_state.get("runs_explorer_compare_columns_state")
+            state_source = runtime_state if isinstance(runtime_state, list) and runtime_state else saved_state
+            _rx_widths: dict[str, int] = {}
+            try:
+                if isinstance(state_source, list) and state_source:
+                    for item in state_source:
+                        if not isinstance(item, dict):
+                            continue
+                        col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                        if not col_id:
+                            continue
+                        width_val = item.get("width") or item.get("actualWidth")
+                        if width_val is None:
+                            continue
+                        try:
+                            _rx_widths[str(col_id)] = int(width_val)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            def _rx_w(col: str, default: int) -> int:
+                try:
+                    return max(60, int(_rx_widths.get(str(col), default)))
+                except Exception:
+                    return default
+
             # Identity columns (match Results page formatting)
             if "run_id" in df.columns:
                 gb.configure_column(
@@ -10299,7 +10625,7 @@ def main() -> None:
                     "created_at",
                     headerName=header_map.get("created_at", "Run Date"),
                     pinned="left",
-                    width=120,
+                    width=_rx_w("created_at", 120),
                     hide=("created_at" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
@@ -10309,7 +10635,7 @@ def main() -> None:
                     "start_date",
                     headerName=header_map.get("start_date", "Start"),
                     pinned="left",
-                    width=110,
+                    width=_rx_w("start_date", 110),
                     hide=("start_date" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
@@ -10321,7 +10647,7 @@ def main() -> None:
                     "end_date",
                     headerName=header_map.get("end_date", "End"),
                     pinned="left",
-                    width=110,
+                    width=_rx_w("end_date", 110),
                     hide=("end_date" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
@@ -10333,21 +10659,20 @@ def main() -> None:
                     "duration",
                     headerName=header_map.get("duration", "Duration"),
                     pinned="left",
-                    width=105,
+                    width=_rx_w("duration", 105),
                     hide=("duration" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                     cellClass="ag-center-aligned-cell",
                 )
-            if "avg_position_time_s" in df.columns:
+            if "avg_position_time" in df.columns:
                 gb.configure_column(
-                    "avg_position_time_s",
-                    headerName=header_map.get("avg_position_time_s", "Avg Position Time"),
-                    width=150,
-                    hide=("avg_position_time_s" not in visible_cols),
+                    "avg_position_time",
+                    headerName=header_map.get("avg_position_time", "Avg Position Time"),
+                    width=_rx_w("avg_position_time", 150),
+                    hide=("avg_position_time" not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
-                    valueFormatter=avg_pos_time_formatter,
                     cellClass="ag-center-aligned-cell",
                 )
             if "symbol" in df.columns:
@@ -10355,7 +10680,7 @@ def main() -> None:
                     "symbol",
                     headerName=header_map.get("symbol", "Asset"),
                     pinned="left",
-                    width=140,
+                    width=_rx_w("symbol", 140),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                     hide=("symbol" not in visible_cols),
@@ -10369,7 +10694,7 @@ def main() -> None:
                     "timeframe",
                     headerName=header_map.get("timeframe", "Timeframe"),
                     pinned="left",
-                    width=90,
+                    width=_rx_w("timeframe", 90),
                     cellStyle=timeframe_style,
                     cellClass="ag-center-aligned-cell",
                     wrapHeaderText=True,
@@ -10381,7 +10706,7 @@ def main() -> None:
                     "direction",
                     headerName=header_map.get("direction", "Direction"),
                     pinned="left",
-                    width=100,
+                    width=_rx_w("direction", 100),
                     cellStyle=direction_style,
                     cellRenderer=direction_renderer,
                     cellClass="ag-center-aligned-cell",
@@ -10394,7 +10719,7 @@ def main() -> None:
                     "strategy",
                     headerName=header_map.get("strategy", "Strategy"),
                     pinned="left",
-                    width=160,
+                    width=_rx_w("strategy", 160),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                     hide=("strategy" not in visible_cols),
@@ -10403,14 +10728,14 @@ def main() -> None:
                 gb.configure_column(
                     "sweep",
                     headerName=header_map.get("sweep", "Sweep"),
-                    width=200,
+                    width=_rx_w("sweep", 200),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                     hide=("sweep" not in visible_cols),
                 )
 
             # Hide Results-style helper columns
-            for hidden in ("icon_uri", "base_asset", "quote_asset", "market_type", "market"):
+            for hidden in ("icon_uri", "base_asset", "quote_asset", "market_type", "market", "asset_display"):
                 if hidden in df.columns:
                     gb.configure_column(hidden, hide=True)
 
@@ -10440,7 +10765,7 @@ def main() -> None:
                 gb.configure_column(
                     mk,
                     headerName=_metric_label(mk),
-                    width=130,
+                    width=_rx_w(mk, 130),
                     type=["numericColumn"],
                     valueFormatter=fmt,
                     cellStyle=style,
@@ -10459,7 +10784,7 @@ def main() -> None:
                     gb.configure_column(
                         core_pct_col,
                         headerName=header_map.get(core_pct_col, core_pct_col.replace("_", " ").title()),
-                        width=130,
+                        width=_rx_w(core_pct_col, 130),
                         type=["numericColumn"],
                         valueFormatter=pct_formatter,
                         cellStyle=core_style,
@@ -10490,17 +10815,14 @@ def main() -> None:
                 gb.configure_column(
                     cfg_col,
                     headerName=_config_label(str(k)),
-                    width=170,
+                    width=_rx_w(cfg_col, 170),
                     cellStyle=style_js,
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                 )
 
             # Restore persisted column sizing/order for this compare grid.
-            runtime_state = st.session_state.get("runs_explorer_compare_columns_state_runtime")
-            saved_state = st.session_state.get("runs_explorer_compare_columns_state")
             columns_state = None
-            state_source = runtime_state if isinstance(runtime_state, list) and runtime_state else saved_state
             if isinstance(state_source, list) and state_source:
                 try:
                     sanitized: list[dict] = []
@@ -10535,7 +10857,10 @@ def main() -> None:
                 gridOptions=gb.build(),
                 # Sorting/filtering should be client-side (no rerun). Only selection should rerun
                 # (for CSV selection/export) to keep the UI responsive.
-                update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.MODEL_CHANGED),
+                update_mode=(
+                    GridUpdateMode.SELECTION_CHANGED
+                    | GridUpdateMode.MODEL_CHANGED
+                ),
                 data_return_mode=DataReturnMode.AS_INPUT,
                 enable_enterprise_modules=False,
                 allow_unsafe_jscode=True,
@@ -10700,11 +11025,7 @@ def main() -> None:
             # Persist column layout only on explicit save (prevents resize loops and matches Results).
             if st.session_state.get("runs_explorer_compare_save_layout_requested"):
                 try:
-                    new_state = None
-                    if hasattr(grid, "columns_state"):
-                        new_state = getattr(grid, "columns_state")
-                    if not new_state and hasattr(grid, "get"):
-                        new_state = grid.get("columns_state")
+                    new_state = _extract_aggrid_columns_state(grid)
                     if isinstance(new_state, list) and new_state:
                         sanitized_state: list[dict] = []
                         for item in new_state:
@@ -10715,6 +11036,11 @@ def main() -> None:
                             col_id = d.get("colId") or d.get("col_id") or d.get("field")
                             if not col_id:
                                 continue
+                            if "width" not in d:
+                                try:
+                                    d["width"] = int(d.get("actualWidth") or 0) or d.get("width")
+                                except Exception:
+                                    pass
                             sanitized_state.append(d)
                         with open_db_connection() as _prefs_conn:
                             set_user_setting(
@@ -10794,6 +11120,46 @@ def main() -> None:
 
         # Backtest page (UI body)
         st.subheader("Backtesting")
+
+        def _render_backtest_job_status(job_id: Optional[int], label: str) -> None:
+            if not job_id:
+                return
+            try:
+                with open_db_connection(read_only=True) as _job_conn:
+                    job_row = get_job(_job_conn, int(job_id))
+            except Exception:
+                job_row = None
+            if not isinstance(job_row, dict):
+                st.warning(f"{label}: job #{job_id} not found")
+                return
+            status = str(job_row.get("status") or "").strip() or "unknown"
+            message = str(job_row.get("message") or "").strip()
+            error_text = str(job_row.get("error_text") or "").strip()
+            progress = job_row.get("progress")
+            msg = f"{label}: #{job_id} • {status}"
+            if message:
+                msg = f"{msg} • {message}"
+            if status.lower() == "failed":
+                st.error(msg)
+            else:
+                st.caption(msg)
+            try:
+                if progress is not None:
+                    st.progress(float(progress), text=None)
+            except Exception:
+                pass
+            if error_text:
+                with st.expander(f"{label} error details", expanded=False):
+                    st.code(error_text)
+
+        _render_backtest_job_status(
+            st.session_state.get("last_backtest_job_id"),
+            "Last backtest job",
+        )
+        _render_backtest_job_status(
+            st.session_state.get("last_sweep_parent_job_id"),
+            "Last sweep planner job",
+        )
 
         # Stored runs/sweeps are immutable: no deep-link "re-run" actions.
 
@@ -11606,10 +11972,31 @@ def main() -> None:
                     except Exception as e:
                         st.warning(f"Could not load CCXT metadata for '{exchange_id}': {e}")
 
+                    ex_norm = normalize_exchange_id(exchange_id) or (str(exchange_id or "").strip().lower())
                     raw_symbol_candidates = sorted(list(markets.keys())) if markets else ["ETH/USDT:USDT"]
-                    symbol_candidates = _dedupe_symbol_candidates(raw_symbol_candidates, markets)
-                    preferred_symbol = "ETH/USDT:USDT"
-                    symbol_default = st.session_state.get("ccxt_symbol") or preferred_symbol
+
+                    # WooX: show canonical PERP_/SPOT_ symbols (no ccxt-format duplicates).
+                    if ex_norm == "woox":
+                        from project_dragon.exchange_normalization import canonical_symbol
+
+                        symbol_candidates = []
+                        seen: set[str] = set()
+                        want_prefix = "PERP_" if str(market_type).strip().lower().startswith("perp") else "SPOT_"
+                        for s in raw_symbol_candidates:
+                            cs = str(canonical_symbol(ex_norm, s) or "").strip().upper()
+                            if not cs or not cs.startswith(want_prefix):
+                                continue
+                            if cs in seen:
+                                continue
+                            seen.add(cs)
+                            symbol_candidates.append(cs)
+                        preferred_symbol = "PERP_ETH_USDT" if want_prefix == "PERP_" else "SPOT_ETH_USDT"
+                        symbol_default_raw = st.session_state.get("ccxt_symbol") or preferred_symbol
+                        symbol_default = str(canonical_symbol(ex_norm, symbol_default_raw) or preferred_symbol).strip().upper()
+                    else:
+                        symbol_candidates = _dedupe_symbol_candidates(raw_symbol_candidates, markets)
+                        preferred_symbol = "ETH/USDT:USDT"
+                        symbol_default = st.session_state.get("ccxt_symbol") or preferred_symbol
                     if symbol_default in symbol_candidates:
                         symbol_index = symbol_candidates.index(symbol_default)
                     elif preferred_symbol in symbol_candidates:
@@ -11624,17 +12011,26 @@ def main() -> None:
                             return ""
                         # CCXT: BTC/USDT or BTC/USDT:USDT
                         if "/" in s:
-                            base = (s.split("/", 1)[0] or "").strip().upper()
+                            left = s.split(":", 1)[0]
+                            base = (left.split("/", 1)[0] or "").strip().upper()
+                            quote = (left.split("/", 1)[1] or "").strip().upper() if "/" in left else ""
                         else:
                             up = s.strip().upper()
                             if up.startswith("PERP_") or up.startswith("SPOT_"):
                                 parts = [p for p in up.split("_") if p]
                                 base = (parts[1] if len(parts) >= 2 else up).strip().upper()
+                                quote = (parts[2] if len(parts) >= 3 else "").strip().upper()
                             elif "-" in s:
                                 base = (s.split("-", 1)[0] or "").strip().upper()
+                                quote = (s.split("-", 1)[1] or "").strip().upper()
                             else:
                                 base = up
-                        return f"{base} - {ml}" if base else ""
+                                quote = ""
+                        if not base:
+                            return ""
+                        if quote:
+                            return f"{base}/{quote} - {ml}"
+                        return f"{base} - {ml}"
 
                     selected_symbol_for_defaults = str(st.session_state.get("ccxt_symbol") or symbol_default or "").strip()
 
@@ -11725,18 +12121,22 @@ def main() -> None:
                     # Best-effort: show the selected symbol's icon inline next to the dropdown.
                     if show_symbol_picker:
                         icon_uri_selected = None
-                        try:
-                            selected_for_icon = str(st.session_state.get("ccxt_symbol") or symbol_default or "").strip()
-                            if selected_for_icon:
-                                with open_db_connection() as conn:
-                                    r = conn.execute(
-                                        "SELECT icon_uri FROM symbols WHERE exchange_symbol = ? LIMIT 1",
-                                        (selected_for_icon,),
-                                    ).fetchone()
-                                if r:
-                                    icon_uri_selected = str(r[0] or "").strip() or None
-                        except Exception:
-                            icon_uri_selected = None
+                        selected_for_icon = str(st.session_state.get("ccxt_symbol") or symbol_default or "").strip()
+                        if selected_for_icon:
+                            icon_uri_selected = _lookup_symbol_icon_uri(selected_for_icon, exchange_id=ex_norm) or None
+
+                        placeholder_html = None
+                        if not icon_uri_selected:
+                            try:
+                                placeholder_html = render_tabler_icon(
+                                    "coin",
+                                    size_px=18,
+                                    color="#9aa0a6",
+                                    variant="outline",
+                                    as_img=True,
+                                )
+                            except Exception:
+                                placeholder_html = None
 
                         sym_icon_col, sym_select_col = st.columns([1, 11], vertical_alignment="center")
                         with sym_icon_col:
@@ -11745,6 +12145,13 @@ def main() -> None:
                                     f'<div style="width:22px;height:22px;display:flex;align-items:center;justify-content:center;">'
                                     f'<img src="{icon_uri_selected}" width="20" height="20" style="display:block;border-radius:4px;" />'
                                     f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            elif placeholder_html:
+                                st.markdown(
+                                    '<div style="width:22px;height:22px;display:flex;align-items:center;justify-content:center;">'
+                                    f"{placeholder_html}"
+                                    "</div>",
                                     unsafe_allow_html=True,
                                 )
                             else:
@@ -11834,29 +12241,50 @@ def main() -> None:
                                 periods = list_saved_periods(_p_conn, user_id)
                         except Exception:
                             periods = []
-                        period_labels = []
-                        period_id_by_label: Dict[str, int] = {}
+                        period_rows_by_id: Dict[int, dict] = {}
+                        period_ids: list[int] = []
                         for p in periods or []:
-                            pid = p.get("id")
-                            name = str(p.get("name") or "").strip()
-                            if pid is None or not name:
+                            try:
+                                pid = int(p.get("id"))
+                            except Exception:
                                 continue
-                            label = f"{name} (#{pid})"
-                            period_labels.append(label)
-                            period_id_by_label[label] = int(pid)
-                        if not period_labels:
+                            name = str(p.get("name") or "").strip()
+                            if not name:
+                                continue
+                            if pid not in period_rows_by_id:
+                                period_rows_by_id[pid] = p
+                                period_ids.append(pid)
+
+                        # Best-effort migration from legacy "ccxt_period_label" state.
+                        if "ccxt_period_id" not in st.session_state and "ccxt_period_label" in st.session_state:
+                            legacy = str(st.session_state.get("ccxt_period_label") or "").strip()
+                            migrated = None
+                            if legacy.isdigit():
+                                migrated = int(legacy)
+                            else:
+                                m = re.search(r"\(#(\d+)\)", legacy)
+                                if m:
+                                    try:
+                                        migrated = int(m.group(1))
+                                    except Exception:
+                                        migrated = None
+                            if migrated is not None:
+                                st.session_state["ccxt_period_id"] = migrated
+
+                        if not period_ids:
                             st.warning("No saved periods found. Create one in Settings → Periods.")
                             start_dt = None
                             end_dt = None
                         else:
-                            selected_label = st.selectbox(
+                            # Store id as value; render only the saved name.
+                            selected_id = st.selectbox(
                                 "Period",
-                                options=period_labels,
+                                options=period_ids,
                                 index=0,
-                                key="ccxt_period_label",
+                                key="ccxt_period_id",
+                                format_func=lambda pid: str((period_rows_by_id.get(int(pid)) or {}).get("name") or "").strip(),
                             )
-                            selected_id = period_id_by_label.get(selected_label)
-                            selected_row = next((p for p in periods if int(p.get("id")) == int(selected_id)), None)
+                            selected_row = period_rows_by_id.get(int(selected_id)) if selected_id is not None else None
                             start_dt = _normalize_timestamp((selected_row or {}).get("start_ts"))
                             end_dt = _normalize_timestamp((selected_row or {}).get("end_ts"))
                             if start_dt and end_dt:
@@ -12223,6 +12651,7 @@ def main() -> None:
                     payload["metadata"]["leverage"] = int(lev_bt)
 
                 job_id = enqueue_backtest_job(payload, is_interactive=bool(run_as_high_priority))
+                st.session_state["last_backtest_job_id"] = int(job_id)
                 msg = f"Backtest job queued: #{job_id}"
                 if run_feedback is not None:
                     run_feedback.success(msg)
@@ -12387,6 +12816,8 @@ def main() -> None:
                 total_runs = int(total_combos) * int(len(sweep_assets_job) if sweep_assets_job else 1)
 
                 parent_job_id = enqueue_sweep_parent_job(sweep_id=str(sweep_id), user_id=str(user_id or "").strip() or None)
+                st.session_state["last_sweep_parent_job_id"] = int(parent_job_id)
+                st.session_state["last_sweep_id"] = str(sweep_id)
                 msg = f"Sweep queued: sweep_id={sweep_id} ({total_runs} runs) – parent job_id={int(parent_job_id)}"
                 if run_feedback is not None:
                     run_feedback.success(msg)
@@ -12589,6 +13020,17 @@ def main() -> None:
                 render_dragon_strategy_config_view(config_dict, key_prefix=f"run_{target_run_id}")
 
             st.caption("Strategy config will be reused from the backtest; only entry/timeout sizing fields below are editable.")
+            strategy_default = str(run_row.get("strategy_name") if isinstance(run_row, dict) else "").strip()
+            if not strategy_default:
+                strategy_default = str(metadata.get("strategy_name") or "").strip()
+            if not strategy_default:
+                strategy_default = "DragonDcaAtr"
+            strategy_name_live = st.text_input(
+                "Strategy",
+                value=strategy_default,
+                key="live_bot_strategy_name",
+                help="Stored on the bot config for display/traceability.",
+            )
             bot_name = st.text_input("Bot name", value=bot_name_default, key="live_bot_name")
             exchange_val = st.text_input("Exchange ID", value=exchange_default, key="live_bot_exchange")
             symbol_val = st.text_input("Symbol", value=symbol_default or "PERP_BTC_USDT", key="live_bot_symbol")
@@ -12791,6 +13233,14 @@ def main() -> None:
                 can_create = derived is not None and selected_account_id is not None
                 if st.button("Create bot from run", type="primary", disabled=not can_create):
                     payload_config_base = deepcopy(config_dict)
+                    strategy_name_clean = str(strategy_name_live or "").strip()
+                    if strategy_name_clean:
+                        payload_config_base["strategy_name"] = strategy_name_clean
+                        md_cfg = payload_config_base.setdefault("metadata", {})
+                        if not isinstance(md_cfg, dict):
+                            md_cfg = {}
+                            payload_config_base["metadata"] = md_cfg
+                        md_cfg["strategy_name"] = strategy_name_clean
                     payload_config_base.setdefault("general", {})
                     payload_config_base["general"]["prefer_bbo_maker"] = bool(prefer_bbo_live)
                     payload_config_base["general"]["bbo_queue_level"] = int(bbo_level_live)
@@ -12879,6 +13329,9 @@ def main() -> None:
                     st.rerun()
         else:
             st.info("Enter a valid run ID to load its config and create a bot.")
+
+        # Live Bots page is complete; avoid falling through to Results grid logic.
+        return
 
     # Runs Explorer page removed (Results now covers this functionality).
 
@@ -13276,19 +13729,276 @@ def main() -> None:
         # Prefer set filters when enterprise modules are enabled
         sym_filter = "agSetColumnFilter" if use_enterprise else True
 
+        _sweeps_runs_widths: dict[str, int] = {}
+        try:
+            _sweeps_runs_saved = st.session_state.get("sweeps_runs_columns_state")
+            if isinstance(_sweeps_runs_saved, list) and _sweeps_runs_saved:
+                for item in _sweeps_runs_saved:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        _sweeps_runs_widths[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        def _sweeps_runs_w(col: str, default: int) -> int:
+            try:
+                return max(60, int(_sweeps_runs_widths.get(str(col), default)))
+            except Exception:
+                return default
+
+        shared_col_defs: list[dict[str, Any]] = []
+        if "start_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "start_date",
+                    header_map.get("start_date", "Start"),
+                    width=_sweeps_runs_w("start_date", 110),
+                    hide=("start_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "end_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "end_date",
+                    header_map.get("end_date", "End"),
+                    width=_sweeps_runs_w("end_date", 110),
+                    hide=("end_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "timeframe" in df.columns:
+            shared_col_defs.append(
+                col_timeframe_pill(
+                    field="timeframe",
+                    header=header_map.get("timeframe", "Timeframe"),
+                    width=_sweeps_runs_w("timeframe", 90),
+                    filter=sym_filter,
+                    hide=("timeframe" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "direction" in df.columns:
+            shared_col_defs.append(
+                col_direction_pill(
+                    field="direction",
+                    header=header_map.get("direction", "Direction"),
+                    width=_sweeps_runs_w("direction", 100),
+                    filter=sym_filter,
+                    hide=("direction" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "avg_position_time" in df.columns:
+            shared_col_defs.append(
+                col_avg_position_time(
+                    field="avg_position_time",
+                    header=header_map.get("avg_position_time", "Avg Position Time"),
+                    width=_sweeps_runs_w("avg_position_time", 150),
+                    hide=("avg_position_time" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "shortlist" in df.columns:
+            shared_col_defs.append(
+                col_shortlist(
+                    field="shortlist",
+                    header=col_label("shortlist"),
+                    editable=True,
+                    width=_sweeps_runs_w("shortlist", 130),
+                    hide=("shortlist" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "shortlist_note" in df.columns:
+            shared_col_defs.append(
+                col_shortlist_note(
+                    field="shortlist_note",
+                    header=col_label("shortlist_note"),
+                    editable=True,
+                    width=_sweeps_runs_w("shortlist_note", 200),
+                    hide=("shortlist_note" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        apply_columns(gb, shared_col_defs, saved_widths=_sweeps_runs_widths)
+
+        runtime_state = st.session_state.get("results_runs_columns_state_runtime")
+        saved_state = st.session_state.get("runs_explorer_columns_state")
+        state_source = runtime_state if isinstance(runtime_state, list) and runtime_state else saved_state
+        _results_widths: dict[str, int] = {}
+        try:
+            if isinstance(state_source, list) and state_source:
+                for item in state_source:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        _results_widths[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        def _res_w(col: str, default: int) -> int:
+            try:
+                return max(60, int(_results_widths.get(str(col), default)))
+            except Exception:
+                return default
+
         # Columns
         # (via “Save layout”), and we keep defaults as the true starting point.
-        def _w(px: int) -> int:
+        debug_grid = str(os.environ.get("DRAGON_DEBUG_GRID") or "").strip().lower() in {"1", "true", "yes", "on"}
+        debug_logger = logging.getLogger(__name__)
+        _runs_widths: dict[str, int] = {}
+        try:
+            _runs_runtime_state = st.session_state.get("runs_explorer_columns_state_runtime")
+            _runs_saved_state = st.session_state.get("runs_explorer_columns_state")
+            _runs_state_source = (
+                _runs_runtime_state
+                if isinstance(_runs_runtime_state, list) and _runs_runtime_state
+                else _runs_saved_state
+            )
+            if isinstance(_runs_state_source, list) and _runs_state_source:
+                for item in _runs_state_source:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        _runs_widths[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if debug_grid:
+            debug_logger.info(
+                "runs_explorer.grid_state width_map key=%s widths=%s",
+                "ui.runs_explorer.columns_state",
+                len(_runs_widths),
+            )
+
+        def _w(col: str, default: int) -> int:
             try:
-                return max(60, int(px))
+                base = _runs_widths.get(str(col), default)
+                return max(60, int(base))
             except Exception:
-                return px
+                return default
+
+        shared_col_defs: list[dict[str, Any]] = []
+        if "start_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "start_date",
+                    header_map.get("start_date", "Start"),
+                    width=_w("start_date", 110),
+                    hide=("start_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "end_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "end_date",
+                    header_map.get("end_date", "End"),
+                    width=_w("end_date", 110),
+                    hide=("end_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "timeframe" in df.columns:
+            shared_col_defs.append(
+                col_timeframe_pill(
+                    field="timeframe",
+                    header=header_map.get("timeframe", "Timeframe"),
+                    width=_w("timeframe", 90),
+                    filter=sym_filter,
+                    hide=("timeframe" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "direction" in df.columns:
+            shared_col_defs.append(
+                col_direction_pill(
+                    field="direction",
+                    header=header_map.get("direction", "Direction"),
+                    width=_w("direction", 100),
+                    filter=sym_filter,
+                    hide=("direction" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "avg_position_time" in df.columns:
+            shared_col_defs.append(
+                col_avg_position_time(
+                    field="avg_position_time",
+                    header=header_map.get("avg_position_time", "Avg Position Time"),
+                    width=_w("avg_position_time", 150),
+                    hide=("avg_position_time" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "shortlist" in df.columns:
+            shared_col_defs.append(
+                col_shortlist(
+                    field="shortlist",
+                    header="Shortlist",
+                    editable=True,
+                    width=_w("shortlist", 130),
+                    hide=("shortlist" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "shortlist_note" in df.columns:
+            shared_col_defs.append(
+                col_shortlist_note(
+                    field="shortlist_note",
+                    header="Shortlist Note",
+                    editable=True,
+                    width=_w("shortlist_note", 180),
+                    hide=("shortlist_note" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        apply_columns(gb, shared_col_defs, saved_widths=_runs_widths)
 
         if "run_id" in df.columns:
             gb.configure_column(
                 "run_id",
                 headerName=header_map.get("run_id", "Run ID"),
-                width=_w(180),
+                width=_w("run_id", 180),
                 hide=("run_id" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
@@ -13297,37 +14007,16 @@ def main() -> None:
             gb.configure_column(
                 "created_at",
                 headerName=header_map.get("created_at", "Run Date"),
-                width=_w(120),
+                width=_w("created_at", 120),
                 hide=("created_at" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
-            )
-
-        if "start_date" in df.columns:
-            gb.configure_column(
-                "start_date",
-                headerName=header_map.get("start_date", "Start"),
-                width=_w(110),
-                hide=("start_date" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
-        if "end_date" in df.columns:
-            gb.configure_column(
-                "end_date",
-                headerName=header_map.get("end_date", "End"),
-                width=_w(110),
-                hide=("end_date" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
             )
         if "duration" in df.columns:
             gb.configure_column(
                 "duration",
                 headerName=header_map.get("duration", "Duration"),
-                width=_w(105),
+                width=_w("duration", 105),
                 hide=("duration" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
@@ -13336,12 +14025,14 @@ def main() -> None:
 
         for col, width in (("symbol", 110), ("timeframe", 90), ("direction", 100), ("strategy", 160), ("sweep_name", 180)):
             if col in df.columns:
+                if col in {"timeframe", "direction"}:
+                    continue
                 col_filter = sym_filter if col in {"symbol", "timeframe", "direction", "strategy"} else True
                 if col == "direction":
                     gb.configure_column(
                         col,
                         headerName=header_map.get(col, str(col).replace("_", " ").title()),
-                        width=_w(width),
+                        width=_w(col, width),
                         cellStyle=direction_style,
                         cellRenderer=direction_renderer,
                         filter=col_filter,
@@ -13355,7 +14046,7 @@ def main() -> None:
                         gb.configure_column(
                             col,
                             headerName=header_map.get("timeframe", "Timeframe"),
-                            width=_w(width),
+                            width=_w(col, width),
                             filter=col_filter,
                             cellStyle=timeframe_style,
                             hide=(col not in visible_cols),
@@ -13367,7 +14058,7 @@ def main() -> None:
                         gb.configure_column(
                             col,
                             headerName=header_map.get("strategy", "Strategy"),
-                            width=_w(width),
+                            width=_w(col, width),
                             filter=col_filter,
                             hide=(col not in visible_cols),
                             wrapHeaderText=True,
@@ -13377,7 +14068,7 @@ def main() -> None:
                         gb.configure_column(
                             col,
                             headerName=header_map.get("sweep_name", "Sweep"),
-                            width=_w(width),
+                            width=_w(col, width),
                             filter=True,
                             hide=(col not in visible_cols),
                             wrapHeaderText=True,
@@ -13387,7 +14078,7 @@ def main() -> None:
                         gb.configure_column(
                             col,
                             headerName=header_map.get(col, str(col).replace("_", " ").title()),
-                            width=_w(width),
+                            width=_w(col, width),
                             filter=col_filter,
                             hide=(col not in visible_cols),
                             wrapHeaderText=True,
@@ -13405,7 +14096,7 @@ def main() -> None:
                         col,
                         headerName=header_map.get(col, "Max Drawdown"),
                         valueFormatter=pct_formatter,
-                        width=_w(130),
+                        width=_w(col, 130),
                         cellStyle=dd_style,
                         type=["numericColumn"],
                         cellClass="ag-center-aligned-cell",
@@ -13418,7 +14109,7 @@ def main() -> None:
                         col,
                         headerName=header_map.get(col, "Win Rate"),
                         valueFormatter=pct_formatter,
-                        width=_w(120),
+                        width=_w(col, 120),
                         cellStyle=metrics_gradient_style,
                         type=["numericColumn"],
                         cellClass="ag-center-aligned-cell",
@@ -13431,7 +14122,7 @@ def main() -> None:
                         col,
                         headerName=header_map.get(col, "Net Return"),
                         valueFormatter=pct_formatter,
-                        width=_w(120),
+                        width=_w(col, 120),
                         cellStyle=metrics_gradient_style,
                         type=["numericColumn"],
                         cellClass="ag-center-aligned-cell",
@@ -13446,7 +14137,7 @@ def main() -> None:
                         col,
                         headerName=header_map.get(col, "Net Profit"),
                         valueFormatter=num2_formatter,
-                        width=_w(120),
+                        width=_w(col, 120),
                         cellStyle=metrics_gradient_style,
                         type=["numericColumn"],
                         cellClass="ag-center-aligned-cell",
@@ -13459,7 +14150,7 @@ def main() -> None:
                         col,
                         headerName=header_map.get(col, str(col).replace("_", " ").title()),
                         valueFormatter=num2_formatter,
-                        width=_w(140 if col == "common_sense_ratio" else 120),
+                        width=_w(col, 140 if col == "common_sense_ratio" else 120),
                         cellStyle=metrics_gradient_style,
                         type=["numericColumn"],
                         cellClass="ag-center-aligned-cell",
@@ -13468,36 +14159,14 @@ def main() -> None:
                         autoHeaderHeight=True,
                     )
 
-        if "shortlisted" in df.columns:
-            gb.configure_column(
-                "shortlisted",
-                headerName="Shortlist",
-                editable=True,
-                cellRenderer="agCheckboxCellRenderer",
-                width=_w(130),
-                filter=False,
-                hide=("shortlisted" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
-        if "shortlist_note" in df.columns:
-            gb.configure_column(
-                "shortlist_note",
-                headerName="Shortlist Note",
-                editable=True,
-                width=_w(180),
-                hide=("shortlist_note" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
 
         if "actions" in df.columns:
             gb.configure_column(
                 "actions",
                 headerName="Actions",
                 cellRenderer=actions_renderer,
-                width=_w(130),
-                minWidth=_w(130),
+                width=_w("actions", 130),
+                minWidth=130,
                 pinned="right",
                 filter=False,
                 sortable=False,
@@ -13529,6 +14198,30 @@ def main() -> None:
         ):
             if hidden in df.columns:
                 gb.configure_column(hidden, hide=True)
+
+        # Apply saved widths after dynamic columns are configured.
+        _runs_saved_state = st.session_state.get("runs_explorer_columns_state")
+        if isinstance(_runs_saved_state, list) and _runs_saved_state:
+            try:
+                width_map: dict[str, int] = {}
+                for item in _runs_saved_state:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        width_map[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+                for col in df.columns.tolist():
+                    if col in width_map:
+                        gb.configure_column(col, width=width_map[col])
+            except Exception:
+                pass
 
         grid_options = gb.build()
 
@@ -13660,15 +14353,19 @@ def main() -> None:
 
         # Restore persisted column sizing/order. We sanitize out `hide` so the dropdown remains authoritative.
         saved_state = st.session_state.get("runs_explorer_columns_state")
+        runtime_state = st.session_state.get("runs_explorer_columns_state_runtime")
+        state_source = runtime_state if isinstance(runtime_state, list) and runtime_state else saved_state
         columns_state = None
-        if isinstance(saved_state, list) and saved_state:
+        if isinstance(state_source, list) and state_source:
             try:
                 sanitized: list[dict] = []
-                for item in saved_state:
+                widths_applied = 0
+                for item in state_source:
                     if not isinstance(item, dict):
                         continue
                     d = dict(item)
                     d.pop("hide", None)
+                    d.pop("headerName", None)
                     # Ensure Actions stays right-pinned (new column may be missing in older saved layouts).
                     col_id = d.get("colId") or d.get("col_id") or d.get("field")
                     if str(col_id) == "action_click":
@@ -13681,6 +14378,13 @@ def main() -> None:
                         except Exception:
                             d["width"] = 150
                         d["minWidth"] = max(130, int(d.get("minWidth") or 0))
+                    if d.get("width") is None and d.get("actualWidth") is not None:
+                        try:
+                            d["width"] = int(d.get("actualWidth"))
+                        except Exception:
+                            pass
+                    if d.get("width") is not None:
+                        widths_applied += 1
                     sanitized.append(d)
                 have_ids = {
                     str((x.get("colId") or x.get("col_id") or x.get("field") or "")).strip() for x in sanitized
@@ -13688,25 +14392,79 @@ def main() -> None:
                 if "actions" not in have_ids and "actions" in df.columns:
                     sanitized.append({"colId": "actions", "pinned": "right", "width": 150, "minWidth": 150})
                 columns_state = sanitized or None
+                if debug_grid:
+                    debug_logger.info(
+                        "runs_explorer.grid_state loaded key=%s cols=%s widths_applied=%s",
+                        "ui.runs_explorer.columns_state",
+                        len(sanitized),
+                        widths_applied,
+                    )
             except Exception:
                 columns_state = None
+        if debug_grid:
+            debug_logger.info(
+                "runs_explorer.grid_state final_payload=%s",
+                json.dumps(columns_state, default=str) if columns_state else "null",
+            )
 
+        fit_columns = not bool(saved_state)
         grid = AgGrid(
             df,
             gridOptions=grid_options,
             # Sorting/filtering should be client-side (no rerun). Only selection + edits should rerun.
-            update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.VALUE_CHANGED),
+            update_mode=(
+                GridUpdateMode.SELECTION_CHANGED
+                | GridUpdateMode.VALUE_CHANGED
+                | GridUpdateMode.MODEL_CHANGED
+                | getattr(GridUpdateMode, "COLUMN_RESIZED", 0)
+                | getattr(GridUpdateMode, "COLUMN_MOVED", 0)
+                | getattr(GridUpdateMode, "COLUMN_VISIBLE", 0)
+            ),
             data_return_mode=DataReturnMode.AS_INPUT,
-            fit_columns_on_grid_load=False,
+            fit_columns_on_grid_load=fit_columns,
             allow_unsafe_jscode=True,
             enable_enterprise_modules=use_enterprise,
             theme="dark",
             custom_css=custom_css,
             height=630,
-            key="runs_explorer_grid_v2",
+            key="grid_runs_explorer",
             pre_selected_rows=pre_selected,
             columns_state=columns_state,
         )
+
+        # Store latest grid response for Save Layout (avoid stale column state).
+        st.session_state["grid_resp_runs_explorer"] = grid
+
+        # Persist runtime column sizing/order so widths survive sorting/filtering/selection.
+        try:
+            runtime_cols = _extract_aggrid_columns_state(grid)
+            if isinstance(runtime_cols, list) and runtime_cols:
+                sanitized_runtime: list[dict] = []
+                valid_ids = {str(c) for c in df.columns.tolist()}
+                for item in runtime_cols:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if col_id is None or str(col_id) not in valid_ids:
+                        continue
+                    if str(col_id) == "action_click":
+                        continue
+                    d = dict(item)
+                    d.pop("hide", None)
+                    d.pop("headerName", None)
+                    if str(col_id) == "actions":
+                        d["pinned"] = "right"
+                        d.pop("flex", None)
+                        try:
+                            d["width"] = max(130, int(d.get("width") or d.get("actualWidth") or 0))
+                        except Exception:
+                            d["width"] = 150
+                        d["minWidth"] = max(130, int(d.get("minWidth") or 0))
+                    sanitized_runtime.append(d)
+                if sanitized_runtime:
+                    st.session_state["runs_explorer_columns_state_runtime"] = sanitized_runtime
+        except Exception:
+            pass
 
         pager_cols = st.columns([1, 1, 2, 2, 2])
         with pager_cols[0]:
@@ -13731,14 +14489,54 @@ def main() -> None:
                 label_visibility="collapsed",
             )
 
+        st.markdown("---")
+        st.caption("Runs Explorer settings")
+        layout_bar = st.columns([2, 3], gap="large")
+        with layout_bar[1]:
+            st.caption("Layout")
+
+            def _request_save_layout_runs() -> None:
+                st.session_state["runs_explorer_save_layout_requested"] = True
+                try:
+                    st.toast("Saving layout…")
+                except Exception:
+                    pass
+
+            st.button("Save layout", key="runs_explorer_save_layout", on_click=_request_save_layout_runs)
+
+            if st.button("Reset layout", key="runs_explorer_reset_layout"):
+                try:
+                    with open_db_connection() as conn:
+                        set_user_setting(conn, user_id, "ui.runs_explorer.columns_state", None)
+                except Exception:
+                    pass
+                for k in (
+                    "runs_explorer_columns_state",
+                    "runs_explorer_columns_state_runtime",
+                    "runs_explorer_columns_state_last_persisted",
+                    "runs_explorer_columns_state_loaded",
+                ):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+            if str(os.environ.get("DRAGON_DEBUG") or "").strip() == "1":
+                resp_dbg = st.session_state.get("grid_resp_runs_explorer") or {}
+                has_state = bool(
+                    resp_dbg.get("columnState")
+                    or resp_dbg.get("columnsState")
+                    or resp_dbg.get("column_state")
+                    or resp_dbg.get("columns_state")
+                )
+                saved_count = len(saved_state) if isinstance(saved_state, list) else 0
+                st.caption(
+                    f"Debug: key=grid_runs_explorer • columnState={has_state} • saved={saved_count} • fit_columns_on_grid_load={fit_columns}"
+                )
+
         # Persist column sizing/order only on explicit save (prevents resize loops).
         if st.session_state.get("runs_explorer_save_layout_requested"):
             try:
-                new_state = None
-                if hasattr(grid, "columns_state"):
-                    new_state = getattr(grid, "columns_state")
-                if not new_state and hasattr(grid, "get"):
-                    new_state = grid.get("columns_state")
+                resp = st.session_state.get("grid_resp_runs_explorer")
+                new_state = _extract_aggrid_columns_state(resp)
                 if isinstance(new_state, list) and new_state:
                     # Never persist internal plumbing columns.
                     sanitized_state: list[dict] = []
@@ -13749,6 +14547,7 @@ def main() -> None:
                         if str(col_id) == "action_click":
                             continue
                         d = dict(item)
+                        d.pop("headerName", None)
                         if str(col_id) == "actions":
                             d["pinned"] = "right"
                             d.pop("flex", None)
@@ -13757,12 +14556,19 @@ def main() -> None:
                             except Exception:
                                 d["width"] = 150
                             d["minWidth"] = max(130, int(d.get("minWidth") or 0))
+                        if "width" not in d:
+                            try:
+                                d["width"] = int(d.get("actualWidth") or 0) or d.get("width")
+                            except Exception:
+                                pass
                         sanitized_state.append(d)
                     with open_db_connection() as conn:
                         set_user_setting(conn, user_id, "ui.runs_explorer.columns_state", sanitized_state)
                     st.session_state["runs_explorer_columns_state"] = sanitized_state
                     st.session_state["runs_explorer_columns_state_last_persisted"] = sanitized_state
                     st.success("Layout saved.")
+                else:
+                    st.warning("No column state returned; ensure update_mode includes column events.")
             except Exception as exc:
                 st.error(f"Failed to save layout: {exc}")
             finally:
@@ -13833,25 +14639,25 @@ def main() -> None:
         baseline = st.session_state.get("runs_explorer_shortlist_baseline")
         if not isinstance(baseline, dict):
             baseline = {}
-            if not df.empty and "run_id" in df.columns and "shortlisted" in df.columns:
+            if not df.empty and "run_id" in df.columns and "shortlist" in df.columns:
                 for _, r in df.iterrows():
                     rid = str(r.get("run_id") or r.get("id") or r.get("runId") or "").strip()
                     if not rid:
                         continue
                     baseline[rid] = {
-                        "shortlisted": bool(r.get("shortlisted")),
+                        "shortlist": bool(r.get("shortlist")),
                         "note": str(r.get("shortlist_note") or "").strip(),
                     }
             st.session_state["runs_explorer_shortlist_baseline"] = baseline
 
         current_map: Dict[str, Dict[str, Any]] = {}
-        if not grid_df.empty and "run_id" in grid_df.columns and "shortlisted" in grid_df.columns:
+        if not grid_df.empty and "run_id" in grid_df.columns and "shortlist" in grid_df.columns:
             for _, r in grid_df.iterrows():
                 rid = str(r.get("run_id") or "").strip()
                 if not rid:
                     continue
                 current_map[rid] = {
-                    "shortlisted": bool(r.get("shortlisted")),
+                    "shortlist": bool(r.get("shortlist")),
                     "note": str(r.get("shortlist_note") or ""),
                 }
 
@@ -13861,18 +14667,22 @@ def main() -> None:
             old = baseline.get(rid)
             if old is None:
                 continue
-            if bool(old.get("shortlisted")) != bool(cur.get("shortlisted")) or str(old.get("note") or "") != str(cur.get("note") or ""):
-                changed_flags[rid] = bool(cur.get("shortlisted"))
+            if bool(old.get("shortlist")) != bool(cur.get("shortlist")) or str(old.get("note") or "") != str(cur.get("note") or ""):
+                changed_flags[rid] = bool(cur.get("shortlist"))
                 changed_notes[rid] = str(cur.get("note") or "")
 
         if changed_flags:
             try:
-                set_user_run_shortlists(user_id, changed_flags, run_id_to_note=changed_notes)
-                # Update baseline only for the rows we persisted
-                for rid in changed_flags.keys():
+                for rid, flag in changed_flags.items():
+                    update_run_shortlist_fields(
+                        rid,
+                        shortlist=bool(flag),
+                        shortlist_note=str(changed_notes.get(rid) or ""),
+                        user_id=user_id,
+                    )
                     baseline[rid] = {
-                        "shortlisted": bool(current_map.get(rid, {}).get("shortlisted")),
-                        "note": str(current_map.get(rid, {}).get("note") or ""),
+                        "shortlist": bool(flag),
+                        "note": str(changed_notes.get(rid) or ""),
                     }
                 st.session_state["runs_explorer_shortlist_baseline"] = baseline
             except Exception as exc:
@@ -14089,7 +14899,6 @@ def main() -> None:
             "profit_factor",
             "cpc_index",
             "common_sense_ratio",
-            "avg_position_time_s",
             "sweep_id",
             "sweep_name",
             "sweep_exchange_id",
@@ -14099,7 +14908,7 @@ def main() -> None:
             "base_asset",
             "quote_asset",
             "icon_uri",
-            "shortlisted",
+            "shortlist",
             "shortlist_note",
         ]
 
@@ -14150,21 +14959,23 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-        # Load per-user persisted grid preferences once per session.
-        if not st.session_state.get("runs_explorer_prefs_loaded", False):
+        # Load per-user persisted Results grid preferences once per session.
+        if not st.session_state.get("results_prefs_loaded", False):
             try:
                 with open_db_connection() as conn:
-                    saved_visible = get_user_setting(conn, user_id, "ui.runs_explorer.visible_cols", default=None)
-                    saved_col_state = get_user_setting(conn, user_id, "ui.runs_explorer.columns_state", default=None)
+                    saved_visible = get_user_setting(conn, user_id, "ui.results.visible_cols", default=None)
+                    saved_col_state = get_user_setting(conn, user_id, "ui.results.columns_state", default=None)
                 if isinstance(saved_visible, list) and saved_visible:
-                    st.session_state["runs_explorer_visible_cols"] = saved_visible
-                    st.session_state["runs_explorer_visible_cols_last_persisted"] = list(saved_visible)
+                    st.session_state["results_visible_cols"] = saved_visible
+                    st.session_state["results_visible_cols_last_persisted"] = list(saved_visible)
                 if isinstance(saved_col_state, list) and saved_col_state:
-                    st.session_state["runs_explorer_columns_state"] = saved_col_state
-                    st.session_state["runs_explorer_columns_state_last_persisted"] = saved_col_state
+                    st.session_state["results_columns_state"] = saved_col_state
+                    st.session_state["results_columns_state_last_persisted"] = saved_col_state
+                    # Apply saved column state only once; after that, let the grid keep its own client-side state.
+                    st.session_state["results_apply_saved_columns_state"] = True
             except Exception:
                 pass
-            st.session_state["runs_explorer_prefs_loaded"] = True
+            st.session_state["results_prefs_loaded"] = True
 
         use_enterprise = bool(os.environ.get("AGGRID_ENTERPRISE"))
 
@@ -14175,6 +14986,8 @@ def main() -> None:
 
         with _perf("results.build_df"):
             df = pd.DataFrame(rows)
+
+        _results_log = logging.getLogger(__name__)
 
         # Derive Start/End/Duration columns from stored run fields if present.
         try:
@@ -14203,7 +15016,13 @@ def main() -> None:
 
                 df["duration"] = dur.map(_fmt_td)
         except Exception:
-            pass
+            _results_log.warning("Results prep: failed to derive start/end/duration", exc_info=True)
+            if "start_date" not in df.columns:
+                df["start_date"] = ""
+            if "end_date" not in df.columns:
+                df["end_date"] = ""
+            if "duration" not in df.columns:
+                df["duration"] = ""
 
         # Derive Start/End/Duration columns from stored run fields if present.
         try:
@@ -14240,15 +15059,22 @@ def main() -> None:
                 else:
                     df["direction"] = ""
             except Exception:
+                _results_log.warning("Results prep: failed to infer direction", exc_info=True)
                 df["direction"] = ""
+
+        if "avg_position_time" not in df.columns:
+            df["avg_position_time"] = "—"
+
+        if "avg_position_time" not in df.columns:
+            df["avg_position_time"] = "—"
 
         # Drop large JSON payloads early. Even if the columns are hidden in the grid,
         # AgGrid still receives the full dataset which can cause very slow browser-side
         # rendering for large run lists.
         df = df.drop(columns=["config_json", "sweep_assets_json"], errors="ignore")
 
-        if "shortlisted" in df.columns:
-            df["shortlisted"] = df["shortlisted"].astype(bool)
+        if "shortlist" in df.columns:
+            df["shortlist"] = df["shortlist"].astype(bool)
         # Keep icon_uri so the Results grid can show asset icons.
         if "icon_uri" not in df.columns:
             df["icon_uri"] = ""
@@ -14266,9 +15092,26 @@ def main() -> None:
             try:
                 df["symbol_full"] = df["symbol"].fillna("").astype(str)
             except Exception:
-                df["symbol_full"] = df["symbol"].astype(str)
+                _results_log.warning("Results prep: failed to normalize symbol_full", exc_info=True)
+                try:
+                    df["symbol_full"] = df["symbol"].astype(str)
+                except Exception:
+                    df["symbol_full"] = ""
         else:
             df["symbol_full"] = ""
+
+        if "asset_display" not in df.columns:
+            try:
+                df["asset_display"] = df["symbol"].fillna("").astype(str)
+            except Exception:
+                _results_log.warning("Results prep: failed to build asset_display", exc_info=True)
+                df["asset_display"] = df.get("symbol", "")
+
+        if "asset_display" not in df.columns:
+            try:
+                df["asset_display"] = df["symbol"].fillna("").astype(str)
+            except Exception:
+                df["asset_display"] = df.get("symbol", "")
 
         # Category should reflect the sweep's category (not global membership):
         # only populate for multi-asset category sweeps.
@@ -14317,35 +15160,13 @@ def main() -> None:
                                 "sweep_category_id",
                             ].map(lambda x: id_to_name.get(int(x), "") if x is not None else "")
         except Exception:
-            pass
+            _results_log.warning("Results prep: failed to map categories", exc_info=True)
 
         # Remove internal/raw columns from the Results page.
         # Keep them long enough to derive `category`, then drop.
         df = df.drop(columns=["metadata_json", "sweep_exchange_id", "sweep_category_id"], errors="ignore")
 
-        sym_from_asset = df.get("asset") if "asset" in df.columns else None
-        if sym_from_asset is not None:
-            df["symbol"] = sym_from_asset.fillna("").astype(str).str.upper().replace({"NAN": ""})
-        else:
-            df["symbol"] = ""
-
         st.caption(f"{total_rows} rows matched")
-
-        try:
-            need_parse = df["symbol"].fillna("").astype(str).str.strip().eq("")
-            if need_parse.any():
-                parsed = (
-                    df.loc[need_parse, "symbol_full"]
-                    .fillna("")
-                    .astype(str)
-                    .str.upper()
-                    .str.replace("/", "-", regex=False)
-                    .str.split("-", n=1)
-                    .str[0]
-                )
-                df.loc[need_parse, "symbol"] = parsed
-        except Exception:
-            pass
 
         if "market_type" in df.columns and "market" not in df.columns:
             df["market"] = df["market_type"]
@@ -14376,6 +15197,7 @@ def main() -> None:
             "start_date",
             "end_date",
             "duration",
+            "avg_position_time",
             "symbol",
             "timeframe",
             "direction",
@@ -14403,6 +15225,7 @@ def main() -> None:
             "symbol",
             "symbol_full",
             "icon_uri",
+            "asset_display",
             "timeframe",
             "direction",
             "strategy",
@@ -14419,8 +15242,8 @@ def main() -> None:
             "profit_factor",
             "cpc_index",
             "common_sense_ratio",
-            "avg_position_time_s",
-            "shortlisted",
+            "avg_position_time",
+            "shortlist",
             "shortlist_note",
         ]
         df = df[[c for c in grid_allowlist if c in df.columns]]
@@ -14435,8 +15258,8 @@ def main() -> None:
         candidate_cols = df.columns.tolist()
 
         # Keep internal/helper columns in the payload, but hide them by default.
-        _default_hidden_cols = {"run_id", "icon_uri", "symbol_full", "market"}
-        default_visible = st.session_state.get("runs_explorer_visible_cols")
+        _default_hidden_cols = {"run_id", "icon_uri", "symbol_full", "market", "asset_display"}
+        default_visible = st.session_state.get("results_visible_cols")
         if not isinstance(default_visible, list) or not default_visible:
             default_visible = [c for c in candidate_cols if c not in _default_hidden_cols]
         try:
@@ -14452,71 +15275,71 @@ def main() -> None:
         # on the same rerun (the popover UI is rendered later on the page).
         try:
             picker_cols = list(candidate_cols)
-            any_picker_key = any(f"runs_explorer_col_{c}" in st.session_state for c in picker_cols)
+            any_picker_key = any(f"results_col_{c}" in st.session_state for c in picker_cols)
             if any_picker_key:
                 chosen_from_picker = [
-                    c for c in picker_cols if bool(st.session_state.get(f"runs_explorer_col_{c}", False))
+                    c for c in picker_cols if bool(st.session_state.get(f"results_col_{c}", False))
                 ]
                 for c in always_visible_cols:
                     if c not in chosen_from_picker:
                         chosen_from_picker.append(c)
-                st.session_state["runs_explorer_visible_cols"] = list(chosen_from_picker)
+                st.session_state["results_visible_cols"] = list(chosen_from_picker)
         except Exception:
             pass
 
-        header_map = {
-            "run_id": "Run ID",
-            "created_at": "Run Date",
-            "start_date": "Start",
-            "end_date": "End",
-            "duration": "Duration",
-            "symbol": "Asset",
-            "symbol_full": "Symbol (raw)",
-            "market": "Market",
-            "icon_uri": "Icon URI",
-            "timeframe": "Timeframe",
-            "direction": "Direction",
-            "strategy": "Strategy",
-            "sweep_name": "Sweep",
-            "net_return_pct": "Net Return",
-            "roi_pct_on_margin": "ROI",
-            "max_drawdown_pct": "Max Drawdown",
-            "win_rate": "Win Rate",
-            "net_profit": "Net Profit",
-            "sharpe": "Sharpe",
-            "sortino": "Sortino",
-            "profit_factor": "Profit Factor",
-            "cpc_index": "CPC Index",
-            "common_sense_ratio": "Common Sense Ratio",
-            "avg_position_time_s": "Avg Position Time",
-            "shortlisted": "Shortlist",
-            "shortlist_note": "Shortlist Note",
-        }
-
-        avg_pos_time_formatter = JsCode(
+        ddmm_yy_formatter = JsCode(
             """
             function(params) {
-              if (params.value === null || params.value === undefined || params.value === '') { return ''; }
-              const v = Number(params.value);
-              if (!isFinite(v) || v < 0) { return ''; }
-              const secs = Math.floor(v);
-              const days = Math.floor(secs / 86400);
-              const hours = Math.floor((secs % 86400) / 3600);
-              const mins = Math.floor((secs % 3600) / 60);
-              if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-              if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
-              if (mins > 0) return `${mins}m`;
-              return '<1m';
+                try {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    if (!v) return '';
+                    let d = v;
+                    if (typeof v === 'string' || v instanceof String) {
+                        d = new Date(v);
+                    } else if (!(v instanceof Date)) {
+                        d = new Date(v);
+                    }
+                    if (isNaN(d)) return v;
+                    const dd = String(d.getDate()).padStart(2, '0');
+                    const mm = String(d.getMonth() + 1).padStart(2, '0');
+                    const yy = String(d.getFullYear()).slice(-2);
+                    return `${dd}/${mm}/${yy}`;
+                } catch (e) {
+                    const v = params && params.value !== undefined && params.value !== null ? params.value : '';
+                    return v;
+                }
+            }
+            """
+        )
+        date_comparator = JsCode(
+            """
+            function(a, b) {
+                try {
+                    const at = new Date(a).getTime();
+                    const bt = new Date(b).getTime();
+                    if (!isFinite(at) && !isFinite(bt)) return 0;
+                    if (!isFinite(at)) return -1;
+                    if (!isFinite(bt)) return 1;
+                    return at - bt;
+                } catch (e) {
+                    return 0;
+                }
             }
             """
         )
 
         # Determine visible columns from session state; UI control is rendered at bottom.
-        raw_visible = st.session_state.get("runs_explorer_visible_cols")
+        raw_visible = st.session_state.get("results_visible_cols")
+        try:
+            if isinstance(raw_visible, list) and "avg_position_time_s" in raw_visible:
+                raw_visible = ["avg_position_time" if c == "avg_position_time_s" else c for c in raw_visible]
+                st.session_state["results_visible_cols"] = list(raw_visible)
+        except Exception:
+            pass
         if isinstance(raw_visible, list) and raw_visible:
             sanitized_visible = [c for c in raw_visible if c in candidate_cols]
             if sanitized_visible != raw_visible:
-                st.session_state["runs_explorer_visible_cols"] = sanitized_visible
+                st.session_state["results_visible_cols"] = sanitized_visible
             chosen_visible = sanitized_visible
         else:
             chosen_visible = [c for c in default_visible if c in candidate_cols]
@@ -14531,98 +15354,14 @@ def main() -> None:
             chosen_visible.append("max_drawdown_pct")
         visible_cols = chosen_visible
 
-        # JS renderers/styles (must be defined in this page scope)
-        asset_market_getter = JsCode(
-            """
-            function(params) {
-                try {
-                    const data = (params && params.data) ? params.data : {};
-                    const rawSym = (data.symbol !== undefined && data.symbol !== null) ? data.symbol.toString() : '';
-                    const rawMarket = (data.market !== undefined && data.market !== null) ? data.market.toString() : '';
-
-                    function inferBaseAsset(sym) {
-                        const s = (sym || '').toString().trim();
-                        if (!s) return '';
-                        if (s.indexOf('/') >= 0) return s.split('/', 1)[0].trim().toUpperCase();
-                        const up = s.toUpperCase();
-                        if (up.indexOf('PERP_') === 0 || up.indexOf('SPOT_') === 0) {
-                            const parts = up.split('_').filter(Boolean);
-                            return (parts.length >= 2) ? parts[1].trim() : up;
-                        }
-                        if (s.indexOf('-') >= 0) return s.split('-', 1)[0].trim().toUpperCase();
-                        return up;
-                    }
-
-                    const base = (data.base_asset !== undefined && data.base_asset !== null && data.base_asset.toString().trim())
-                        ? data.base_asset.toString().trim().toUpperCase()
-                        : ((data.asset !== undefined && data.asset !== null && data.asset.toString().trim())
-                            ? data.asset.toString().trim().toUpperCase()
-                            : inferBaseAsset(rawSym));
-                    const mkt = (rawMarket || '').toString().trim().toUpperCase();
-                    return (base && mkt) ? `${base} - ${mkt}` : base;
-                } catch (e) {
-                    const v = (params && params.value !== undefined && params.value !== null) ? params.value.toString() : '';
-                    return v;
-                }
-            }
-            """
+        # JS renderers/styles (shared helpers)
+        asset_market_getter = asset_market_getter_js(
+            symbol_field="symbol",
+            market_field="market",
+            base_asset_field="asset_display",
+            asset_field="asset_display",
         )
-
-        asset_renderer = JsCode(
-            """
-            class AssetRenderer {
-                init(params) {
-                    // NOTE: Sorting/filtering uses valueGetter (symbol + market),
-                    // so params.value is already the combined label.
-                    const label = (params && params.value !== undefined && params.value !== null)
-                        ? params.value.toString()
-                        : '';
-
-                    const iconUri = (params && params.data && params.data.icon_uri !== undefined && params.data.icon_uri !== null)
-                        ? params.data.icon_uri.toString()
-                        : '';
-
-                    const wrap = document.createElement('div');
-                    wrap.style.display = 'flex';
-                    wrap.style.alignItems = 'center';
-                    wrap.style.gap = '8px';
-                    wrap.style.width = '100%';
-
-                    if (iconUri) {
-                        const img = document.createElement('img');
-                        img.src = iconUri;
-                        img.alt = '';
-                        img.width = 18;
-                        img.height = 18;
-                        img.style.width = '18px';
-                        img.style.height = '18px';
-                        img.style.borderRadius = '4px';
-                        img.style.flex = '0 0 auto';
-                        wrap.appendChild(img);
-                    } else {
-                        const spacer = document.createElement('div');
-                        spacer.style.width = '18px';
-                        spacer.style.height = '18px';
-                        wrap.appendChild(spacer);
-                    }
-
-                    const text = document.createElement('span');
-                    text.innerText = label;
-                    text.style.fontWeight = '500';
-                    text.style.color = '#FFFFFF';
-                    wrap.appendChild(text);
-
-                    this.eGui = wrap;
-                }
-                getGui() {
-                    return this.eGui;
-                }
-                refresh(params) {
-                    return false;
-                }
-            }
-            """
-        )
+        asset_renderer = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
         roi_pct_formatter = JsCode(
             """
@@ -14853,12 +15592,12 @@ def main() -> None:
             function(params) {
                 const v = (params.value || '').toString().toLowerCase();
                 if (v.includes('long')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center' };
+                    return { color: '#FFFFFF', backgroundColor: 'rgba(46,160,67,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
                 }
                 if (v.includes('short')) {
-                    return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center' };
+                    return { color: '#FFFFFF', backgroundColor: 'rgba(248,81,73,0.12)', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
                 }
-                return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center' };
+                return { color: '#FFFFFF', fontWeight: '500', textAlign: 'center', borderRadius: '999px' };
             }
             """
         )
@@ -15007,105 +15746,16 @@ def main() -> None:
             """
         )
 
-        # Quartz-like dark theme CSS (same as Results)
-        custom_css = {
-            ".ag-root-wrapper": {
-                "--ag-font-family": "Roboto,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif",
-                "--ag-font-size": "13px",
-                "--ag-header-font-size": "14px",
-                "--ag-row-height": "36px",
-                "--ag-header-height": "40px",
-                "--ag-background-color": "#1D2737",
-                "--ag-odd-row-background-color": "#223046",
-                "--ag-header-background-color": "#2A4569",
-                "--ag-header-foreground-color": "#FFFFFF",
-                "--ag-foreground-color": "#FFFFFF",
-                "--ag-secondary-foreground-color": "#CBD5E1",
-                "--ag-border-color": "#3B516F",
-                "--ag-row-border-color": "#2D3F5B",
-                "--ag-cell-horizontal-padding": "10px",
-                "--ag-border-radius": "6px",
-                "--ag-row-hover-color": "rgba(59, 130, 246, 0.12)",
-                "--ag-selected-row-background-color": "rgba(59, 130, 246, 0.18)",
-                "--ag-control-panel-background-color": "#1D2737",
-                "--ag-menu-background-color": "#1D2737",
-                "--ag-popup-background-color": "#1D2737",
-                "--ag-popup-shadow": "0 8px 24px rgba(0,0,0,0.35)",
-                "--ag-input-background-color": "#223046",
-                "--ag-input-border-color": "#3B516F",
-                "--ag-input-focus-border-color": "#60a5fa",
-                "border": "1px solid #3B516F",
-                "border-radius": "6px",
-                "background-color": "#1D2737",
-                "color": "#FFFFFF",
-                "font-family": "Roboto,-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif",
-            },
-            ".ag-root-wrapper-body": {"background-color": "#1D2737"},
-            ".ag-header": {
-                "border-bottom": "1px solid rgba(255,255,255,0.10)",
-                "background-color": "#2A4569",
-            },
-            ".ag-header-cell-label": {
-                "font-weight": "500",
-                "letter-spacing": "0.00em",
-                "color": "#FFFFFF",
-                "white-space": "normal",
-                "line-height": "1.1",
-            },
-            ".ag-header-cell-text": {"color": "#FFFFFF", "white-space": "normal"},
-            ".ag-header-cell": {"align-items": "center"},
-            ".ag-row:nth-child(even) .ag-cell": {"background-color": "#1F2B3F"},
-            ".ag-cell": {
-                "padding-left": "10px",
-                "padding-right": "10px",
-                "font-variant-numeric": "tabular-nums",
-                "color": "#FFFFFF",
-            },
-            # Actions column: tighter padding so icon buttons fit without a huge column.
-            ".ag-cell[col-id='actions']": {"padding-left": "2px", "padding-right": "2px"},
-            ".ag-cell-wrapper": {"align-items": "center", "height": "100%"},
-            ".ag-cell-value": {"display": "flex", "align-items": "center", "height": "100%"},
-            ".ag-row": {"background-color": "#223046"},
-            ".ag-body-viewport": {"color-scheme": "dark"},
-            ".ag-popup": {"color-scheme": "dark"},
-            ".ag-popup-child": {
-                "background-color": "#1D2737",
-                "border": "1px solid #3B516F",
-                "box-shadow": "0 8px 24px rgba(0,0,0,0.35)",
-                "color": "#FFFFFF",
-            },
-            ".ag-menu": {
-                "background-color": "#1D2737",
-                "color": "#FFFFFF",
-                "border": "1px solid #3B516F",
-                "color-scheme": "dark",
-            },
-            ".ag-menu-option": {"color": "#FFFFFF"},
-            ".ag-menu-option:hover": {"background-color": "rgba(59, 130, 246, 0.16)"},
-            ".ag-filter": {"background-color": "#1D2737", "color": "#FFFFFF"},
-            ".ag-filter-body": {"background-color": "#1D2737"},
-            ".ag-filter-apply-panel": {"background-color": "#1D2737"},
-            ".ag-input-field-input": {
-                "background-color": "#223046",
-                "border": "1px solid #3B516F",
-                "color": "#FFFFFF",
-            },
-            ".ag-input-field-input:focus": {"border-color": "#60a5fa"},
-            ".ag-picker-field-wrapper": {"background-color": "#223046", "border": "1px solid #3B516F"},
-            ".ag-select": {"background-color": "#223046", "color": "#FFFFFF"},
-            ".ag-right-aligned-cell": {"font-variant-numeric": "tabular-nums"},
-            ".ag-center-aligned-cell": {"justify-content": "center"},
-        }
+        # Shared AG Grid dark theme CSS
+        custom_css = _aggrid_dark_custom_css()
 
         # Presentation-only: render date columns as local strings before sending to AGGrid.
         # This avoids JS Date parsing and keeps sorting stable.
+        # Keep Start/End columns as datetime/ISO so sorting/filtering remains correct.
         try:
             tz = _ui_display_tz()
             if "created_at" in df.columns:
                 df["created_at"] = [_ui_local_dt_ampm(v, tz) for v in df["created_at"].tolist()]
-            for _c in ("start_date", "end_date"):
-                if _c in df.columns:
-                    df[_c] = [_ui_local_date_iso(v, tz) for v in df[_c].tolist()]
         except Exception:
             pass
 
@@ -15118,10 +15768,151 @@ def main() -> None:
 
         sym_filter = "agSetColumnFilter" if use_enterprise else True
 
+        saved_state = st.session_state.get("results_columns_state")
+        _results_widths: dict[str, int] = {}
+        try:
+            # Always seed widths from persisted state (Sweeps-style).
+            if isinstance(saved_state, list) and saved_state:
+                for item in saved_state:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        _results_widths[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        def _res_w(col: str, default: int) -> int:
+            try:
+                return max(60, int(_results_widths.get(str(col), default)))
+            except Exception:
+                return default
+
+        shared_col_defs: list[dict[str, Any]] = []
+        if "start_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "start_date",
+                    col_label("start_date"),
+                    width=_res_w("start_date", 110),
+                    filter=True,
+                    comparator=date_comparator,
+                    hide=("start_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "end_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "end_date",
+                    col_label("end_date"),
+                    width=_res_w("end_date", 110),
+                    filter=True,
+                    comparator=date_comparator,
+                    hide=("end_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "start_time" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "start_time",
+                    col_label("start_time"),
+                    width=_res_w("start_time", 130),
+                    filter=True,
+                    comparator=date_comparator,
+                    hide=("start_time" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "end_time" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "end_time",
+                    col_label("end_time"),
+                    width=_res_w("end_time", 130),
+                    filter=True,
+                    comparator=date_comparator,
+                    hide=("end_time" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "timeframe" in df.columns:
+            shared_col_defs.append(
+                col_timeframe_pill(
+                    field="timeframe",
+                    header=col_label("timeframe"),
+                    width=_res_w("timeframe", 90),
+                    filter=sym_filter,
+                    hide=("timeframe" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "direction" in df.columns:
+            shared_col_defs.append(
+                col_direction_pill(
+                    field="direction",
+                    header=col_label("direction"),
+                    width=_res_w("direction", 100),
+                    filter=sym_filter,
+                    hide=("direction" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "avg_position_time" in df.columns:
+            shared_col_defs.append(
+                col_avg_position_time(
+                    field="avg_position_time",
+                    header=col_label("avg_position_time"),
+                    width=_res_w("avg_position_time", 150),
+                    hide=("avg_position_time" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "shortlist" in df.columns:
+            shared_col_defs.append(
+                col_shortlist(
+                    field="shortlist",
+                    header=col_label("shortlist"),
+                    editable=True,
+                    width=_res_w("shortlist", 105),
+                    hide=("shortlist" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "shortlist_note" in df.columns:
+            shared_col_defs.append(
+                col_shortlist_note(
+                    field="shortlist_note",
+                    header=col_label("shortlist_note"),
+                    editable=True,
+                    width=_res_w("shortlist_note", 200),
+                    hide=("shortlist_note" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        apply_columns(gb, shared_col_defs, saved_widths=_results_widths)
+
         gb.configure_column(
             "symbol",
-            headerName=header_map.get("symbol", "Asset"),
-            width=220,
+            headerName=col_label("symbol"),
+            width=_res_w("symbol", 220),
             filter=sym_filter,
             hide=("symbol" not in visible_cols),
             wrapHeaderText=True,
@@ -15134,69 +15925,20 @@ def main() -> None:
         if "created_at" in df.columns:
             gb.configure_column(
                 "created_at",
-                headerName=header_map.get("created_at", "Run Date"),
-                width=120,
+                headerName=col_label("created_at"),
+                width=_res_w("created_at", 120),
                 hide=("created_at" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
 
-        # These are often present but were previously not explicitly configured (and thus
-        # didn't obey the Visible columns picker).
-        if "start_date" in df.columns:
-            gb.configure_column(
-                "start_date",
-                headerName=header_map.get("start_date", "Start"),
-                width=110,
-                filter=True,
-                hide=("start_date" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
-        if "end_date" in df.columns:
-            gb.configure_column(
-                "end_date",
-                headerName=header_map.get("end_date", "End"),
-                width=110,
-                filter=True,
-                hide=("end_date" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
         if "duration" in df.columns:
             gb.configure_column(
                 "duration",
-                headerName=header_map.get("duration", "Duration"),
-                width=110,
+                headerName=col_label("duration"),
+                width=_res_w("duration", 110),
                 filter=False,
                 hide=("duration" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
-        if "timeframe" in df.columns:
-            gb.configure_column(
-                "timeframe",
-                headerName=header_map.get("timeframe", "Timeframe"),
-                width=90,
-                filter=sym_filter,
-                cellStyle=aggrid_pill_style("timeframe") or timeframe_style,
-                hide=("timeframe" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
-        if "direction" in df.columns:
-            gb.configure_column(
-                "direction",
-                headerName=header_map.get("direction", "Direction"),
-                width=100,
-                filter=sym_filter,
-                cellStyle=direction_style,
-                cellRenderer=direction_renderer,
-                hide=("direction" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
                 cellClass="ag-center-aligned-cell",
@@ -15204,8 +15946,8 @@ def main() -> None:
         if "strategy" in df.columns:
             gb.configure_column(
                 "strategy",
-                headerName=header_map.get("strategy", "Strategy"),
-                width=160,
+                headerName=col_label("strategy"),
+                width=_res_w("strategy", 160),
                 filter=sym_filter,
                 hide=("strategy" not in visible_cols),
                 wrapHeaderText=True,
@@ -15214,8 +15956,8 @@ def main() -> None:
         if "sweep_name" in df.columns:
             gb.configure_column(
                 "sweep_name",
-                headerName=header_map.get("sweep_name", "Sweep"),
-                width=180,
+                headerName=col_label("sweep_name"),
+                width=_res_w("sweep_name", 180),
                 filter=True,
                 hide=("sweep_name" not in visible_cols),
                 wrapHeaderText=True,
@@ -15227,9 +15969,9 @@ def main() -> None:
             if col in df.columns:
                 gb.configure_column(
                     col,
-                    headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                    headerName=col_label(col),
                     valueFormatter=pct_formatter,
-                    width=130 if col == "max_drawdown_pct" else 120,
+                    width=_res_w(col, 130 if col == "max_drawdown_pct" else 120),
                     cellStyle=dd_style if col == "max_drawdown_pct" else metrics_gradient_style,
                     type=["numericColumn"],
                     cellClass="ag-center-aligned-cell",
@@ -15241,9 +15983,9 @@ def main() -> None:
         if "roi_pct_on_margin" in df.columns:
             gb.configure_column(
                 "roi_pct_on_margin",
-                headerName=header_map.get("roi_pct_on_margin", "ROI"),
+                headerName=col_label("roi_pct_on_margin"),
                 valueFormatter=roi_pct_formatter,
-                width=140,
+                width=_res_w("roi_pct_on_margin", 140),
                 cellStyle=metrics_gradient_style,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -15255,9 +15997,9 @@ def main() -> None:
             if col in df.columns:
                 gb.configure_column(
                     col,
-                    headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                    headerName=col_label(col),
                     valueFormatter=num2_formatter,
-                    width=120,
+                    width=_res_w(col, 120),
                     cellStyle=metrics_gradient_style,
                     type=["numericColumn"],
                     cellClass="ag-center-aligned-cell",
@@ -15266,42 +16008,6 @@ def main() -> None:
                     autoHeaderHeight=True,
                 )
 
-        if "avg_position_time_s" in df.columns:
-            gb.configure_column(
-                "avg_position_time_s",
-                headerName=header_map.get("avg_position_time_s", "Avg Position Time"),
-                valueFormatter=avg_pos_time_formatter,
-                width=150,
-                type=["numericColumn"],
-                cellClass="ag-center-aligned-cell",
-                hide=("avg_position_time_s" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
-
-        # Shortlist editable columns
-        if "shortlisted" in df.columns:
-            gb.configure_column(
-                "shortlisted",
-                headerName=header_map.get("shortlisted", "Shortlist"),
-                editable=True,
-                cellRenderer="agCheckboxCellRenderer",
-                width=105,
-                filter=False,
-                hide=("shortlisted" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
-        if "shortlist_note" in df.columns:
-            gb.configure_column(
-                "shortlist_note",
-                headerName=header_map.get("shortlist_note", "Shortlist Note"),
-                editable=True,
-                width=200,
-                hide=("shortlist_note" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
 
         # Ensure the Cols picker controls visibility for *all* candidate columns.
         # GridOptionsBuilder.from_dataframe() creates default column defs for every df column;
@@ -15311,6 +16017,8 @@ def main() -> None:
             "created_at",
             "start_date",
             "end_date",
+            "start_time",
+            "end_time",
             "duration",
             "timeframe",
             "direction",
@@ -15326,8 +16034,8 @@ def main() -> None:
             "profit_factor",
             "cpc_index",
             "common_sense_ratio",
-            "avg_position_time_s",
-            "shortlisted",
+            "avg_position_time",
+            "shortlist",
             "shortlist_note",
         }
         try:
@@ -15338,8 +16046,9 @@ def main() -> None:
                     continue
                 gb.configure_column(
                     col,
-                    headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                    headerName=col_label(col),
                     hide=(col not in visible_cols),
+                    width=_res_w(col, 120),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                 )
@@ -15347,30 +16056,79 @@ def main() -> None:
             pass
 
         # Hide truly-internal columns (not part of payload allowlist, but keep defensive).
-        for hidden in ("start_time", "end_time"):
+        for hidden in ("start_time", "end_time", "avg_position_time_seconds"):
             if hidden in df.columns:
                 gb.configure_column(hidden, hide=True)
 
+        # Apply saved widths after dynamic columns are configured.
+        if isinstance(saved_state, list) and saved_state:
+            try:
+                width_map: dict[str, int] = {}
+                for item in saved_state:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        width_map[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+                for col in df.columns.tolist():
+                    if col in width_map:
+                        gb.configure_column(col, width=width_map[col])
+            except Exception:
+                pass
+
         grid_options = gb.build()
 
-        # Restore persisted column sizing/order (sanitized)
-        saved_state = st.session_state.get("runs_explorer_columns_state")
+        # Force friendly headers even if the client regenerates columnDefs.
+        # This also prevents any stored grid state from "bringing back" raw db field names.
+        try:
+            header_value_map = {str(c): col_label(c) for c in df.columns.tolist()}
+            if "actions" in df.columns:
+                header_value_map["actions"] = col_label("actions")
+            grid_options.setdefault("defaultColDef", {})
+            grid_options["defaultColDef"]["headerValueGetter"] = JsCode(
+                f"""
+                function(params) {{
+                    try {{
+                        const m = {json.dumps(header_value_map)};
+                        const cd = (params && params.colDef) ? params.colDef : {{}};
+                        const key = (cd.field || cd.colId || '');
+                        if (key && m[key]) return m[key];
+                        if (cd.headerName) return cd.headerName;
+                        return key || '';
+                    }} catch (e) {{
+                        return '';
+                    }}
+                }}
+                """
+            )
+        except Exception:
+            pass
+
+        # Restore persisted column sizing/order (sanitized) on every render (Sweeps-style).
         columns_state = None
         if isinstance(saved_state, list) and saved_state:
             try:
                 sanitized: list[dict] = []
+                valid_ids = {str(c) for c in df.columns.tolist()}
                 for item in saved_state:
                     if not isinstance(item, dict):
                         continue
                     d = dict(item)
                     d.pop("hide", None)
+                    d.pop("headerName", None)
                     col_id = d.get("colId") or d.get("col_id") or d.get("field")
                     if str(col_id) in {"action_click", "actions"}:
                         continue
+                    if col_id is None or str(col_id) not in valid_ids:
+                        continue
                     sanitized.append(d)
-                have_ids = {
-                    str((x.get("colId") or x.get("col_id") or x.get("field") or "")).strip() for x in sanitized
-                }
                 columns_state = sanitized or None
             except Exception:
                 columns_state = None
@@ -15385,13 +16143,40 @@ def main() -> None:
                 GridUpdateMode.SELECTION_CHANGED
                 | GridUpdateMode.VALUE_CHANGED
                 | GridUpdateMode.MODEL_CHANGED
+                | getattr(GridUpdateMode, "COLUMN_RESIZED", 0)
+                | getattr(GridUpdateMode, "COLUMN_MOVED", 0)
+                | getattr(GridUpdateMode, "COLUMN_VISIBLE", 0)
             ),
             data_return_mode=DataReturnMode.AS_INPUT,
             fit_columns_on_grid_load=False,
             allow_unsafe_jscode=True,
             height=630,
+            key="results_runs_grid_v2",
             columns_state=columns_state,
         )
+
+        # Store latest grid response for Save Layout (avoid stale column state).
+        st.session_state["grid_resp_results"] = grid
+
+        # Persist runtime column sizing/order so widths survive sorting/filtering/selection.
+        try:
+            runtime_cols = _extract_aggrid_columns_state(grid)
+            if isinstance(runtime_cols, list) and runtime_cols:
+                sanitized_runtime: list[dict] = []
+                valid_ids = {str(c) for c in df.columns.tolist()}
+                for item in runtime_cols:
+                    if not isinstance(item, dict):
+                        continue
+                    d = dict(item)
+                    d.pop("hide", None)
+                    col_id = d.get("colId") or d.get("col_id") or d.get("field")
+                    if col_id is None or str(col_id) not in valid_ids:
+                        continue
+                    sanitized_runtime.append(d)
+                if sanitized_runtime:
+                    st.session_state["results_runs_columns_state_runtime"] = sanitized_runtime
+        except Exception:
+            pass
 
         pager_cols = st.columns([1, 1, 2, 2, 2])
         with pager_cols[0]:
@@ -15431,13 +16216,10 @@ def main() -> None:
                 st.json(grid)
 
         # Persist column sizing/order only on explicit save.
-        if st.session_state.get("runs_explorer_save_layout_requested"):
+        if st.session_state.get("results_runs_save_layout_requested"):
             try:
-                new_state = None
-                if hasattr(grid, "columns_state"):
-                    new_state = getattr(grid, "columns_state")
-                if not new_state and hasattr(grid, "get"):
-                    new_state = grid.get("columns_state")
+                resp = st.session_state.get("grid_resp_results")
+                new_state = _extract_aggrid_columns_state(resp)
                 if isinstance(new_state, list) and new_state:
                     sanitized_state: list[dict] = []
                     for item in new_state:
@@ -15447,30 +16229,52 @@ def main() -> None:
                         if str(col_id) in {"action_click", "actions"}:
                             continue
                         d = dict(item)
+                        # Visible columns are controlled separately (ui.results.visible_cols).
+                        d.pop("hide", None)
+                        d.pop("headerName", None)
+                        if "width" not in d:
+                            try:
+                                d["width"] = int(d.get("actualWidth") or 0) or d.get("width")
+                            except Exception:
+                                pass
                         sanitized_state.append(d)
                     with open_db_connection() as conn:
-                        set_user_setting(conn, user_id, "ui.runs_explorer.columns_state", sanitized_state)
-                    st.session_state["runs_explorer_columns_state"] = sanitized_state
-                    st.session_state["runs_explorer_columns_state_last_persisted"] = sanitized_state
+                        set_user_setting(conn, user_id, "ui.results.columns_state", sanitized_state)
+                    st.session_state["results_columns_state"] = sanitized_state
+                    st.session_state["results_columns_state_last_persisted"] = sanitized_state
                     st.success("Layout saved.")
+                else:
+                    st.warning("No column state returned; ensure update_mode includes column events.")
             except Exception as exc:
                 st.error(f"Failed to save layout: {exc}")
             finally:
-                st.session_state.pop("runs_explorer_save_layout_requested", None)
+                st.session_state.pop("results_runs_save_layout_requested", None)
 
         # Persist shortlist edits (avoid pandas conversion on every rerun).
-        grid_data = grid.get("data")
+        grid_data_raw = grid.get("data")
+        if isinstance(grid_data_raw, pd.DataFrame):
+            try:
+                grid_data = grid_data_raw.to_dict("records")
+            except Exception:
+                grid_data = []
+        elif isinstance(grid_data_raw, list):
+            grid_data = grid_data_raw
+        else:
+            try:
+                grid_data = list(grid_data_raw) if grid_data_raw is not None else []
+            except Exception:
+                grid_data = []
 
         baseline = st.session_state.get("runs_explorer_shortlist_baseline")
         if not isinstance(baseline, dict):
             baseline = {}
-            if not df.empty and "run_id" in df.columns and "shortlisted" in df.columns:
+            if not df.empty and "run_id" in df.columns and "shortlist" in df.columns:
                 for _, r in df.iterrows():
                     rid = str(r.get("run_id") or "").strip()
                     if not rid:
                         continue
                     baseline[rid] = {
-                        "shortlisted": bool(r.get("shortlisted")),
+                        "shortlist": bool(r.get("shortlist")),
                         "note": str(r.get("shortlist_note") or ""),
                     }
             st.session_state["runs_explorer_shortlist_baseline"] = baseline
@@ -15487,9 +16291,9 @@ def main() -> None:
                 old = baseline.get(rid)
                 if old is None:
                     continue
-                cur_shortlisted = bool(row.get("shortlisted") or False)
+                cur_shortlisted = bool(row.get("shortlist") or False)
                 cur_note = str(row.get("shortlist_note") or "").strip()
-                old_shortlisted = bool(old.get("shortlisted") or False)
+                old_shortlisted = bool(old.get("shortlist") or False)
                 old_note = str(old.get("note") or "").strip()
                 if old_shortlisted != cur_shortlisted or old_note != cur_note:
                     changed_flags[rid] = cur_shortlisted
@@ -15497,10 +16301,15 @@ def main() -> None:
 
         if changed_flags:
             try:
-                set_user_run_shortlists(user_id, changed_flags, run_id_to_note=changed_notes)
-                for rid in changed_flags.keys():
+                for rid, flag in changed_flags.items():
+                    update_run_shortlist_fields(
+                        rid,
+                        shortlist=bool(flag),
+                        shortlist_note=str(changed_notes.get(rid) or "").strip(),
+                        user_id=user_id,
+                    )
                     baseline[rid] = {
-                        "shortlisted": bool(changed_flags.get(rid)),
+                        "shortlist": bool(flag),
                         "note": str(changed_notes.get(rid) or "").strip(),
                     }
                 st.session_state["runs_explorer_shortlist_baseline"] = baseline
@@ -15550,7 +16359,7 @@ def main() -> None:
             st.caption("Columns")
             picker_cols = list(candidate_cols)
 
-            persisted = st.session_state.get("runs_explorer_visible_cols")
+            persisted = st.session_state.get("results_visible_cols")
             if isinstance(persisted, list) and persisted:
                 persisted_base = [c for c in persisted if c in picker_cols]
             else:
@@ -15560,8 +16369,8 @@ def main() -> None:
             with st.popover("Visible columns"):
                 st.caption("Toggle visible columns")
                 for c in picker_cols:
-                    label = header_map.get(c, str(c).replace("_", " ").title())
-                    wkey = f"runs_explorer_col_{c}"
+                    label = col_label(c)
+                    wkey = f"results_col_{c}"
                     desired = bool(c in persisted_base)
                     # Initialize from persisted visibility only if the widget key isn't already set.
                     if wkey not in st.session_state:
@@ -15575,38 +16384,63 @@ def main() -> None:
                 if c not in chosen_visible_ui:
                     chosen_visible_ui.append(c)
 
-            last_persisted = st.session_state.get("runs_explorer_visible_cols_last_persisted")
+            last_persisted = st.session_state.get("results_visible_cols_last_persisted")
             if isinstance(chosen_visible_ui, list) and chosen_visible_ui and chosen_visible_ui != last_persisted:
                 try:
                     with open_db_connection() as conn:
-                        set_user_setting(conn, user_id, "ui.runs_explorer.visible_cols", list(chosen_visible_ui))
-                    st.session_state["runs_explorer_visible_cols_last_persisted"] = list(chosen_visible_ui)
+                        set_user_setting(conn, user_id, "ui.results.visible_cols", list(chosen_visible_ui))
+                    st.session_state["results_visible_cols_last_persisted"] = list(chosen_visible_ui)
                 except Exception:
                     pass
         with bottom_bar[1]:
             st.caption("Layout")
 
             def _request_save_layout() -> None:
-                st.session_state["runs_explorer_save_layout_requested"] = True
+                st.session_state["results_runs_save_layout_requested"] = True
+                try:
+                    st.toast("Saving layout…")
+                except Exception:
+                    pass
 
-            st.button("Save layout", key="runs_explorer_save_layout", on_click=_request_save_layout)
+            st.button("Save layout", key="results_runs_save_layout", on_click=_request_save_layout)
 
-            if st.button("Reset layout", key="runs_explorer_reset_layout"):
+            if st.button("Reset layout", key="results_runs_reset_layout"):
                 try:
                     with open_db_connection() as conn:
-                        set_user_setting(conn, user_id, "ui.runs_explorer.visible_cols", None)
-                        set_user_setting(conn, user_id, "ui.runs_explorer.columns_state", None)
+                        set_user_setting(conn, user_id, "ui.results.visible_cols", None)
+                        set_user_setting(conn, user_id, "ui.results.columns_state", None)
+                except Exception:
+                    pass
+                try:
+                    for _k in list(st.session_state.keys()):
+                        if str(_k).startswith("results_col_"):
+                            st.session_state.pop(_k, None)
                 except Exception:
                     pass
                 for k in (
-                    "runs_explorer_visible_cols",
-                    "runs_explorer_visible_cols_last_persisted",
-                    "runs_explorer_columns_state",
-                    "runs_explorer_columns_state_last_persisted",
-                    "runs_explorer_prefs_loaded",
+                    "results_visible_cols",
+                    "results_visible_cols_last_persisted",
+                    "results_columns_state",
+                    "results_runs_columns_state_runtime",
+                    "results_columns_state_last_persisted",
+                    "results_apply_saved_columns_state",
+                    "results_prefs_loaded",
                 ):
                     st.session_state.pop(k, None)
                 st.rerun()
+
+            if str(os.environ.get("DRAGON_DEBUG") or "").strip() == "1":
+                resp_dbg = st.session_state.get("grid_resp_results") or {}
+                has_state = bool(
+                    resp_dbg.get("columnState")
+                    or resp_dbg.get("columnsState")
+                    or resp_dbg.get("column_state")
+                    or resp_dbg.get("columns_state")
+                )
+                saved_count = len(saved_state) if isinstance(saved_state, list) else 0
+                st.caption(
+                    f"Debug: columnState={has_state} • saved={saved_count} • fit_columns_on_grid_load=False"
+                )
 
     if current_page == "Sweeps":
         st.subheader("Parameter sweeps")
@@ -16073,6 +16907,55 @@ def main() -> None:
                 if mask_single.any():
                     df_sweeps.loc[mask_single, "asset"] = df_sweeps.loc[mask_single, "symbol"].apply(_base_from_symbol)
 
+        # Normalize Asset display to match other grids (e.g., "ETH/USDT:USDT - PERPS").
+        if not df_sweeps.empty:
+            try:
+                df_sweeps = df_sweeps.copy()
+            except Exception:
+                pass
+
+            try:
+                from project_dragon.data_online import woox_symbol_to_ccxt_symbol
+            except Exception:
+                woox_symbol_to_ccxt_symbol = None
+
+            def _display_symbol_for_row(row: dict) -> str:
+                sym = str(row.get("symbol") or "").strip()
+                if not sym:
+                    return ""
+                ex_id = str(row.get("exchange_id") or "").strip()
+                ex_norm = normalize_exchange_id(ex_id) if ex_id else ""
+                if (ex_norm == "woox" or sym.upper().startswith(("PERP_", "SPOT_"))) and woox_symbol_to_ccxt_symbol:
+                    try:
+                        display, _ = woox_symbol_to_ccxt_symbol(sym)
+                        return str(display or sym).strip()
+                    except Exception:
+                        return sym
+                return sym
+
+            try:
+                df_sweeps["asset_display"] = df_sweeps.apply(lambda r: _display_symbol_for_row(dict(r)), axis=1)
+            except Exception:
+                df_sweeps["asset_display"] = df_sweeps.get("symbol", "")
+
+            def _asset_label_for_row(row: dict) -> str:
+                scope_val = str(row.get("sweep_scope") or "").strip().lower()
+                if scope_val == "multi_asset_category":
+                    return str(row.get("sweep_category") or "").strip()
+                if scope_val == "multi_asset_manual":
+                    return str(row.get("asset") or "").strip()
+                # single asset: base asset derived from symbol
+                display = str(row.get("asset_display") or "").strip()
+                if display:
+                    return display
+                sym = str(row.get("symbol") or "").strip()
+                return _base_from_symbol(sym)
+
+            try:
+                df_sweeps["asset_label"] = df_sweeps.apply(lambda r: _asset_label_for_row(dict(r)), axis=1)
+            except Exception:
+                df_sweeps["asset_label"] = df_sweeps.get("asset", "")
+
         # Optional: compute per-sweep best metrics (from all runs; filter applies only to run grid)
         # Do this via SQL aggregation to keep the Sweeps page fast even with many runs.
         try:
@@ -16182,6 +17065,7 @@ def main() -> None:
             "sweep_category_id",
             # Remove from Sweeps overview grid
             "asset",
+            "asset_display",
             "strategy_version",
             "data_source",
             "exchange_id",
@@ -16398,6 +17282,7 @@ def main() -> None:
                         "sweeps_visible_cols_version",
                         "sweeps_visible_cols_version_loaded",
                         "sweeps_columns_state",
+                        "sweeps_columns_state_runtime",
                         "sweeps_columns_state_last_persisted",
                         "sweeps_columns_state_loaded",
                     ):
@@ -16409,10 +17294,24 @@ def main() -> None:
 
         custom_css = _aggrid_dark_custom_css()
 
+        # IMPORTANT: load persisted column state BEFORE we compute per-column widths.
+        # Otherwise a browser refresh would render defaults on the first pass.
+        if not st.session_state.get("sweeps_columns_state_loaded", False):
+            try:
+                with open_db_connection() as _prefs_conn:
+                    saved = get_user_setting(_prefs_conn, user_id, "ui.sweeps.columns_state", default=None)
+                if isinstance(saved, list) and saved:
+                    st.session_state["sweeps_columns_state"] = saved
+                    st.session_state["sweeps_columns_state_last_persisted"] = saved
+            except Exception:
+                pass
+            st.session_state["sweeps_columns_state_loaded"] = True
+
         # NOTE: Use section-local variable names. The Sweeps page also defines
         # `timeframe_style` later for the Runs grid; reusing the same name here
         # causes an UnboundLocalError (Python treats it as a local assigned later).
         timeframe_style_sweeps_overview = aggrid_pill_style("timeframe")
+        status_style_sweeps_overview = aggrid_pill_style("status")
         direction_style_sweeps_overview = JsCode(
             """
             function(params) {
@@ -16427,6 +17326,68 @@ def main() -> None:
             }
             """
         )
+
+        sweeps_header_overrides = {
+            "id": "ID",
+            "name": "Name",
+            "symbol": "Asset",
+            "sweep_category": "Category",
+            "timeframe": "Timeframe",
+            "direction": "Direction",
+            "status": "Status",
+            "run_count": "Runs",
+            "jobs_progress_pct": "Jobs %",
+            "jobs_total": "Jobs",
+            "jobs_done": "Done",
+            "jobs_failed": "Failed",
+            "jobs_cancelled": "Cancelled",
+            "jobs_running": "Running",
+            "jobs_queued": "Queued",
+            "created_at": "Run Date",
+            "start_date": "Start",
+            "end_date": "End",
+            "duration": "Duration",
+            "best_net_return_pct": "Best Net Return",
+            "best_roi_pct_on_margin": "Best ROI",
+            "best_sharpe": "Best Sharpe",
+            "best_cpc_index": "Best CPC",
+        }
+        sweeps_acronyms = {"id", "roi", "cpc", "api", "url", "pnl", "atr", "ma", "rsi", "macd", "bb"}
+
+        def _sweeps_header_label(col: str) -> str:
+            if not col:
+                return ""
+            if col in sweeps_header_overrides:
+                return sweeps_header_overrides[col]
+            parts = [p for p in str(col).replace("_", " ").split() if p]
+            out: list[str] = []
+            for p in parts:
+                lo = p.lower()
+                out.append(p.upper() if lo in sweeps_acronyms else p.capitalize())
+            return " ".join(out)
+
+        _sweeps_state = st.session_state.get("sweeps_columns_state")
+        _sweeps_widths: dict[str, int] = {}
+        if isinstance(_sweeps_state, list):
+            for item in _sweeps_state:
+                if not isinstance(item, dict):
+                    continue
+                col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                if not col_id:
+                    continue
+                width_val = item.get("width") or item.get("actualWidth")
+                try:
+                    width_int = int(width_val)
+                except Exception:
+                    continue
+                if width_int > 0:
+                    _sweeps_widths[str(col_id)] = width_int
+
+        def _sweeps_w(col: str, default: int) -> int:
+            try:
+                return int(_sweeps_widths.get(str(col), default))
+            except Exception:
+                return default
         direction_renderer_sweeps_overview = JsCode(
             """
             class DirectionRenderer {
@@ -16782,53 +17743,12 @@ def main() -> None:
         if "sweep_actions" in df_sweeps_display.columns and "sweep_actions" not in visible_cols_sweeps:
             visible_cols_sweeps.append("sweep_actions")
 
-        # Restore persisted column sizing/order/hide state for sweeps.
-        if not st.session_state.get("sweeps_columns_state_loaded", False):
-            try:
-                with open_db_connection() as _prefs_conn:
-                    saved = get_user_setting(_prefs_conn, user_id, "ui.sweeps.columns_state", default=None)
-                if isinstance(saved, list) and saved:
-                    st.session_state["sweeps_columns_state"] = saved
-                    st.session_state["sweeps_columns_state_last_persisted"] = saved
-            except Exception:
-                pass
-            st.session_state["sweeps_columns_state_loaded"] = True
-
         # Standardize Asset column sorting/filtering: use "symbol - market" as the value.
-        asset_market_getter = JsCode(
-            """
-            function(params) {
-                try {
-                    const data = (params && params.data) ? params.data : {};
-                    const rawSym = (data.symbol !== undefined && data.symbol !== null) ? data.symbol.toString() : '';
-                    const rawMarket = (data.market !== undefined && data.market !== null) ? data.market.toString() : '';
-
-                    function inferBaseAsset(sym) {
-                        const s = (sym || '').toString().trim();
-                        if (!s) return '';
-                        if (s.indexOf('/') >= 0) return s.split('/', 1)[0].trim().toUpperCase();
-                        const up = s.toUpperCase();
-                        if (up.indexOf('PERP_') === 0 || up.indexOf('SPOT_') === 0) {
-                            const parts = up.split('_').filter(Boolean);
-                            return (parts.length >= 2) ? parts[1].trim() : up;
-                        }
-                        if (s.indexOf('-') >= 0) return s.split('-', 1)[0].trim().toUpperCase();
-                        return up;
-                    }
-
-                    const base = (data.base_asset !== undefined && data.base_asset !== null && data.base_asset.toString().trim())
-                        ? data.base_asset.toString().trim().toUpperCase()
-                        : ((data.asset !== undefined && data.asset !== null && data.asset.toString().trim())
-                            ? data.asset.toString().trim().toUpperCase()
-                            : inferBaseAsset(rawSym));
-                    const mkt = (rawMarket || '').toString().trim().toUpperCase();
-                    return (base && mkt) ? `${base} - ${mkt}` : base;
-                } catch (e) {
-                    const v = (params && params.value !== undefined && params.value !== null) ? params.value.toString() : '';
-                    return v;
-                }
-            }
-            """
+        asset_market_getter = asset_market_getter_js(
+            symbol_field="symbol",
+            market_field="market",
+            base_asset_field="asset_label",
+            asset_field="asset_label",
         )
 
         # Date formatting (UTC) for sweeps overview.
@@ -16864,47 +17784,7 @@ def main() -> None:
 
         ddmm_yy_formatter = _aggrid_ddmmyy_formatter()
 
-        asset_renderer_sweeps = JsCode(
-            """
-            class AssetRenderer {
-                init(params) {
-                    const sym = (params && params.value) ? params.value.toString() : '';
-                    const uri = (params && params.data && params.data.icon_uri) ? params.data.icon_uri.toString() : '';
-
-                    const wrap = document.createElement('div');
-                    wrap.style.display = 'flex';
-                    wrap.style.alignItems = 'center';
-                    wrap.style.gap = '8px';
-                    wrap.style.width = '100%';
-
-                    if (uri) {
-                        const img = document.createElement('img');
-                        img.src = uri;
-                        img.style.width = '18px';
-                        img.style.height = '18px';
-                        img.style.borderRadius = '3px';
-                        img.style.display = 'block';
-                        wrap.appendChild(img);
-                    } else {
-                        const spacer = document.createElement('div');
-                        spacer.style.width = '18px';
-                        spacer.style.height = '18px';
-                        wrap.appendChild(spacer);
-                    }
-
-                    const text = document.createElement('span');
-                    text.innerText = sym;
-                    text.style.fontWeight = '500';
-                    text.style.color = '#FFFFFF';
-                    wrap.appendChild(text);
-
-                    this.eGui = wrap;
-                }
-                getGui() { return this.eGui; }
-                refresh(params) { return false; }
-            }
-            """
-        )
+        asset_renderer_sweeps = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
         metrics_gradient_style = JsCode(
             """
@@ -16979,7 +17859,7 @@ def main() -> None:
             gb_s.configure_column(
                 "run_count",
                 headerName="Runs",
-                width=90,
+                width=_sweeps_w("run_count", 90),
                 filter=False,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -16990,7 +17870,7 @@ def main() -> None:
             gb_s.configure_column(
                 "jobs_progress_pct",
                 headerName="Jobs %",
-                width=140,
+                width=_sweeps_w("jobs_progress_pct", 140),
                 filter=False,
                 type=["numericColumn"],
                 cellRenderer=jobs_progress_renderer_sweeps,
@@ -17001,7 +17881,7 @@ def main() -> None:
             gb_s.configure_column(
                 "jobs_total",
                 headerName="Jobs",
-                width=90,
+                width=_sweeps_w("jobs_total", 90),
                 filter=False,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -17011,7 +17891,7 @@ def main() -> None:
             gb_s.configure_column(
                 "jobs_done",
                 headerName="Done",
-                width=90,
+                width=_sweeps_w("jobs_done", 90),
                 filter=False,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -17021,18 +17901,95 @@ def main() -> None:
             gb_s.configure_column(
                 "jobs_failed",
                 headerName="Failed",
-                width=95,
+                width=_sweeps_w("jobs_failed", 95),
                 filter=False,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
                 hide=("jobs_failed" not in visible_cols_sweeps),
             )
 
+        if "id" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "id",
+                headerName=_sweeps_header_label("id"),
+                width=_sweeps_w("id", 130),
+                cellClass="ag-center-aligned-cell",
+                hide=("id" not in visible_cols_sweeps),
+            )
+        if "name" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "name",
+                headerName=_sweeps_header_label("name"),
+                width=_sweeps_w("name", 220),
+                hide=("name" not in visible_cols_sweeps),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+            )
+        if "symbol" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "symbol",
+                headerName=_sweeps_header_label("symbol"),
+                width=_sweeps_w("symbol", 200),
+                filter=sym_filter,
+                hide=("symbol" not in visible_cols_sweeps),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+                cellRenderer=asset_renderer_sweeps,
+                valueGetter=asset_market_getter,
+            )
+        if "sweep_category" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "sweep_category",
+                headerName=_sweeps_header_label("sweep_category"),
+                width=_sweeps_w("sweep_category", 170),
+                filter=True,
+                hide=("sweep_category" not in visible_cols_sweeps),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+            )
+        if "timeframe" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "timeframe",
+                headerName=_sweeps_header_label("timeframe"),
+                width=_sweeps_w("timeframe", 95),
+                filter=sym_filter,
+                cellStyle=timeframe_style_sweeps_overview,
+                cellClass="ag-center-aligned-cell",
+                hide=("timeframe" not in visible_cols_sweeps),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+            )
+        if "direction" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "direction",
+                headerName=_sweeps_header_label("direction"),
+                width=_sweeps_w("direction", 110),
+                filter=sym_filter,
+                cellStyle=direction_style_sweeps_overview,
+                cellRenderer=direction_renderer_sweeps_overview,
+                cellClass="ag-center-aligned-cell",
+                hide=("direction" not in visible_cols_sweeps),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+            )
+        if "status" in df_sweeps_display.columns:
+            gb_s.configure_column(
+                "status",
+                headerName=_sweeps_header_label("status"),
+                width=_sweeps_w("status", 120),
+                filter=True,
+                cellStyle=status_style_sweeps_overview,
+                cellClass="ag-center-aligned-cell",
+                hide=("status" not in visible_cols_sweeps),
+                wrapHeaderText=True,
+                autoHeaderHeight=True,
+            )
+
         if "created_at" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "created_at",
-                headerName="Run Date",
-                width=160,
+                headerName=_sweeps_header_label("created_at"),
+                width=_sweeps_w("created_at", 160),
                 filter=True,
                 hide=("created_at" not in visible_cols_sweeps),
             )
@@ -17040,8 +17997,8 @@ def main() -> None:
         if "start_date" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "start_date",
-                headerName="Start",
-                width=110,
+                headerName=_sweeps_header_label("start_date"),
+                width=_sweeps_w("start_date", 110),
                 filter=True,
                 valueFormatter=ddmm_yy_formatter,
                 cellClass="ag-center-aligned-cell",
@@ -17051,8 +18008,8 @@ def main() -> None:
         if "end_date" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "end_date",
-                headerName="End",
-                width=110,
+                headerName=_sweeps_header_label("end_date"),
+                width=_sweeps_w("end_date", 110),
                 filter=True,
                 valueFormatter=ddmm_yy_formatter,
                 cellClass="ag-center-aligned-cell",
@@ -17062,9 +18019,9 @@ def main() -> None:
         if "best_net_return_pct" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "best_net_return_pct",
-                headerName="Best Net Return",
+                headerName=_sweeps_header_label("best_net_return_pct"),
                 valueFormatter=pct_formatter,
-                width=150,
+                width=_sweeps_w("best_net_return_pct", 150),
                 cellStyle=metrics_gradient_style,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -17073,9 +18030,9 @@ def main() -> None:
         if "best_roi_pct_on_margin" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "best_roi_pct_on_margin",
-                headerName="Best ROI",
+                headerName=_sweeps_header_label("best_roi_pct_on_margin"),
                 valueFormatter=roi_pct_formatter,
-                width=150,
+                width=_sweeps_w("best_roi_pct_on_margin", 150),
                 cellStyle=metrics_gradient_style,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -17084,9 +18041,9 @@ def main() -> None:
         if "best_sharpe" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "best_sharpe",
-                headerName="Best Sharpe",
+                headerName=_sweeps_header_label("best_sharpe"),
                 valueFormatter=num2_formatter,
-                width=120,
+                width=_sweeps_w("best_sharpe", 120),
                 cellStyle=metrics_gradient_style,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -17096,9 +18053,9 @@ def main() -> None:
         if "best_cpc_index" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "best_cpc_index",
-                headerName="Best CPC",
+                headerName=_sweeps_header_label("best_cpc_index"),
                 valueFormatter=num2_formatter,
-                width=120,
+                width=_sweeps_w("best_cpc_index", 120),
                 cellStyle=metrics_gradient_style,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -17107,8 +18064,8 @@ def main() -> None:
         if "duration" in df_sweeps_display.columns:
             gb_s.configure_column(
                 "duration",
-                headerName="Duration",
-                width=105,
+                headerName=_sweeps_header_label("duration"),
+                width=_sweeps_w("duration", 105),
                 cellClass="ag-center-aligned-cell",
                 hide=("duration" not in visible_cols_sweeps),
             )
@@ -17118,14 +18075,45 @@ def main() -> None:
         if "market" in df_sweeps_display.columns:
             gb_s.configure_column("market", hide=True)
 
-        # Hide any other columns not selected.
+        # Hide any other columns not selected (and apply title-case headers).
         try:
             always_hidden = {"icon_uri", "market"}
+            configured_cols = {
+                "id",
+                "name",
+                "symbol",
+                "sweep_category",
+                "timeframe",
+                "direction",
+                "status",
+                "run_count",
+                "jobs_progress_pct",
+                "jobs_total",
+                "jobs_done",
+                "jobs_failed",
+                "created_at",
+                "start_date",
+                "end_date",
+                "duration",
+                "best_net_return_pct",
+                "best_roi_pct_on_margin",
+                "best_sharpe",
+                "best_cpc_index",
+            }
             for c in df_sweeps_display.columns.tolist():
                 if c in always_hidden or c == "sweep_actions":
                     continue
-                if c not in visible_cols_sweeps:
-                    gb_s.configure_column(c, hide=True)
+                if c in configured_cols:
+                    if c not in visible_cols_sweeps:
+                        gb_s.configure_column(c, hide=True)
+                    continue
+                gb_s.configure_column(
+                    c,
+                    headerName=_sweeps_header_label(str(c)),
+                    hide=(c not in visible_cols_sweeps),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
         except Exception:
             pass
 
@@ -17181,18 +18169,24 @@ def main() -> None:
             except Exception:
                 pass
 
+        runtime_state = st.session_state.get("sweeps_columns_state_runtime")
         saved_state = st.session_state.get("sweeps_columns_state")
         columns_state = None
-        if isinstance(saved_state, list) and saved_state:
+        state_source = runtime_state if isinstance(runtime_state, list) and runtime_state else saved_state
+        if isinstance(state_source, list) and state_source:
             try:
                 sanitized: list[dict] = []
-                for item in saved_state:
+                valid_ids = {str(c) for c in df_sweeps_display.columns.tolist()}
+                for item in state_source:
                     if not isinstance(item, dict):
                         continue
                     d = dict(item)
                     # Visible columns are controlled separately (ui.sweeps.visible_cols).
                     d.pop("hide", None)
+                    d.pop("headerName", None)
                     col_id = d.get("colId") or d.get("col_id") or d.get("field")
+                    if col_id is None or str(col_id) not in valid_ids:
+                        continue
                     sanitized.append(d)
                 columns_state = sanitized or None
             except Exception:
@@ -17204,7 +18198,11 @@ def main() -> None:
             theme="dark",
             custom_css=custom_css,
             # Selection changes must trigger a rerun so the runs grid appears.
-            update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.VALUE_CHANGED),
+            update_mode=(
+                GridUpdateMode.SELECTION_CHANGED
+                | GridUpdateMode.VALUE_CHANGED
+                | getattr(GridUpdateMode, "COLUMN_RESIZED", 0)
+            ),
             data_return_mode=DataReturnMode.AS_INPUT,
             fit_columns_on_grid_load=False,
             allow_unsafe_jscode=True,
@@ -17217,11 +18215,7 @@ def main() -> None:
         # Persist sweeps layout only on explicit request (Results-style).
         if st.session_state.get("sweeps_save_layout_requested"):
             try:
-                new_state = None
-                if hasattr(grid_sweeps, "columns_state"):
-                    new_state = getattr(grid_sweeps, "columns_state")
-                if not new_state and hasattr(grid_sweeps, "get"):
-                    new_state = grid_sweeps.get("columns_state")
+                new_state = _extract_aggrid_columns_state(grid_sweeps)
                 if isinstance(new_state, list) and new_state:
                     sanitized_state: list[dict] = []
                     for item in new_state:
@@ -17231,12 +18225,20 @@ def main() -> None:
                         d = dict(item)
                         # Hide is controlled by ui.sweeps.visible_cols.
                         d.pop("hide", None)
+                        d.pop("headerName", None)
+                        if "width" not in d:
+                            try:
+                                d["width"] = int(d.get("actualWidth") or 0) or d.get("width")
+                            except Exception:
+                                pass
                         sanitized_state.append(d)
                     with open_db_connection() as _prefs_conn:
                         set_user_setting(_prefs_conn, user_id, "ui.sweeps.columns_state", sanitized_state)
                     st.session_state["sweeps_columns_state"] = sanitized_state
                     st.session_state["sweeps_columns_state_last_persisted"] = sanitized_state
                     st.success("Layout saved.")
+                else:
+                    st.warning("No layout changes detected to save.")
             except Exception as exc:
                 st.error(f"Failed to save layout: {exc}")
             finally:
@@ -17268,6 +18270,79 @@ def main() -> None:
                 selected_sweep_id = None
         if selected_sweep_id is None and deep_link_sweep_id is not None:
             selected_sweep_id = str(deep_link_sweep_id).strip() or None
+
+        def _render_sweeps_overview_chart(df_in: pd.DataFrame, highlight_id: Optional[str]) -> None:
+            if df_in is None or df_in.empty:
+                return
+            df_chart = df_in.copy()
+            if "created_at" not in df_chart.columns:
+                return
+            try:
+                df_chart["created_at_ts"] = pd.to_datetime(df_chart["created_at"], errors="coerce", utc=True)
+            except Exception:
+                return
+            df_chart = df_chart.dropna(subset=["created_at_ts"])
+            if df_chart.empty:
+                return
+
+            metric_candidates = [
+                "best_roi_pct_on_margin",
+                "best_net_return_pct",
+                "best_sharpe",
+                "run_count",
+            ]
+            y_col = None
+            for c in metric_candidates:
+                if c in df_chart.columns and df_chart[c].notna().any():
+                    y_col = c
+                    break
+            if y_col is None:
+                return
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=df_chart["created_at_ts"],
+                    y=df_chart[y_col],
+                    mode="markers",
+                    name="Sweeps",
+                    text=df_chart.get("name", ""),
+                    customdata=df_chart.get("id", ""),
+                    hovertemplate="%{text}<br>%{y}<extra></extra>",
+                )
+            )
+
+            if highlight_id:
+                try:
+                    mask = df_chart.get("id").astype(str) == str(highlight_id)
+                except Exception:
+                    mask = None
+                if mask is not None and mask.any():
+                    sel = df_chart.loc[mask]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=sel["created_at_ts"],
+                            y=sel[y_col],
+                            mode="markers",
+                            name="Selected",
+                            marker={"size": 14, "symbol": "diamond-open"},
+                            showlegend=False,
+                            text=sel.get("name", ""),
+                            hovertemplate="%{text}<br>%{y}<extra></extra>",
+                        )
+                    )
+
+            fig.update_layout(
+                template="plotly_dark",
+                height=260,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis_title="Created",
+                yaxis_title=_sweeps_header_label(y_col) if "_sweeps_header_label" in locals() else y_col,
+                showlegend=False,
+            )
+            st.plotly_chart(fig, width="stretch", key="sweeps_overview_chart")
+
+        _render_sweeps_overview_chart(df_sweeps_display, selected_sweep_id)
 
         if selected_sweep_id is None:
             st.info("Select a sweep in the grid to load its runs below.")
@@ -17526,8 +18601,8 @@ def main() -> None:
             except Exception:
                 df["direction"] = ""
 
-        if "shortlisted" in df.columns:
-            df["shortlisted"] = df["shortlisted"].astype(bool)
+        if "shortlist" in df.columns:
+            df["shortlist"] = df["shortlist"].astype(bool)
         if "icon_uri" not in df.columns:
             df["icon_uri"] = None
 
@@ -17546,10 +18621,7 @@ def main() -> None:
         else:
             df["symbol_full"] = ""
 
-        sym_from_asset = df.get("asset") if "asset" in df.columns else None
-        if sym_from_asset is not None:
-            df["symbol"] = sym_from_asset.fillna("").astype(str).str.upper().replace({"NAN": ""})
-        else:
+        if "symbol" not in df.columns:
             df["symbol"] = ""
 
         if "market_type" in df.columns and "market" not in df.columns:
@@ -17583,6 +18655,7 @@ def main() -> None:
             "start_date",
             "end_date",
             "duration",
+            "avg_position_time",
             "symbol",
             "timeframe",
             "direction",
@@ -17647,7 +18720,9 @@ def main() -> None:
                 "base_asset",
                 "quote_asset",
                 "asset",
+                "asset_display",
                 "market",
+                "avg_position_time_seconds",
             }
         ]
         default_visible = st.session_state.get("sweeps_runs_visible_cols")
@@ -17661,33 +18736,14 @@ def main() -> None:
             if c not in default_visible:
                 default_visible.append(c)
 
-        header_map = {
-            "run_id": "Run ID",
-            "created_at": "Run Date",
-            "start_date": "Start",
-            "end_date": "End",
-            "duration": "Duration",
-            "symbol": "Asset",
-            "timeframe": "Timeframe",
-            "direction": "Direction",
-            "strategy": "Strategy",
-            "sweep_name": "Sweep",
-            "net_return_pct": "Net Return",
-            "roi_pct_on_margin": "ROI",
-            "max_drawdown_pct": "Max Drawdown",
-            "win_rate": "Win Rate",
-            "net_profit": "Net Profit",
-            "sharpe": "Sharpe",
-            "sortino": "Sortino",
-            "profit_factor": "Profit Factor",
-            "cpc_index": "CPC Index",
-            "common_sense_ratio": "Common Sense Ratio",
-            "shortlisted": "Shortlist",
-            "shortlist_note": "Shortlist Note",
-        }
-
         # Determine visible columns from session state; UI control is rendered below.
         raw_visible = st.session_state.get("sweeps_runs_visible_cols")
+        if isinstance(raw_visible, list) and ("avg_position_time_s" in raw_visible or "avg_position_time_seconds" in raw_visible):
+            raw_visible = [
+                ("avg_position_time" if c in {"avg_position_time_s", "avg_position_time_seconds"} else c)
+                for c in raw_visible
+            ]
+            st.session_state["sweeps_runs_visible_cols"] = list(raw_visible)
         if isinstance(raw_visible, list) and raw_visible:
             sanitized_visible = [c for c in raw_visible if c in candidate_cols and c != "market"]
             if sanitized_visible != raw_visible:
@@ -17706,40 +18762,11 @@ def main() -> None:
             chosen_visible.append("max_drawdown_pct")
         visible_cols = chosen_visible
 
-        asset_market_getter = JsCode(
-            """
-            function(params) {
-                try {
-                    const data = (params && params.data) ? params.data : {};
-                    const rawSym = (data.symbol !== undefined && data.symbol !== null) ? data.symbol.toString() : '';
-                    const rawMarket = (data.market !== undefined && data.market !== null) ? data.market.toString() : '';
-
-                    function inferBaseAsset(sym) {
-                        const s = (sym || '').toString().trim();
-                        if (!s) return '';
-                        if (s.indexOf('/') >= 0) return s.split('/', 1)[0].trim().toUpperCase();
-                        const up = s.toUpperCase();
-                        if (up.indexOf('PERP_') === 0 || up.indexOf('SPOT_') === 0) {
-                            const parts = up.split('_').filter(Boolean);
-                            return (parts.length >= 2) ? parts[1].trim() : up;
-                        }
-                        if (s.indexOf('-') >= 0) return s.split('-', 1)[0].trim().toUpperCase();
-                        return up;
-                    }
-
-                    const base = (data.base_asset !== undefined && data.base_asset !== null && data.base_asset.toString().trim())
-                        ? data.base_asset.toString().trim().toUpperCase()
-                        : ((data.asset !== undefined && data.asset !== null && data.asset.toString().trim())
-                            ? data.asset.toString().trim().toUpperCase()
-                            : inferBaseAsset(rawSym));
-                    const mkt = (rawMarket || '').toString().trim().toUpperCase();
-                    return (base && mkt) ? `${base} - ${mkt}` : base;
-                } catch (e) {
-                    const v = (params && params.value !== undefined && params.value !== null) ? params.value.toString() : '';
-                    return v;
-                }
-            }
-            """
+        asset_market_getter = asset_market_getter_js(
+            symbol_field="symbol",
+            market_field="market",
+            base_asset_field="asset_display",
+            asset_field="asset_display",
         )
 
         roi_pct_formatter = JsCode(
@@ -17753,51 +18780,7 @@ def main() -> None:
             """
         )
 
-        asset_renderer = JsCode(
-            """
-            class AssetRenderer {
-                init(params) {
-                    // NOTE: Sorting/filtering uses valueGetter (symbol + market),
-                    // so params.value is already the combined label.
-                    const label = (params && params.value !== undefined && params.value !== null)
-                        ? params.value.toString()
-                        : '';
-                    const uri = (params && params.data && params.data.icon_uri) ? params.data.icon_uri.toString() : '';
-
-                    const wrap = document.createElement('div');
-                    wrap.style.display = 'flex';
-                    wrap.style.alignItems = 'center';
-                    wrap.style.gap = '8px';
-                    wrap.style.width = '100%';
-
-                    if (uri) {
-                        const img = document.createElement('img');
-                        img.src = uri;
-                        img.style.width = '18px';
-                        img.style.height = '18px';
-                        img.style.borderRadius = '3px';
-                        img.style.display = 'block';
-                        wrap.appendChild(img);
-                    } else {
-                        const spacer = document.createElement('div');
-                        spacer.style.width = '18px';
-                        spacer.style.height = '18px';
-                        wrap.appendChild(spacer);
-                    }
-
-                    const text = document.createElement('span');
-                    text.innerText = label;
-                    text.style.fontWeight = '500';
-                    text.style.color = '#FFFFFF';
-                    wrap.appendChild(text);
-
-                    this.eGui = wrap;
-                }
-                getGui() { return this.eGui; }
-                refresh(params) { return false; }
-            }
-            """
-        )
+        asset_renderer = asset_renderer_js(icon_field="icon_uri", size_px=18, text_color="#FFFFFF")
 
         direction_renderer = JsCode(
             """
@@ -17955,21 +18938,137 @@ def main() -> None:
         # Prefer set filters when enterprise modules are enabled
         sym_filter = "agSetColumnFilter" if use_enterprise else True
 
+        # Column width helper for the Sweeps > Runs grid.
+        # NOTE: This must be defined in this code path; a same-named helper exists in other pages
+        # but is conditionally defined, which can otherwise trigger UnboundLocalError here.
+        _sweeps_runs_widths: dict[str, int] = {}
+        try:
+            _sweeps_runs_saved = st.session_state.get("sweeps_runs_columns_state")
+            if isinstance(_sweeps_runs_saved, list) and _sweeps_runs_saved:
+                for item in _sweeps_runs_saved:
+                    if not isinstance(item, dict):
+                        continue
+                    col_id = item.get("colId") or item.get("col_id") or item.get("field")
+                    if not col_id:
+                        continue
+                    width_val = item.get("width") or item.get("actualWidth")
+                    if width_val is None:
+                        continue
+                    try:
+                        _sweeps_runs_widths[str(col_id)] = int(width_val)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        def _sweeps_runs_w(col: str, default: int) -> int:
+            try:
+                return max(60, int(_sweeps_runs_widths.get(str(col), default)))
+            except Exception:
+                return default
+
+        debug_grid = str(os.environ.get("DRAGON_DEBUG_GRID") or os.environ.get("DRAGON_DEBUG") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        debug_logger = logging.getLogger(__name__)
+        configured_cols: set[str] = set()
+        configured_headers: dict[str, bool] = {}
+        timeframe_pill_applied = False
+        direction_pill_applied = False
+
+        def _track_col(col: str, *, has_header: bool) -> None:
+            configured_cols.add(col)
+            if has_header:
+                configured_headers[col] = True
+            else:
+                configured_headers.setdefault(col, False)
+
+        shared_col_defs: list[dict[str, Any]] = []
+        if "start_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "start_date",
+                    col_label("start_date"),
+                    width=_sweeps_runs_w("start_date", 110),
+                    hide=("start_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "end_date" in df.columns:
+            shared_col_defs.append(
+                col_date_ddmmyy(
+                    "end_date",
+                    col_label("end_date"),
+                    width=_sweeps_runs_w("end_date", 110),
+                    hide=("end_date" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+        if "timeframe" in df.columns:
+            shared_col_defs.append(
+                col_timeframe_pill(
+                    field="timeframe",
+                    header=col_label("timeframe"),
+                    width=_sweeps_runs_w("timeframe", 90),
+                    filter=sym_filter,
+                    hide=("timeframe" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+            timeframe_pill_applied = True
+        if "direction" in df.columns:
+            shared_col_defs.append(
+                col_direction_pill(
+                    field="direction",
+                    header=col_label("direction"),
+                    width=_sweeps_runs_w("direction", 100),
+                    filter=sym_filter,
+                    hide=("direction" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+            direction_pill_applied = True
+        if "avg_position_time" in df.columns:
+            shared_col_defs.append(
+                col_avg_position_time(
+                    field="avg_position_time",
+                    header=col_label("avg_position_time"),
+                    width=_sweeps_runs_w("avg_position_time", 150),
+                    hide=("avg_position_time" not in visible_cols),
+                    wrapHeaderText=True,
+                    autoHeaderHeight=True,
+                )
+            )
+
+        apply_columns(gb, shared_col_defs, saved_widths=_sweeps_runs_widths)
+        for col_def in shared_col_defs:
+            field = col_def.get("field") if isinstance(col_def, dict) else None
+            if field:
+                _track_col(str(field), has_header=True)
+
         # Show Run Date first (requested), then Asset.
         if "created_at" in df.columns:
             gb.configure_column(
                 "created_at",
-                headerName=header_map.get("created_at", "Run Date"),
-                width=160,
+                headerName=col_label("created_at"),
+                width=_sweeps_runs_w("created_at", 160),
                 pinned="left",
                 hide=("created_at" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
+            _track_col("created_at", has_header=True)
         gb.configure_column(
             "symbol",
-            headerName=header_map.get("symbol", "Asset"),
-            width=220,
+            headerName=col_label("symbol"),
+            width=_sweeps_runs_w("symbol", 220),
             filter=sym_filter,
             hide=("symbol" not in visible_cols),
             wrapHeaderText=True,
@@ -17979,89 +19078,48 @@ def main() -> None:
             checkboxSelection=True,
             headerCheckboxSelection=False,
         )
-        if "start_date" in df.columns:
-            gb.configure_column(
-                "start_date",
-                headerName=header_map.get("start_date", "Start"),
-                width=110,
-                valueFormatter=ddmm_yy_formatter,
-                hide=("start_date" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
-        if "end_date" in df.columns:
-            gb.configure_column(
-                "end_date",
-                headerName=header_map.get("end_date", "End"),
-                width=110,
-                valueFormatter=ddmm_yy_formatter,
-                hide=("end_date" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-            )
+        _track_col("symbol", has_header=True)
         if "duration" in df.columns:
             gb.configure_column(
                 "duration",
-                headerName=header_map.get("duration", "Duration"),
-                width=110,
+                headerName=col_label("duration"),
+                width=_sweeps_runs_w("duration", 110),
                 hide=("duration" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
                 cellClass="ag-center-aligned-cell",
             )
-        if "timeframe" in df.columns:
-            gb.configure_column(
-                "timeframe",
-                headerName=header_map.get("timeframe", "Timeframe"),
-                width=90,
-                filter=sym_filter,
-                cellStyle=timeframe_style,
-                hide=("timeframe" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
-        if "direction" in df.columns:
-            gb.configure_column(
-                "direction",
-                headerName=header_map.get("direction", "Direction"),
-                width=100,
-                filter=sym_filter,
-                cellStyle=direction_style,
-                cellRenderer=direction_renderer,
-                hide=("direction" not in visible_cols),
-                wrapHeaderText=True,
-                autoHeaderHeight=True,
-                cellClass="ag-center-aligned-cell",
-            )
+            _track_col("duration", has_header=True)
         if "strategy" in df.columns:
             gb.configure_column(
                 "strategy",
-                headerName=header_map.get("strategy", "Strategy"),
-                width=160,
+                headerName=col_label("strategy"),
+                width=_sweeps_runs_w("strategy", 160),
                 filter=sym_filter,
                 hide=("strategy" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
+            _track_col("strategy", has_header=True)
         if "sweep_name" in df.columns:
             gb.configure_column(
                 "sweep_name",
-                headerName=header_map.get("sweep_name", "Sweep"),
-                width=180,
+                headerName=col_label("sweep_name"),
+                width=_sweeps_runs_w("sweep_name", 180),
                 filter=True,
                 hide=("sweep_name" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
+            _track_col("sweep_name", has_header=True)
 
         for col in ("net_return_pct", "max_drawdown_pct", "win_rate"):
             if col in df.columns:
                 gb.configure_column(
                     col,
-                    headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                    headerName=col_label(col),
                     valueFormatter=pct_formatter,
-                    width=130 if col == "max_drawdown_pct" else 120,
+                    width=_sweeps_runs_w(col, 130 if col == "max_drawdown_pct" else 120),
                     cellStyle=dd_style if col == "max_drawdown_pct" else metrics_gradient_style,
                     type=["numericColumn"],
                     cellClass="ag-center-aligned-cell",
@@ -18069,13 +19127,14 @@ def main() -> None:
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                 )
+                _track_col(col, has_header=True)
 
         if "roi_pct_on_margin" in df.columns:
             gb.configure_column(
                 "roi_pct_on_margin",
-                headerName=header_map.get("roi_pct_on_margin", "ROI"),
+                headerName=col_label("roi_pct_on_margin"),
                 valueFormatter=roi_pct_formatter,
-                width=140,
+                width=_sweeps_runs_w("roi_pct_on_margin", 140),
                 cellStyle=metrics_gradient_style,
                 type=["numericColumn"],
                 cellClass="ag-center-aligned-cell",
@@ -18083,13 +19142,14 @@ def main() -> None:
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
+            _track_col("roi_pct_on_margin", has_header=True)
         for col in ("net_profit", "sharpe", "sortino", "profit_factor", "cpc_index", "common_sense_ratio"):
             if col in df.columns:
                 gb.configure_column(
                     col,
-                    headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                    headerName=col_label(col),
                     valueFormatter=num2_formatter,
-                    width=120,
+                    width=_sweeps_runs_w(col, 120),
                     cellStyle=metrics_gradient_style,
                     type=["numericColumn"],
                     cellClass="ag-center-aligned-cell",
@@ -18097,30 +19157,33 @@ def main() -> None:
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                 )
+                _track_col(col, has_header=True)
 
         # Shortlist editable columns
-        if "shortlisted" in df.columns:
+        if "shortlist" in df.columns:
             gb.configure_column(
-                "shortlisted",
-                headerName=header_map.get("shortlisted", "Shortlist"),
+                "shortlist",
+                headerName=col_label("shortlist"),
                 editable=True,
                 cellRenderer="agCheckboxCellRenderer",
-                width=105,
+                width=_sweeps_runs_w("shortlist", 105),
                 filter=False,
-                hide=("shortlisted" not in visible_cols),
+                hide=("shortlist" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
+            _track_col("shortlist", has_header=True)
         if "shortlist_note" in df.columns:
             gb.configure_column(
                 "shortlist_note",
-                headerName=header_map.get("shortlist_note", "Shortlist Note"),
+                headerName=col_label("shortlist_note"),
                 editable=True,
-                width=200,
+                width=_sweeps_runs_w("shortlist_note", 200),
                 hide=("shortlist_note" not in visible_cols),
                 wrapHeaderText=True,
                 autoHeaderHeight=True,
             )
+            _track_col("shortlist_note", has_header=True)
 
         # Ensure the Cols picker controls visibility for all candidate columns.
         # GridOptionsBuilder.from_dataframe() creates default column defs for every df column;
@@ -18145,7 +19208,7 @@ def main() -> None:
             "profit_factor",
             "cpc_index",
             "common_sense_ratio",
-            "shortlisted",
+            "shortlist",
             "shortlist_note",
         }
         try:
@@ -18156,11 +19219,12 @@ def main() -> None:
                     continue
                 gb.configure_column(
                     col,
-                    headerName=header_map.get(col, str(col).replace("_", " ").title()),
+                    headerName=col_label(col),
                     hide=(col not in visible_cols),
                     wrapHeaderText=True,
                     autoHeaderHeight=True,
                 )
+                _track_col(col, has_header=True)
         except Exception:
             pass
 
@@ -18185,6 +19249,19 @@ def main() -> None:
         ):
             if hidden in df.columns:
                 gb.configure_column(hidden, hide=True)
+                _track_col(hidden, has_header=False)
+
+        if debug_grid:
+            debug_logger.info("sweeps_runs.grid_columns configured=%s", sorted(configured_cols))
+            debug_logger.info(
+                "sweeps_runs.grid_headers %s",
+                {c: configured_headers.get(c, False) for c in sorted(configured_cols)},
+            )
+            debug_logger.info(
+                "sweeps_runs.grid_pills timeframe=%s direction=%s",
+                timeframe_pill_applied,
+                direction_pill_applied,
+            )
 
         grid_options_runs = gb.build()
         try:
@@ -18245,6 +19322,7 @@ def main() -> None:
                         continue
                     d = dict(item)
                     d.pop("hide", None)
+                    d.pop("headerName", None)
                     col_id = d.get("colId") or d.get("col_id") or d.get("field")
                     # If a column is no longer in the dataframe, drop it from the restored state.
                     if str(col_id) not in valid_ids:
@@ -18268,7 +19346,7 @@ def main() -> None:
             chosen_base: list[str] = []
             with st.popover("Cols", help="Choose visible Runs columns"):
                 for c in picker_cols:
-                    label = header_map.get(c, str(c).replace("_", " ").title())
+                    label = col_label(c)
                     checked = st.checkbox(
                         label,
                         value=(c in persisted_base),
@@ -18339,7 +19417,12 @@ def main() -> None:
             gridOptions=grid_options_runs,
             theme="dark",
             custom_css=custom_css,
-            update_mode=(GridUpdateMode.SELECTION_CHANGED | GridUpdateMode.VALUE_CHANGED),
+            update_mode=(
+                GridUpdateMode.SELECTION_CHANGED
+                | GridUpdateMode.VALUE_CHANGED
+                | GridUpdateMode.MODEL_CHANGED
+                | getattr(GridUpdateMode, "COLUMN_RESIZED", 0)
+            ),
             data_return_mode=DataReturnMode.AS_INPUT,
             fit_columns_on_grid_load=False,
             allow_unsafe_jscode=True,
@@ -18354,11 +19437,7 @@ def main() -> None:
         # Persist sweeps-runs layout only on explicit request (Results-style).
         if st.session_state.get("sweeps_runs_save_layout_requested"):
             try:
-                new_state = None
-                if hasattr(grid_runs, "columns_state"):
-                    new_state = getattr(grid_runs, "columns_state")
-                if not new_state and hasattr(grid_runs, "get"):
-                    new_state = grid_runs.get("columns_state")
+                new_state = _extract_aggrid_columns_state(grid_runs)
                 if isinstance(new_state, list) and new_state:
                     sanitized_state: list[dict] = []
                     for item in new_state:
@@ -18367,6 +19446,12 @@ def main() -> None:
                         col_id = item.get("colId") or item.get("col_id") or item.get("field")
                         d = dict(item)
                         d.pop("hide", None)
+                        d.pop("headerName", None)
+                        if "width" not in d:
+                            try:
+                                d["width"] = int(d.get("actualWidth") or 0) or d.get("width")
+                            except Exception:
+                                pass
                         sanitized_state.append(d)
                     with open_db_connection() as _prefs_conn:
                         set_user_setting(_prefs_conn, user_id, "ui.sweeps_runs.columns_state", sanitized_state)
@@ -18378,7 +19463,19 @@ def main() -> None:
             finally:
                 st.session_state.pop("sweeps_runs_save_layout_requested", None)
 
-        grid_data = grid_runs.get("data")
+        grid_data_raw = grid_runs.get("data")
+        if isinstance(grid_data_raw, pd.DataFrame):
+            try:
+                grid_data = grid_data_raw.to_dict("records")
+            except Exception:
+                grid_data = []
+        elif isinstance(grid_data_raw, list):
+            grid_data = grid_data_raw
+        else:
+            try:
+                grid_data = list(grid_data_raw) if grid_data_raw is not None else []
+            except Exception:
+                grid_data = []
 
         # (Actions removed) Keep selection navigation simple.
 
@@ -18386,13 +19483,13 @@ def main() -> None:
         baseline = st.session_state.get(baseline_key)
         if not isinstance(baseline, dict):
             baseline = {}
-            if not df.empty and "run_id" in df.columns and "shortlisted" in df.columns:
+            if not df.empty and "run_id" in df.columns and "shortlist" in df.columns:
                 for _, r in df.iterrows():
                     rid = str(r.get("run_id") or r.get("id") or r.get("runId") or "").strip()
                     if not rid:
                         continue
                     baseline[rid] = {
-                        "shortlisted": bool(r.get("shortlisted")),
+                        "shortlist": bool(r.get("shortlist")),
                         "note": str(r.get("shortlist_note") or "").strip(),
                     }
             st.session_state[baseline_key] = baseline
@@ -18411,9 +19508,9 @@ def main() -> None:
                 old = baseline.get(rid)
                 if old is None:
                     continue
-                cur_shortlisted = bool(row.get("shortlisted") or False)
+                cur_shortlisted = bool(row.get("shortlist") or False)
                 cur_note = str(row.get("shortlist_note") or "").strip()
-                old_shortlisted = bool(old.get("shortlisted") or False)
+                old_shortlisted = bool(old.get("shortlist") or False)
                 old_note = str(old.get("note") or "").strip()
                 if old_shortlisted != cur_shortlisted or old_note != cur_note:
                     changed_flags[rid] = cur_shortlisted
@@ -18421,14 +19518,19 @@ def main() -> None:
 
         if changed_flags:
             try:
-                set_user_run_shortlists(user_id, changed_flags, run_id_to_note=changed_notes)
-                did_shortlist_change = True
-                for rid in changed_flags.keys():
+                for rid, flag in changed_flags.items():
+                    update_run_shortlist_fields(
+                        rid,
+                        shortlist=bool(flag),
+                        shortlist_note=str(changed_notes.get(rid) or "").strip(),
+                        user_id=user_id,
+                    )
                     baseline[rid] = {
-                        "shortlisted": bool(changed_flags.get(rid)),
+                        "shortlist": bool(flag),
                         "note": str(changed_notes.get(rid) or "").strip(),
                     }
                 st.session_state[baseline_key] = baseline
+                did_shortlist_change = True
             except Exception as exc:
                 st.error(f"Failed to persist shortlist changes: {exc}")
 
@@ -18550,12 +19652,13 @@ def main() -> None:
     if current_page == "Candle Cache":
         st.subheader("Candle cache")
         tz = _ui_display_tz()
-        exchange_options = ["woo", "binance", "bybit", "okx", "kraken", "Custom…"]
+        exchange_options = ["woox", "binance", "bybit", "okx", "kraken", "Custom…"]
         exchange_choice = st.selectbox("Exchange", exchange_options, index=0, key="cache_exchange_choice")
         if exchange_choice == "Custom…":
-            exchange_id = st.text_input("Custom exchange id", value="woo", key="cache_exchange_custom")
+            exchange_id = st.text_input("Custom exchange id", value="woox", key="cache_exchange_custom")
         else:
             exchange_id = exchange_choice
+        exchange_id = normalize_exchange_id(exchange_id) or (str(exchange_id or "").strip().lower())
 
         markets: dict = {}
         exchange_timeframes: list[str] = []
@@ -18753,6 +19856,11 @@ def main() -> None:
             else:
                 cols[11].write("")
 
+            err_text = str(job.get("error_text") or "").strip()
+            if err_text:
+                with st.expander(f"Job #{job_id} error", expanded=False):
+                    st.code(err_text)
+
             if allow_cancel and status in {"queued", "running", "cancel_requested"}:
                 if cols[12].button("Cancel", key=f"cancel_job_{job_id}"):
                     with _job_conn() as conn:
@@ -18947,27 +20055,30 @@ def main() -> None:
                     else:
                         st.info("No saved periods yet.")
 
-                    period_labels = []
-                    period_id_by_label: Dict[str, int] = {}
+                    period_ids: list[int] = []
+                    period_rows_by_id: Dict[int, dict] = {}
                     for p in periods or []:
-                        pid = p.get("id")
-                        name = str(p.get("name") or "").strip()
-                        if pid is None or not name:
+                        try:
+                            pid = int(p.get("id"))
+                        except Exception:
                             continue
-                        label = f"{name} (#{pid})"
-                        period_labels.append(label)
-                        period_id_by_label[label] = int(pid)
+                        name = str(p.get("name") or "").strip()
+                        if not name:
+                            continue
+                        if pid not in period_rows_by_id:
+                            period_rows_by_id[pid] = p
+                            period_ids.append(pid)
 
-                    selected_label = st.selectbox(
+                    selected_id = st.selectbox(
                         "Saved periods",
-                        options=["(new)"] + period_labels,
+                        options=[None] + period_ids,
                         index=0,
                         key="settings_period_selected",
+                        format_func=lambda pid: "(new)" if pid is None else str((period_rows_by_id.get(int(pid)) or {}).get("name") or "").strip(),
                     )
-                    selected_id = period_id_by_label.get(selected_label) if selected_label != "(new)" else None
                     selected_row = None
                     if selected_id is not None:
-                        selected_row = next((p for p in periods if int(p.get("id")) == int(selected_id)), None)
+                        selected_row = period_rows_by_id.get(int(selected_id))
 
                     name_default = str((selected_row or {}).get("name") or "") if selected_row else ""
                     start_default = _normalize_timestamp((selected_row or {}).get("start_ts")) or datetime.now(timezone.utc) - timedelta(days=7)
@@ -19085,37 +20196,6 @@ def main() -> None:
                         key="settings_bbo_queue_level",
                     )
 
-                with st.container(border=True):
-                    st.markdown("### Crypto icons")
-                    st.caption(
-                        "Uses the local spothq cryptocurrency icon pack. Icons are cached in the DB for fast rendering."
-                    )
-
-                    icons_force_refresh = st.checkbox(
-                        "Force refresh cached icons",
-                        value=False,
-                        key="settings_icons_force_refresh",
-                    )
-                    if st.button("Sync missing crypto icons", key="settings_sync_crypto_icons"):
-                        repo_root = Path(__file__).resolve().parents[2]
-                        spothq_root = repo_root / "app" / "assets" / "crypto_icons" / "spothq" / "cryptocurrency-icons"
-                        try:
-                            updated = sync_symbol_icons_from_spothq_pack(
-                                conn,
-                                icons_root=str(spothq_root),
-                                force=bool(icons_force_refresh),
-                                max_updates=2000,
-                            )
-                            conn.commit()
-                            st.success(f"Synced icons for {updated} asset(s).")
-                            st.rerun()
-                        except FileNotFoundError:
-                            st.warning(
-                                "spothq icon pack not found. Ensure it exists at app/assets/crypto_icons/spothq/cryptocurrency-icons."
-                            )
-                        except Exception as exc:
-                            st.error(f"Icon sync failed: {exc}")
-
             st.markdown("---")
             if st.button("Save settings", type="primary"):
                 set_setting(conn, "live_trading_enabled", bool(live_trading_enabled_input))
@@ -19134,216 +20214,259 @@ def main() -> None:
                 st.rerun()
 
             st.markdown("---")
-            st.markdown("## Data Retention")
-            st.caption("Safely reclaim DB space by clearing large artifacts or deleting low-performing runs.")
+            with st.expander("Data Retention (Advanced)", expanded=False):
+                st.caption("Safely reclaim DB space by clearing large artifacts or deleting low-performing runs.")
 
-            # Preload sweeps list for optional filtering (lightweight columns only)
-            sweep_rows = []
-            try:
-                with open_db_connection(read_only=True) as sweeps_conn:
-                    sweep_rows = sweeps_conn.execute(
-                        "SELECT id, name FROM sweeps ORDER BY created_at DESC LIMIT 200"
-                    ).fetchall()
-                sweep_rows = [dict(r) for r in sweep_rows or []]
-            except Exception:
-                sweep_rows = []
-            sweep_options = []
-            sweep_id_by_label: Dict[str, str] = {}
-            for s in sweep_rows or []:
-                sid = str(s.get("id") or "").strip()
-                name = str(s.get("name") or "").strip()
-                if not sid:
-                    continue
-                label = f"{sid} · {name}" if name else sid
-                sweep_options.append(label)
-                sweep_id_by_label[label] = sid
+                # Defer sweep list load to keep Settings fast.
+                enable_sweep_filtering = st.checkbox(
+                    "Enable sweep filtering (loads up to 200 sweeps)",
+                    help=(
+                        "Optional: loads a sweep list so the Data Retention tools can be limited to specific sweeps. "
+                        "This is disabled by default to keep the Settings page fast (it avoids querying the sweeps table)."
+                    ),
+                    value=bool(st.session_state.get("retention_enable_sweep_filtering", False)),
+                    key="retention_enable_sweep_filtering",
+                )
 
-            with st.container(border=True):
-                st.markdown("### Delete detailed backtest data (keep basics)")
-                col_a, col_b = st.columns([1, 2])
-                with col_a:
-                    days_details = st.number_input(
-                        "Older than (days)",
-                        min_value=0,
-                        step=1,
-                        value=int(st.session_state.get("retention_details_days", 7)),
-                        key="retention_details_days",
+                sweep_options: list[str] = []
+                sweep_id_by_label: Dict[str, str] = {}
+                if enable_sweep_filtering:
+                    sweep_rows = []
+                    try:
+                        with open_db_connection(read_only=True) as sweeps_conn:
+                            sweep_rows = sweeps_conn.execute(
+                                "SELECT id, name FROM sweeps ORDER BY created_at DESC LIMIT 200"
+                            ).fetchall()
+                        sweep_rows = [dict(r) for r in sweep_rows or []]
+                    except Exception:
+                        sweep_rows = []
+                    for s in sweep_rows or []:
+                        sid = str(s.get("id") or "").strip()
+                        name = str(s.get("name") or "").strip()
+                        if not sid:
+                            continue
+                        label = f"{sid} · {name}" if name else sid
+                        sweep_options.append(label)
+                        sweep_id_by_label[label] = sid
+
+                with st.expander("Cleanup: Delete detailed backtest data (keep basics)", expanded=False):
+                    col_a, col_b = st.columns([1, 2])
+                    with col_a:
+                        days_details = st.number_input(
+                            "Older than (days)",
+                            min_value=0,
+                            step=1,
+                            value=int(st.session_state.get("retention_details_days", 7)),
+                            key="retention_details_days",
+                        )
+                    with col_b:
+                        selected_sweeps = st.multiselect(
+                            "Restrict to sweeps (optional)",
+                            options=sweep_options,
+                            disabled=(not enable_sweep_filtering),
+                            key="retention_details_sweeps",
+                        )
+                    selected_sweep_ids = [
+                        sweep_id_by_label.get(x) for x in selected_sweeps if sweep_id_by_label.get(x)
+                    ]
+
+                    preview_key = "retention_details_preview_count"
+                    refresh_preview = st.button(
+                        "Refresh preview",
+                        key="retention_details_preview_btn",
                     )
-                with col_b:
-                    selected_sweeps = st.multiselect(
+                    if refresh_preview:
+                        try:
+                            st.session_state[preview_key] = count_runs_matching_filters(
+                                older_than_days=int(days_details),
+                                sweep_ids=selected_sweep_ids,
+                                conn=conn,
+                            )
+                        except Exception:
+                            st.session_state[preview_key] = 0
+                    preview_count = st.session_state.get(preview_key)
+                    if preview_count is None:
+                        st.caption("Runs affected: — (click Refresh preview)")
+                    else:
+                        st.caption(f"Runs affected: {int(preview_count)}")
+
+                    confirm_details = st.text_input(
+                        "Type DELETE DETAILS to confirm",
+                        value="",
+                        key="retention_confirm_details",
+                    )
+                    if st.button(
+                        "Delete detailed data",
+                        type="primary",
+                        disabled=(confirm_details.strip() != "DELETE DETAILS"),
+                        key="retention_delete_details_btn",
+                    ):
+                        try:
+                            res = clear_run_details_payloads(
+                                older_than_days=int(days_details),
+                                sweep_ids=selected_sweep_ids,
+                            )
+                            st.success(f"Cleared details for {int(res.get('details_updated') or 0)} run(s).")
+                        except Exception as exc:
+                            st.error(f"Retention failed: {exc}")
+
+                with st.expander("Cleanup: Delete low-profit runs", expanded=False):
+                    r1, r2, r3 = st.columns([1, 1, 1])
+                    with r1:
+                        profit_threshold = st.number_input(
+                            "Profit threshold (USD)",
+                            value=float(st.session_state.get("retention_profit_threshold", 0.0)),
+                            step=1.0,
+                            key="retention_profit_threshold",
+                        )
+                    with r2:
+                        days_low_profit = st.number_input(
+                            "Older than (days)",
+                            min_value=0,
+                            step=1,
+                            value=int(st.session_state.get("retention_lowprofit_days", 14)),
+                            key="retention_lowprofit_days",
+                        )
+                    with r3:
+                        only_completed = st.toggle(
+                            "Only completed runs",
+                            value=bool(st.session_state.get("retention_only_completed", True)),
+                            key="retention_only_completed",
+                        )
+
+                    roi_enabled = st.toggle(
+                        "Apply ROI threshold",
+                        value=bool(st.session_state.get("retention_roi_enabled", False)),
+                        key="retention_roi_enabled",
+                    )
+                    roi_threshold = None
+                    if roi_enabled:
+                        roi_threshold = st.number_input(
+                            "ROI threshold (%)",
+                            value=float(st.session_state.get("retention_roi_threshold", 0.0)),
+                            step=0.5,
+                            key="retention_roi_threshold",
+                        )
+
+                    selected_sweeps_low = st.multiselect(
                         "Restrict to sweeps (optional)",
                         options=sweep_options,
-                        key="retention_details_sweeps",
+                        disabled=(not enable_sweep_filtering),
+                        key="retention_lowprofit_sweeps",
                     )
-                selected_sweep_ids = [sweep_id_by_label.get(x) for x in selected_sweeps if sweep_id_by_label.get(x)]
+                    selected_sweep_ids_low = [
+                        sweep_id_by_label.get(x) for x in selected_sweeps_low if sweep_id_by_label.get(x)
+                    ]
 
-                preview_key = "retention_details_preview_count"
-                refresh_preview = st.button(
-                    "Refresh preview",
-                    key="retention_details_preview_btn",
-                )
-                if refresh_preview:
-                    try:
-                        st.session_state[preview_key] = count_runs_matching_filters(
-                            older_than_days=int(days_details),
-                            sweep_ids=selected_sweep_ids,
-                            conn=conn,
-                        )
-                    except Exception:
-                        st.session_state[preview_key] = 0
-                preview_count = st.session_state.get(preview_key)
-                if preview_count is None:
-                    st.caption("Runs affected: — (click Refresh preview)")
-                else:
-                    st.caption(f"Runs affected: {int(preview_count)}")
-
-                confirm_details = st.text_input(
-                    "Type DELETE DETAILS to confirm",
-                    value="",
-                    key="retention_confirm_details",
-                )
-                if st.button(
-                    "Delete detailed data",
-                    type="primary",
-                    disabled=(confirm_details.strip() != "DELETE DETAILS"),
-                    key="retention_delete_details_btn",
-                ):
-                    try:
-                        res = clear_run_details_payloads(
-                            older_than_days=int(days_details),
-                            sweep_ids=selected_sweep_ids,
-                        )
-                        st.success(
-                            f"Cleared details for {int(res.get('details_updated') or 0)} run(s)."
-                        )
-                    except Exception as exc:
-                        st.error(f"Retention failed: {exc}")
-
-            with st.container(border=True):
-                st.markdown("### Delete low-profit runs")
-                r1, r2, r3 = st.columns([1, 1, 1])
-                with r1:
-                    profit_threshold = st.number_input(
-                        "Profit threshold (USD)",
-                        value=float(st.session_state.get("retention_profit_threshold", 0.0)),
-                        step=1.0,
-                        key="retention_profit_threshold",
+                    preview_key_low = "retention_lowprofit_preview_count"
+                    refresh_preview_low = st.button(
+                        "Refresh preview",
+                        key="retention_lowprofit_preview_btn",
                     )
-                with r2:
-                    days_low_profit = st.number_input(
-                        "Older than (days)",
-                        min_value=0,
-                        step=1,
-                        value=int(st.session_state.get("retention_lowprofit_days", 14)),
-                        key="retention_lowprofit_days",
+                    if refresh_preview_low:
+                        try:
+                            st.session_state[preview_key_low] = count_runs_matching_filters(
+                                older_than_days=int(days_low_profit),
+                                sweep_ids=selected_sweep_ids_low,
+                                max_profit=float(profit_threshold),
+                                roi_threshold_pct=(float(roi_threshold) if roi_threshold is not None else None),
+                                only_completed=bool(only_completed),
+                                conn=conn,
+                            )
+                        except Exception:
+                            st.session_state[preview_key_low] = 0
+                    preview_low = st.session_state.get(preview_key_low)
+                    if preview_low is None:
+                        st.caption("Runs to delete: — (click Refresh preview)")
+                    else:
+                        st.caption(f"Runs to delete: {int(preview_low)}")
+
+                    confirm_runs = st.text_input(
+                        "Type DELETE RUNS to confirm",
+                        value="",
+                        key="retention_confirm_runs",
                     )
-                with r3:
-                    only_completed = st.toggle(
-                        "Only completed runs",
-                        value=bool(st.session_state.get("retention_only_completed", True)),
-                        key="retention_only_completed",
-                    )
-
-                roi_enabled = st.toggle(
-                    "Apply ROI threshold",
-                    value=bool(st.session_state.get("retention_roi_enabled", False)),
-                    key="retention_roi_enabled",
-                )
-                roi_threshold = None
-                if roi_enabled:
-                    roi_threshold = st.number_input(
-                        "ROI threshold (%)",
-                        value=float(st.session_state.get("retention_roi_threshold", 0.0)),
-                        step=0.5,
-                        key="retention_roi_threshold",
-                    )
-
-                selected_sweeps_low = st.multiselect(
-                    "Restrict to sweeps (optional)",
-                    options=sweep_options,
-                    key="retention_lowprofit_sweeps",
-                )
-                selected_sweep_ids_low = [
-                    sweep_id_by_label.get(x) for x in selected_sweeps_low if sweep_id_by_label.get(x)
-                ]
-
-                preview_key_low = "retention_lowprofit_preview_count"
-                refresh_preview_low = st.button(
-                    "Refresh preview",
-                    key="retention_lowprofit_preview_btn",
-                )
-                if refresh_preview_low:
-                    try:
-                        st.session_state[preview_key_low] = count_runs_matching_filters(
-                            older_than_days=int(days_low_profit),
-                            sweep_ids=selected_sweep_ids_low,
-                            max_profit=float(profit_threshold),
-                            roi_threshold_pct=(float(roi_threshold) if roi_threshold is not None else None),
-                            only_completed=bool(only_completed),
-                            conn=conn,
-                        )
-                    except Exception:
-                        st.session_state[preview_key_low] = 0
-                preview_low = st.session_state.get(preview_key_low)
-                if preview_low is None:
-                    st.caption("Runs to delete: — (click Refresh preview)")
-                else:
-                    st.caption(f"Runs to delete: {int(preview_low)}")
-
-                confirm_runs = st.text_input(
-                    "Type DELETE RUNS to confirm",
-                    value="",
-                    key="retention_confirm_runs",
-                )
-                if st.button(
-                    "Delete low-profit runs",
-                    type="primary",
-                    disabled=(confirm_runs.strip() != "DELETE RUNS"),
-                    key="retention_delete_runs_btn",
-                ):
-                    try:
-                        res = delete_runs_and_children(
-                            older_than_days=int(days_low_profit),
-                            sweep_ids=selected_sweep_ids_low,
-                            max_profit=float(profit_threshold),
-                            roi_threshold_pct=(float(roi_threshold) if roi_threshold is not None else None),
-                            only_completed=bool(only_completed),
-                            batch_size=500,
-                        )
-                        st.success(
-                            "Deleted runs. "
-                            f"runs={int(res.get('runs_deleted') or 0)}, "
-                            f"details={int(res.get('details_deleted') or 0)}, "
-                            f"shortlists={int(res.get('shortlists_deleted') or 0)}, "
-                            f"bot_map={int(res.get('bot_run_map_deleted') or 0)}"
-                        )
-                    except Exception as exc:
-                        st.error(f"Delete failed: {exc}")
+                    if st.button(
+                        "Delete low-profit runs",
+                        type="primary",
+                        disabled=(confirm_runs.strip() != "DELETE RUNS"),
+                        key="retention_delete_runs_btn",
+                    ):
+                        try:
+                            res = delete_runs_and_children(
+                                older_than_days=int(days_low_profit),
+                                sweep_ids=selected_sweep_ids_low,
+                                max_profit=float(profit_threshold),
+                                roi_threshold_pct=(float(roi_threshold) if roi_threshold is not None else None),
+                                only_completed=bool(only_completed),
+                                batch_size=500,
+                            )
+                            st.success(
+                                "Deleted runs. "
+                                f"runs={int(res.get('runs_deleted') or 0)}, "
+                                f"details={int(res.get('details_deleted') or 0)}, "
+                                f"shortlists={int(res.get('shortlists_deleted') or 0)}, "
+                                f"bot_map={int(res.get('bot_run_map_deleted') or 0)}"
+                            )
+                        except Exception as exc:
+                            st.error(f"Delete failed: {exc}")
 
             st.markdown("---")
             st.markdown("## Assets")
             st.caption("Manage symbols and user-defined categories for multi-asset sweeps.")
 
-            # Exchange selector (simple): default to CCXT 'woo' but include any seen exchanges.
+            with st.container(border=True):
+                st.markdown("### Crypto icons")
+                st.caption("Uses the local spothq cryptocurrency icon pack. Icons are cached in the DB for fast rendering.")
+
+                icons_force_refresh = st.checkbox(
+                    "Force refresh cached icons",
+                    value=False,
+                    key="assets_icons_force_refresh",
+                )
+                if st.button("Sync missing crypto icons", key="assets_sync_crypto_icons"):
+                    repo_root = Path(__file__).resolve().parents[2]
+                    spothq_root = repo_root / "app" / "assets" / "crypto_icons" / "spothq" / "cryptocurrency-icons"
+                    try:
+                        updated = sync_symbol_icons_from_spothq_pack(
+                            conn,
+                            icons_root=str(spothq_root),
+                            force=bool(icons_force_refresh),
+                            max_updates=2000,
+                        )
+                        conn.commit()
+                        st.success(f"Synced icons for {updated} asset(s).")
+                        st.rerun()
+                    except FileNotFoundError:
+                        st.warning(
+                            "spothq icon pack not found. Ensure it exists at app/assets/crypto_icons/spothq/cryptocurrency-icons."
+                        )
+                    except Exception as exc:
+                        st.error(f"Icon sync failed: {exc}")
+
+            # Exchange selector (canonical): prefer 'woox' and dedupe aliases.
             try:
                 with open_db_connection(read_only=True) as _conn:
                     ex_rows = _conn.execute("SELECT DISTINCT exchange_id FROM assets ORDER BY exchange_id").fetchall()
                 exchange_seen = [str(r[0]) for r in ex_rows or [] if r and str(r[0] or "").strip()]
             except Exception:
                 exchange_seen = []
-            exchange_defaults = ["woo", "woox"]
-            exchange_options = []
+            exchange_defaults = ["woox"]
+            exchange_options: list[str] = []
             for x in exchange_defaults + exchange_seen:
-                if x not in exchange_options:
-                    exchange_options.append(x)
+                nx = normalize_exchange_id(x) or str(x or "").strip().lower()
+                if not nx:
+                    continue
+                if nx not in exchange_options:
+                    exchange_options.append(nx)
 
             selected_exchange = st.selectbox(
                 "Exchange ID",
-                options=exchange_options if exchange_options else ["woo"],
+                options=exchange_options if exchange_options else ["woox"],
                 index=0,
                 key="assets_exchange_id",
             )
-            exchange_id_assets = str(selected_exchange or "").strip() or "woo"
+            exchange_id_assets = normalize_exchange_id(selected_exchange) or (str(selected_exchange or "").strip().lower() or "woox")
 
             # --- Assets table + status controls ------------------------
             if "assets_page" not in st.session_state:
