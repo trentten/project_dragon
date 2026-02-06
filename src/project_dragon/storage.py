@@ -6743,7 +6743,6 @@ def set_job_cancel_requested(conn: Any, job_id: int, cancelled: bool) -> None:
             """,
             (now, now, jid),
         )
-        conn.commit()
         if gk:
             _ = bulk_mark_jobs_cancelled(conn, gk)
         try:
@@ -6762,6 +6761,31 @@ def set_job_cancel_requested(conn: Any, job_id: int, cancelled: bool) -> None:
             (now, jid),
         )
         conn.commit()
+
+
+def is_cancel_requested(conn: Any, job_id: int) -> bool:
+    """Return True if a job has cancel_requested set or is already cancelled."""
+
+    try:
+        jid = int(job_id)
+    except Exception:
+        return False
+    if jid <= 0:
+        return False
+    row = execute_fetchone(
+        conn,
+        "SELECT status, COALESCE(cancel_requested, 0) AS cancel_requested FROM jobs WHERE id = %s",
+        (jid,),
+    )
+    if not row:
+        return False
+    try:
+        if int(row.get("cancel_requested") or 0) == 1:
+            return True
+    except Exception:
+        pass
+    status = str(row.get("status") or "").strip().lower()
+    return status in {"cancelled", "canceled"}
 
 
 def count_jobs_by_status_for_group(conn: Any, group_key: str) -> Dict[str, int]:

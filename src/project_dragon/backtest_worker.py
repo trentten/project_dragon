@@ -8,10 +8,11 @@ import logging
 import os
 import socket
 import time
+import threading
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterable, Tuple
 
 from project_dragon.backtest_core import DataSettings, compute_analysis_window_from_snapshot, run_single_backtest
 from project_dragon.candle_cache import get_candles_analysis_window, enqueue_prefetch_analysis_window
@@ -37,6 +38,7 @@ from project_dragon.storage import (
     upsert_backtest_run_by_run_key,
     update_job,
     update_sweep_status,
+    get_cached_coverage,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,7 @@ _CANDLE_CACHE_PREFETCH_TOP_N = int(os.environ.get("DRAGON_CANDLE_CACHE_PREFETCH_
 _CANDLE_CACHE_PREFETCH_QUERY_LIMIT = 50
 _CANDLE_CACHE_PREFETCH_BUDGET_S = 2.0
 _LAST_PREFETCH_GROUP_KEY: Optional[str] = None
+_CACHE_PREFLIGHT_LOCKS: Dict[tuple[str, str, str, str], threading.Lock] = {}
 
 
 def _to_ms(value: Any) -> Optional[int]:
@@ -228,6 +231,168 @@ def _exc_text() -> str:
     import traceback
 
     return "".join(traceback.format_exception(*traceback.sys.exc_info()))
+
+
+def _parse_time_ms(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except Exception:
+            return None
+    if isinstance(value, datetime):
+        try:
+            return int(value.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            try:
+                return int(float(s))
+            except Exception:
+                return None
+    return None
+
+
+def _cache_lock_key(exchange_id: str, market_type: str, symbol: str, timeframe: str) -> tuple[str, str, str, str]:
+    return (
+        str(exchange_id or "").strip().lower(),
+        str(market_type or "").strip().lower(),
+        str(symbol or "").strip(),
+        str(timeframe or "").strip(),
+    )
+
+
+def _get_cache_lock(key: tuple[str, str, str, str]) -> threading.Lock:
+    lock = _CACHE_PREFLIGHT_LOCKS.get(key)
+    if lock is None:
+        lock = threading.Lock()
+        _CACHE_PREFLIGHT_LOCKS[key] = lock
+    return lock
+
+
+def _ensure_candle_cache(
+    *,
+    conn,
+    exchange_id: str,
+    market_type: str,
+    symbol: str,
+    timeframe: str,
+    start_ms: Optional[int],
+    end_ms: Optional[int],
+    limit: Optional[int],
+    job_id: int,
+    label: str,
+) -> Tuple[bool, str]:
+    lock_key = _cache_lock_key(exchange_id, market_type, symbol, timeframe)
+    lock = _get_cache_lock(lock_key)
+    with lock:
+        try:
+            min_ts, max_ts = get_cached_coverage(conn, exchange_id, market_type, symbol, timeframe)
+        except Exception:
+            min_ts, max_ts = None, None
+
+        coverage_ok = False
+        if start_ms is not None and end_ms is not None:
+            coverage_ok = min_ts is not None and max_ts is not None and min_ts <= start_ms and max_ts >= end_ms
+        elif start_ms is None and end_ms is not None:
+            coverage_ok = max_ts is not None and max_ts >= end_ms
+        elif start_ms is not None and end_ms is None:
+            coverage_ok = min_ts is not None and min_ts <= start_ms
+
+        if coverage_ok:
+            return True, "coverage_ok"
+
+        logger.info(
+            "cache_missing_ranges job_id=%s label=%s symbol=%s timeframe=%s start_ms=%s end_ms=%s",
+            int(job_id),
+            str(label),
+            str(symbol),
+            str(timeframe),
+            int(start_ms or 0) if start_ms is not None else None,
+            int(end_ms or 0) if end_ms is not None else None,
+        )
+        try:
+            candles = get_candles_with_cache(
+                exchange_id=exchange_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit,
+                since=start_ms,
+                until=end_ms,
+                range_mode="date range" if start_ms is not None or end_ms is not None else "bars",
+                market_type=market_type,
+            )
+            logger.info(
+                "cache_fetch_progress job_id=%s label=%s fetched=%s",
+                int(job_id),
+                str(label),
+                int(len(candles or [])),
+            )
+        except Exception as exc:
+            return False, f"fetch_failed:{exc}"
+
+        if start_ms is None and end_ms is None:
+            return True, "fetched_bars"
+
+        try:
+            min_ts, max_ts = get_cached_coverage(conn, exchange_id, market_type, symbol, timeframe)
+        except Exception:
+            min_ts, max_ts = None, None
+        if min_ts is None or max_ts is None:
+            return False, "coverage_missing"
+        if start_ms is not None and min_ts > start_ms:
+            return False, "coverage_start_missing"
+        if end_ms is not None and max_ts < end_ms:
+            return False, "coverage_end_missing"
+        return True, "coverage_ok"
+
+
+def _cancel_if_requested(
+    *,
+    conn,
+    job_id: int,
+    reason: str,
+    sweep_id: Optional[str] = None,
+) -> bool:
+    try:
+        job_row = get_job(conn, int(job_id))
+    except Exception:
+        job_row = None
+    if not isinstance(job_row, dict):
+        return False
+    status = str(job_row.get("status") or "").strip().lower()
+    try:
+        cancel_flag = int(job_row.get("cancel_requested") or 0)
+    except Exception:
+        cancel_flag = 0
+    if status != "cancel_requested" and cancel_flag != 1:
+        return False
+
+    logger.info("cancel_detected job_id=%s status=%s", int(job_id), status)
+    update_job(
+        conn,
+        int(job_id),
+        status="cancelled",
+        message=str(reason or "cancel_requested"),
+        finished_at=_now_iso(),
+    )
+    if sweep_id:
+        try:
+            update_sweep_status(str(sweep_id), "cancelled", error_message="cancel_requested")
+        except Exception:
+            pass
+    logger.info("cancel_finalized job_id=%s status=cancelled", int(job_id))
+    return True
 
 
 def _maybe_renew_job_lease(*, conn, job: Dict[str, Any], worker_id: str, lease_s: float, renew_every_s: float) -> bool:
@@ -442,6 +607,146 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
             "range_params": range_params,
         }
 
+    # --- Sweep candle cache preflight (union of symbol/timeframe pairs) ---
+    try:
+        data_source_key = str(base_data_settings.get("data_source") or "ccxt").strip().lower()
+    except Exception:
+        data_source_key = "ccxt"
+    if data_source_key == "ccxt":
+        base_exchange = str(base_data_settings.get("exchange_id") or "").strip()
+        base_symbol = str(base_data_settings.get("symbol") or "").strip()
+        base_timeframe = str(base_data_settings.get("timeframe") or "").strip() or "1h"
+        base_market_type = str(base_data_settings.get("market_type") or "unknown").strip().lower() or "unknown"
+        base_range_params = base_data_settings.get("range_params") if isinstance(base_data_settings.get("range_params"), dict) else {}
+
+        symbols: set[str] = set()
+        timeframes: set[str] = set()
+        if sweep_assets:
+            symbols.update([str(s).strip() for s in sweep_assets if str(s).strip()])
+        if base_symbol:
+            symbols.add(base_symbol)
+        if base_timeframe:
+            timeframes.add(base_timeframe)
+
+        # Include swept symbols/timeframes from data_settings meta.
+        for field_key, vals in (params or {}).items():
+            meta = field_meta.get(field_key) if isinstance(field_meta, dict) else None
+            if not isinstance(meta, dict):
+                continue
+            target = str(meta.get("target") or "").strip().lower()
+            path_raw = meta.get("path")
+            path = [str(p).strip() for p in path_raw] if isinstance(path_raw, (list, tuple)) else []
+            if target == "data_settings" and path:
+                if path[-1] == "symbol":
+                    symbols.update([str(v).strip() for v in (vals or []) if str(v).strip()])
+                if path[-1] == "timeframe":
+                    timeframes.update([str(v).strip() for v in (vals or []) if str(v).strip()])
+
+        symbols = {s for s in symbols if s}
+        timeframes = {t for t in timeframes if t}
+        if not symbols:
+            symbols = {base_symbol} if base_symbol else set()
+        if not timeframes:
+            timeframes = {base_timeframe} if base_timeframe else set()
+
+        # Derive union time window (min start, max end) if available.
+        start_candidates: list[int] = []
+        end_candidates: list[int] = []
+        if isinstance(base_range_params, dict):
+            s0 = _parse_time_ms(base_range_params.get("since"))
+            e0 = _parse_time_ms(base_range_params.get("until"))
+            if s0 is not None:
+                start_candidates.append(int(s0))
+            if e0 is not None:
+                end_candidates.append(int(e0))
+
+        for field_key, vals in (params or {}).items():
+            meta = field_meta.get(field_key) if isinstance(field_meta, dict) else None
+            if not isinstance(meta, dict):
+                continue
+            target = str(meta.get("target") or "").strip().lower()
+            path_raw = meta.get("path")
+            path = [str(p).strip() for p in path_raw] if isinstance(path_raw, (list, tuple)) else []
+            if target == "range_params" and path:
+                if path[-1] == "since":
+                    for v in (vals or []):
+                        ts = _parse_time_ms(v)
+                        if ts is not None:
+                            start_candidates.append(int(ts))
+                if path[-1] == "until":
+                    for v in (vals or []):
+                        ts = _parse_time_ms(v)
+                        if ts is not None:
+                            end_candidates.append(int(ts))
+
+        union_start = min(start_candidates) if start_candidates else None
+        union_end = max(end_candidates) if end_candidates else None
+        union_limit = None
+        try:
+            union_limit = int(base_range_params.get("limit")) if isinstance(base_range_params, dict) and base_range_params.get("limit") is not None else None
+        except Exception:
+            union_limit = None
+
+        logger.info(
+            "sweep_preflight_start job_id=%s sweep_id=%s symbols=%s timeframes=%s",
+            int(job_id),
+            str(sweep_id),
+            int(len(symbols)),
+            int(len(timeframes)),
+        )
+
+        for sym in sorted(symbols):
+            for tf in sorted(timeframes):
+                ds_snapshot = DataSettings(
+                    **{
+                        **base_data_settings,
+                        "exchange_id": base_exchange,
+                        "symbol": sym,
+                        "timeframe": tf,
+                    }
+                )
+                try:
+                    analysis_info = compute_analysis_window_from_snapshot(base_config, ds_snapshot)
+                except Exception:
+                    analysis_info = {}
+
+                start_ms = analysis_info.get("analysis_start_ms")
+                end_ms = analysis_info.get("analysis_end_ms")
+                limit_ms = analysis_info.get("analysis_limit")
+                start_ms = start_ms if start_ms is not None else union_start
+                end_ms = end_ms if end_ms is not None else union_end
+                limit_val = int(limit_ms) if limit_ms is not None else union_limit
+
+                ok, reason = _ensure_candle_cache(
+                    conn=conn,
+                    exchange_id=base_exchange,
+                    market_type=base_market_type,
+                    symbol=sym,
+                    timeframe=tf,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    limit=limit_val,
+                    job_id=job_id,
+                    label=f"sweep:{sweep_id}",
+                )
+                if not ok:
+                    update_job(conn, job_id, status="failed", error_text=f"sweep_preflight_failed:{sym}:{tf}:{reason}", finished_at=_now_iso())
+                    try:
+                        update_sweep_status(str(sweep_id), "failed", error_message=f"preflight_failed:{sym}:{tf}")
+                    except Exception:
+                        pass
+                    logger.error(
+                        "sweep_preflight_failed job_id=%s sweep_id=%s symbol=%s timeframe=%s reason=%s",
+                        int(job_id),
+                        str(sweep_id),
+                        str(sym),
+                        str(tf),
+                        str(reason),
+                    )
+                    return
+
+        logger.info("sweep_preflight_done job_id=%s sweep_id=%s", int(job_id), str(sweep_id))
+
     # Sweep assets
     sweep_assets: list[str] = []
     try:
@@ -644,6 +949,10 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
     if job_key:
         payload.setdefault("job_key", str(job_key))
 
+    # Honor cancel before starting.
+    if _cancel_if_requested(conn=conn, job_id=job_id, reason="Cancelled before start", sweep_id=payload.get("sweep_id")):
+        return
+
     # Mark started.
     update_job(conn, job_id, status="running", started_at=job.get("started_at") or _now_iso(), message="Running")
 
@@ -678,6 +987,29 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
         analysis_info = compute_analysis_window_from_snapshot(config_snapshot, data_settings)
     except Exception:
         analysis_info = {}
+
+    if str(getattr(data_settings, "data_source", "") or "").lower() != "synthetic":
+        try:
+            ok, reason = _ensure_candle_cache(
+                conn=conn,
+                exchange_id=str(getattr(data_settings, "exchange_id", "") or ""),
+                market_type=str(getattr(data_settings, "market_type", "unknown") or "unknown"),
+                symbol=str(getattr(data_settings, "symbol", "") or ""),
+                timeframe=str(getattr(data_settings, "timeframe", "") or ""),
+                start_ms=analysis_info.get("analysis_start_ms"),
+                end_ms=analysis_info.get("analysis_end_ms"),
+                limit=analysis_info.get("analysis_limit"),
+                job_id=job_id,
+                label="single_run",
+            )
+            if not ok:
+                update_job(conn, job_id, status="failed", error_text=f"preflight_failed:{reason}", finished_at=_now_iso())
+                logger.error("preflight_failed job_id=%s reason=%s", int(job_id), str(reason))
+                return
+        except Exception as exc:
+            update_job(conn, job_id, status="failed", error_text=f"preflight_error:{exc}", finished_at=_now_iso())
+            logger.exception("preflight_error job_id=%s", int(job_id))
+            return
 
     # Best-effort prefetch for new sweep groups.
     try:
@@ -727,6 +1059,10 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
         storage_symbol_override=storage_symbol_override,
         storage_timeframe_override=storage_timeframe_override,
     )
+
+    # Honor cancel before persisting results.
+    if _cancel_if_requested(conn=conn, job_id=job_id, reason="Cancelled after run", sweep_id=payload.get("sweep_id")):
+        return
 
     # Always renew before the final write.
     if not _maybe_renew_job_lease(conn=conn, job=job, worker_id=worker_id, lease_s=JOB_LEASE_S, renew_every_s=0.0):

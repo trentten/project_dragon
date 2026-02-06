@@ -120,8 +120,16 @@ Expected:
 - Sweeps (overview + runs): single-asset sweeps show the same CCXT symbol format; multi-asset/category sweeps show the category/preview without `PERP_` prefixes
 
 ## 12) Cancel job / sweep
-- Jobs: cancel a queued or running backtest job; expect status transitions to `cancel_requested`
-- Sweeps: cancel a sweep parent job; expect the sweep state to move to `Cancelling` and no NameError in logs
+- Jobs: cancel a running backtest job; expect status transitions `cancel_requested` -> `cancelled`
+- Expected logs: `cancel_detected` and `cancel_finalized`
+- UI: job does not remain stuck in `cancel_requested`
+- Sweeps: cancel a sweep parent job; expect the sweep state to move to `Cancelling` then `Cancelled` when children finish
+
+## 13) Sweep preflight candle cache
+- Start a sweep with a long date range where cache is incomplete
+- Expected logs: `sweep_preflight_start`, `cache_missing_ranges`, `cache_fetch_progress`, `sweep_preflight_done`
+- Children start only after preflight succeeds (no hang)
+- If preflight fails, sweep ends in `failed` with the symbol/timeframe in the error
 
 ## Notes
 - Always start with tiny sizing and `--dry-run` until you trust the behavior.
