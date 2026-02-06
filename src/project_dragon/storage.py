@@ -649,13 +649,13 @@ def upsert_backtest_run_details(conn: Any, columns: Sequence[str], values: Seque
 
 def _ensure_schema_migrations(conn: Any) -> None:
     conn.execute(
-        f"""
+        """
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             applied_at TEXT NOT NULL
         )
-        f"""
+        """
     )
 
 
@@ -1687,7 +1687,10 @@ def apply_migrations(conn: Any, *, use_lock: bool = True) -> None:
                 if int(version) in applied:
                     continue
                 with _tx_context():
-                    fn(conn)
+                    try:
+                        fn(conn)
+                    except Exception as exc:
+                        raise RuntimeError(f"migration {version}:{name} failed") from exc
                     conn.execute(
                         "INSERT INTO schema_migrations(version, name, applied_at) VALUES (%s, %s, %s)",
                         (int(version), str(name), now_utc_iso()),
