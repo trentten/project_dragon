@@ -15,6 +15,11 @@ from .storage import (
     open_db_connection,
     upsert_candles,
 )
+from .exchange_normalization import (
+    canonical_exchange_id,
+    canonical_symbol,
+    exchange_id_for_ccxt,
+)
 
 
 def timeframe_to_milliseconds(timeframe: str) -> int:
@@ -78,7 +83,6 @@ def woox_symbol_to_ccxt_symbol(woox_symbol: str) -> Tuple[str, str]:
 
 
 _WOOX_MARKETS_CACHE: dict[str, tuple[float, dict[str, dict], list[str]]] = {}
-
 
 
 def _woox_get(path: str, params: dict) -> dict:
@@ -286,7 +290,12 @@ def load_ccxt_candles(
 
     For WooX: uses WooX V3 public klines (no ccxt network calls).
     """
-    is_woox = str(exchange_id).lower() in {"woox", "woo-x", "woo_x", "woo"}
+    ex_norm = canonical_exchange_id(exchange_id)
+    is_woox = ex_norm == "woox"
+
+    sym_in = str(symbol or "").strip()
+    if is_woox:
+        sym_in = canonical_symbol(ex_norm, sym_in)
 
     ms_per_bar = timeframe_to_milliseconds(timeframe)
 
@@ -307,9 +316,7 @@ def load_ccxt_candles(
     if not is_woox:
         # ...existing code...
         # (leave non-WooX behavior as-is for now)
-        ccxt_exchange_id = (
-            "woo" if str(exchange_id).lower() in {"woox", "woo-x", "woo_x"} else exchange_id
-        )
+        ccxt_exchange_id = exchange_id_for_ccxt(exchange_id)
         exchange_class = getattr(ccxt, ccxt_exchange_id)
         exchange = exchange_class()
 
@@ -350,8 +357,13 @@ def load_ccxt_candles(
         return candles
 
     # WooX path (public REST)
-    mt = infer_market_type(symbol, market_type)
-    woox_symbol = ccxt_symbol_to_woox_symbol(symbol, mt)
+    sym_up = str(sym_in or "").strip().upper()
+    if sym_up.startswith("PERP_") or sym_up.startswith("SPOT_"):
+        woox_symbol = sym_up
+        mt = "perps" if sym_up.startswith("PERP_") else "spot"
+    else:
+        mt = infer_market_type(sym_in, market_type)
+        woox_symbol = ccxt_symbol_to_woox_symbol(sym_in, mt)
 
     since_ms = _to_ms(since)
     until_ms = _to_ms(until)
@@ -471,10 +483,16 @@ def load_ccxt_ticker(exchange_id: str, symbol: str) -> dict:
 
     Returns the raw ccxt ticker dict. Callers should be defensive about shape.
     """
-    ccxt_exchange_id = "woo" if str(exchange_id).lower() in {"woox", "woo-x", "woo_x"} else exchange_id
+    ccxt_exchange_id = exchange_id_for_ccxt(exchange_id)
     exchange_class = getattr(ccxt, ccxt_exchange_id)
     exchange = exchange_class()
-    return exchange.fetch_ticker(symbol)
+    sym = str(symbol or "").strip()
+    try:
+        if canonical_exchange_id(exchange_id) == "woox" and sym.upper().startswith(("PERP_", "SPOT_")):
+            sym, _mt = woox_symbol_to_ccxt_symbol(sym)
+    except Exception:
+        pass
+    return exchange.fetch_ticker(sym)
 
 
 def _to_ms(value: Optional[float | int | datetime]) -> Optional[int]:
@@ -507,12 +525,14 @@ def get_candles_with_cache(
     start_ms = _to_ms(since)
     end_ms = _to_ms(until)
     market_type = (market_type or "unknown").lower()
+    ex_norm = canonical_exchange_id(exchange_id)
+    sym_norm = canonical_symbol(ex_norm, str(symbol or "").strip())
 
     # Fast path: bar-count fetches without explicit range -> fetch fresh and cache.
     if range_mode == "bars" and start_ms is None and end_ms is None:
         fetched = load_ccxt_candles(
-            exchange_id,
-            symbol,
+            ex_norm,
+            sym_norm,
             timeframe,
             limit=limit,
             since=None,
@@ -521,11 +541,11 @@ def get_candles_with_cache(
             market_type=market_type,
         )
         with open_db_connection() as conn:
-            upsert_candles(conn, exchange_id, market_type, symbol, timeframe, fetched)
+            upsert_candles(conn, ex_norm, market_type, sym_norm, timeframe, fetched)
         return fetched
 
     with open_db_connection() as conn:
-        min_ts, max_ts = get_cached_coverage(conn, exchange_id, market_type, symbol, timeframe)
+        min_ts, max_ts = get_cached_coverage(conn, ex_norm, market_type, sym_norm, timeframe)
         coverage_ok = False
         if start_ms is not None and end_ms is not None:
             coverage_ok = min_ts is not None and max_ts is not None and min_ts <= start_ms and max_ts >= end_ms
@@ -557,8 +577,8 @@ def get_candles_with_cache(
 
         def _fetch_and_upsert(fetch_limit: Optional[int]) -> None:
             fetched = load_ccxt_candles(
-                exchange_id,
-                symbol,
+                ex_norm,
+                sym_norm,
                 timeframe,
                 limit=fetch_limit,
                 since=start_ms,
@@ -566,12 +586,12 @@ def get_candles_with_cache(
                 range_mode=range_mode,
                 market_type=market_type,
             )
-            upsert_candles(conn, exchange_id, market_type, symbol, timeframe, fetched)
+            upsert_candles(conn, ex_norm, market_type, sym_norm, timeframe, fetched)
 
         if not coverage_ok:
             _fetch_and_upsert(limit)
 
-        rows = load_cached_range(conn, exchange_id, market_type, symbol, timeframe, start_ms, end_ms)
+        rows = load_cached_range(conn, ex_norm, market_type, sym_norm, timeframe, start_ms, end_ms)
 
         # Repair path: earlier versions could populate the cache with a truncated slice (e.g. default 1000 bars)
         # while still having min/max timestamps that make coverage appear OK.
@@ -587,7 +607,7 @@ def get_candles_with_cache(
             if desired is not None:
                 desired = min(max(desired, int(limit or 1)), 250_000)
             _fetch_and_upsert(desired)
-            rows = load_cached_range(conn, exchange_id, market_type, symbol, timeframe, start_ms, end_ms)
+            rows = load_cached_range(conn, ex_norm, market_type, sym_norm, timeframe, start_ms, end_ms)
 
     candles: List[Candle] = []
     for row in rows:

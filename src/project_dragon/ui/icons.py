@@ -54,6 +54,13 @@ def _repo_root() -> Path:
             if (parent / "app" / "assets" / "ui_icons" / "tabler").exists():
                 return parent
 
+    for fallback in (Path("/app"), Path("/workspaces/project_dragon")):
+        try:
+            if (fallback / "app" / "assets" / "ui_icons" / "tabler").exists():
+                return fallback
+        except Exception:
+            pass
+
     return Path(__file__).resolve().parents[3]
 
 
@@ -67,6 +74,19 @@ def tabler_assets_available() -> bool:
         return root.exists()
     except Exception:
         return False
+
+
+def tabler_icon_inventory() -> dict[str, int]:
+    counts: dict[str, int] = {"filled": 0, "outline": 0}
+    try:
+        root = _tabler_root()
+        for variant in ("filled", "outline"):
+            p = root / variant
+            if p.exists():
+                counts[variant] = len(list(p.glob("*.svg")))
+    except Exception:
+        pass
+    return counts
 
 
 def _read_text(path: Path) -> str:

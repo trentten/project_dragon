@@ -76,6 +76,15 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                         color: {text};
                     }}
 
+                    /* Reduce top padding in main content and sidebar for a tighter layout */
+                    div[data-testid="stAppViewContainer"] .block-container {{
+                        padding-top: 0.6rem;
+                        padding-bottom: 1rem;
+                    }}
+                    section[data-testid="stSidebar"] > div {{
+                        padding-top: 0.5rem;
+                    }}
+
                     header[data-testid="stHeader"] {{
                         background-color: {app_bg};
                     }}
@@ -83,6 +92,18 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                     section[data-testid="stSidebar"] {{
                         background-color: {sidebar_bg};
                         border-right: 1px solid {border};
+                    }}
+
+                    /* Reduce top padding/margins for a tighter layout */
+                    div.block-container {{
+                        padding-top: 0.6rem;
+                        padding-bottom: 0.9rem;
+                    }}
+                    section[data-testid="stSidebar"] > div:first-child {{
+                        padding-top: 0.6rem;
+                    }}
+                    header[data-testid="stHeader"] {{
+                        height: 2.5rem;
                     }}
 
                     /* Bordered containers (cards) */
@@ -416,6 +437,18 @@ def inject_trade_stream_css(max_width_px: int = 1920) -> None:
                                     height: 100%;
                                     background: rgba(248,81,73,0.55);
                                 }}
+                    /* ---- AG Grid dark background (avoid white gap when few rows) ---- */
+                    .ag-root-wrapper,
+                    .ag-root-wrapper-body,
+                    .ag-body,
+                    .ag-body-viewport,
+                    .ag-center-cols-viewport,
+                    .ag-center-cols-container,
+                    .ag-row,
+                    .ag-row-odd,
+                    .ag-row-even {{
+                        background-color: #1D2737 !important;
+                    }}
         </style>
         """,
         unsafe_allow_html=True,

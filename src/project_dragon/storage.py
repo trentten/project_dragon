@@ -22,6 +22,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_
 from uuid import uuid4
 
 from project_dragon.observability import profile_span
+from project_dragon.exchange_normalization import (
+    canonical_exchange_id,
+    canonical_symbol,
+    exchange_ids_for_query,
+)
+from project_dragon.ui_formatters import format_duration_dhm
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +81,7 @@ _DB_INITIALIZED_FOR: Optional[str] = None
 _DB_INITIALIZED_VERSION: Optional[int] = None
 _AUTO_MIGRATE_WARNED: bool = False
 _SCHEMA_DDL_ALLOWED: bool = False
+_SCHEMA_VALIDATED: bool = False
 
 
 DEFAULT_USER_EMAIL = "admin@local"
@@ -85,7 +92,66 @@ _UNSET: object = object()
 
 def get_database_url() -> Optional[str]:
     raw = (os.getenv("DRAGON_DATABASE_URL") or "").strip()
+    if raw:
+        return raw
+
+    # Convenience for local `streamlit run`: try to load DRAGON_DATABASE_URL
+    # from common env files if it wasn't exported into the process.
+    _maybe_load_local_dotenv()
+    raw = (os.getenv("DRAGON_DATABASE_URL") or "").strip()
     return raw or None
+
+
+def _maybe_load_local_dotenv() -> None:
+    """Best-effort load env vars from local .env files.
+
+    This is intentionally minimal (no external deps) and only sets variables
+    that are missing from the current process environment.
+    """
+
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        return
+
+    candidates = [
+        repo_root / ".env",
+        repo_root / "deploy" / "portainer" / ".env",
+    ]
+
+    for p in candidates:
+        _load_env_file_if_present(p)
+
+
+def _load_env_file_if_present(path: Path) -> None:
+    try:
+        if not path.exists() or not path.is_file():
+            return
+        content = path.read_text(encoding="utf-8")
+    except Exception:
+        return
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+
+        # Do not override already-present env.
+        if (os.environ.get(key) or "").strip():
+            continue
+
+        v = val.strip()
+        if len(v) >= 2 and ((v[0] == v[-1]) and v[0] in {"\"", "'"}):
+            v = v[1:-1]
+        os.environ[key] = v
 
 
 def _truthy_env(var_name: str) -> bool:
@@ -96,12 +162,15 @@ def _auto_migrate_enabled() -> bool:
     global _AUTO_MIGRATE_WARNED
     env = (os.getenv("DRAGON_ENV") or "prod").strip().lower()
     auto = _truthy_env("DRAGON_AUTO_MIGRATE")
+    if auto and not _AUTO_MIGRATE_WARNED:
+        logger.warning("DRAGON_AUTO_MIGRATE is ignored; migrations must be run via db_migrate")
+        _AUTO_MIGRATE_WARNED = True
     if env == "prod" and auto:
         if not _AUTO_MIGRATE_WARNED:
             logger.warning("DRAGON_AUTO_MIGRATE ignored in prod")
             _AUTO_MIGRATE_WARNED = True
         return False
-    return env == "dev" and auto
+    return False
 
 
 @contextmanager
@@ -229,6 +298,47 @@ def is_postgres(conn: Any) -> bool:
     if conn is None:
         return False
     return bool(getattr(conn, "_is_postgres", False))
+
+
+_DSN_PASS_RE = re.compile(r"://([^:/@]+):([^@]+)@")
+
+
+def _sanitize_dsn(dsn: str) -> str:
+    if not dsn:
+        return ""
+    return _DSN_PASS_RE.sub(r"://\\1:***@", dsn)
+
+
+def describe_db_identity(conn: Any) -> Dict[str, Any]:
+    """Best-effort DB identity for diagnostics (sanitized)."""
+
+    raw = getattr(conn, "_conn", None) or conn
+    out: Dict[str, Any] = {}
+    try:
+        if is_postgres(conn):
+            dsn = ""
+            try:
+                dsn = str(getattr(raw, "dsn", "") or "")
+            except Exception:
+                dsn = ""
+            if not dsn:
+                try:
+                    info = getattr(raw, "info", None)
+                    dsn = str(getattr(info, "dsn", "") or "") if info is not None else ""
+                except Exception:
+                    dsn = ""
+            out["kind"] = "postgres"
+            out["dsn"] = _sanitize_dsn(dsn or (get_database_url() or ""))
+            return out
+    except Exception:
+        pass
+    # Fallback: report sanitized DSN from env if available
+    try:
+        out["kind"] = "unknown"
+        out["dsn"] = _sanitize_dsn(str(get_database_url() or ""))
+    except Exception:
+        out["kind"] = "unknown"
+    return out
 
 
 def _row_to_dict(cursor: Any, row: Any) -> Dict[str, Any]:
@@ -539,13 +649,13 @@ def upsert_backtest_run_details(conn: Any, columns: Sequence[str], values: Seque
 
 def _ensure_schema_migrations(conn: Any) -> None:
     conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             applied_at TEXT NOT NULL
         )
-        """
+        f"""
     )
 
 
@@ -1178,6 +1288,355 @@ def _migration_0011_saved_periods(conn: Any) -> None:
     execute_optional(conn, "CREATE INDEX IF NOT EXISTS idx_saved_periods_user_updated ON saved_periods(user_id, updated_at DESC)")
 
 
+def _canonicalize_woox_identity(conn: Any) -> Dict[str, int]:
+    """Best-effort Woo/WooX normalization (data only, no DDL)."""
+
+    aliases = ["woo", "woox", "woo-x", "woo_x"]
+    canonical = "woox"
+    stats: Dict[str, int] = {}
+
+    # --- Simple exchange_id rewrites ---------------------------------
+    for table in ("bots", "sweeps", "exchange_credentials", "jobs", "trading_accounts"):
+        if not _table_exists(conn, table):
+            continue
+        try:
+            cols = get_table_columns(conn, table)
+        except Exception:
+            cols = set()
+        if "exchange_id" not in cols:
+            continue
+        try:
+            cur = conn.execute(
+                f"UPDATE {table} SET exchange_id = %s WHERE exchange_id IN ({sql_placeholders(conn, len(aliases))})",
+                tuple([canonical] + aliases),
+            )
+            stats[f"{table}_exchange_id"] = int(getattr(cur, "rowcount", 0) or 0)
+        except Exception:
+            stats[f"{table}_exchange_id"] = stats.get(f"{table}_exchange_id", 0)
+
+    # Candle cache: keep it simple (delete and rebuild on-demand).
+    if _table_exists(conn, "candles_cache"):
+        try:
+            cur = conn.execute(
+                f"DELETE FROM candles_cache WHERE exchange_id IN ({sql_placeholders(conn, len(aliases))})",
+                tuple(aliases),
+            )
+            stats["candles_cache_deleted"] = int(getattr(cur, "rowcount", 0) or 0)
+        except Exception:
+            stats["candles_cache_deleted"] = stats.get("candles_cache_deleted", 0)
+
+    # --- Assets: canonicalize + dedupe --------------------------------
+    if _table_exists(conn, "assets"):
+        try:
+            rows = execute_fetchall(
+                conn,
+                f"""
+                SELECT id, exchange_id, symbol, base_asset, quote_asset, status, created_at, updated_at
+                FROM assets
+                WHERE exchange_id IN ({sql_placeholders(conn, len(aliases))})
+                """,
+                tuple(aliases),
+            )
+        except Exception:
+            rows = []
+
+        def _dt_score(iso: Any) -> float:
+            try:
+                if isinstance(iso, str) and iso.strip():
+                    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return 0.0
+            return 0.0
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for r in rows or []:
+            d = dict(r)
+            sym = canonical_symbol(canonical, str(d.get("symbol") or "").strip())
+            if not sym:
+                continue
+            d["_canon_symbol"] = sym
+            grouped.setdefault(sym, []).append(d)
+
+        deleted_assets = 0
+        updated_assets = 0
+        for canon_sym, items in grouped.items():
+            # Choose keeper: prefer already-canonical exchange_id, active status, latest updated_at.
+            def _keeper_key(it: dict[str, Any]) -> tuple[int, int, float, int]:
+                ex_pref = 1 if str(it.get("exchange_id") or "").strip().lower() == canonical else 0
+                active_pref = 1 if str(it.get("status") or "").strip().lower() == "active" else 0
+                ts = _dt_score(it.get("updated_at"))
+                try:
+                    iid = int(it.get("id") or 0)
+                except Exception:
+                    iid = 0
+                return (ex_pref, active_pref, ts, -iid)
+
+            keeper = max(items, key=_keeper_key)
+            keeper_id = int(keeper.get("id") or 0)
+
+            # Delete non-keepers first (avoids UNIQUE(exchange_id, symbol) collisions on UPDATE).
+            delete_ids = [int(it.get("id") or 0) for it in items if int(it.get("id") or 0) != keeper_id]
+            if delete_ids:
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM assets WHERE id IN ({sql_placeholders(conn, len(delete_ids))})",
+                        tuple(delete_ids),
+                    )
+                    deleted_assets += int(getattr(cur, "rowcount", 0) or 0)
+                except Exception:
+                    pass
+
+            # Update keeper to canonical exchange + canonical symbol.
+            b, q = _parse_exchange_symbol_assets(canon_sym)
+            base_norm = (b.strip().upper() if isinstance(b, str) and b.strip() else None)
+            quote_norm = (q.strip().upper() if isinstance(q, str) and q.strip() else None)
+            st = str(keeper.get("status") or "active").strip().lower() or "active"
+            if st not in {"active", "disabled"}:
+                st = "active"
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE assets
+                    SET exchange_id = %s,
+                        symbol = %s,
+                        base_asset = COALESCE(%s, base_asset),
+                        quote_asset = COALESCE(%s, quote_asset),
+                        status = COALESCE(%s, status),
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        canonical,
+                        canon_sym,
+                        base_norm,
+                        quote_norm,
+                        st,
+                        now_utc_iso(),
+                        keeper_id,
+                    ),
+                )
+                updated_assets += int(getattr(cur, "rowcount", 0) or 0)
+            except Exception:
+                pass
+
+        stats["assets_deleted"] = deleted_assets
+        stats["assets_updated"] = updated_assets
+
+    # --- Asset categories + membership: canonicalize + merge ------------
+    category_id_map: dict[int, int] = {}
+    dup_category_ids: list[int] = []
+
+    if _table_exists(conn, "asset_categories"):
+        try:
+            cat_rows = execute_fetchall(
+                conn,
+                f"""
+                SELECT id, user_id, exchange_id, name, updated_at
+                FROM asset_categories
+                WHERE exchange_id IN ({sql_placeholders(conn, len(aliases))})
+                """,
+                tuple(aliases),
+            )
+        except Exception:
+            cat_rows = []
+
+        grouped_cats: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for r in cat_rows or []:
+            d = dict(r)
+            key = (str(d.get("user_id") or ""), str(d.get("name") or ""))
+            if not key[0] or not key[1]:
+                continue
+            grouped_cats.setdefault(key, []).append(d)
+
+        for (_uid, _name), items in grouped_cats.items():
+            def _cat_key(it: dict[str, Any]) -> tuple[int, float, int]:
+                ex_pref = 1 if str(it.get("exchange_id") or "").strip().lower() == canonical else 0
+                ts = _dt_score(it.get("updated_at"))
+                try:
+                    iid = int(it.get("id") or 0)
+                except Exception:
+                    iid = 0
+                return (ex_pref, ts, -iid)
+
+            keeper = max(items, key=_cat_key)
+            keeper_id = int(keeper.get("id") or 0)
+            for it in items:
+                cid = int(it.get("id") or 0)
+                if cid <= 0:
+                    continue
+                category_id_map[cid] = keeper_id
+                if cid != keeper_id:
+                    dup_category_ids.append(cid)
+
+            # Ensure keeper exchange_id is canonical.
+            try:
+                conn.execute(
+                    "UPDATE asset_categories SET exchange_id = %s WHERE id = %s",
+                    (canonical, keeper_id),
+                )
+            except Exception:
+                pass
+
+        # Delete duplicate categories after membership is migrated.
+
+    if _table_exists(conn, "asset_category_membership"):
+        try:
+            mem_rows = execute_fetchall(
+                conn,
+                f"""
+                SELECT user_id, exchange_id, category_id, symbol, created_at
+                FROM asset_category_membership
+                WHERE exchange_id IN ({sql_placeholders(conn, len(aliases))})
+                """,
+                tuple(aliases),
+            )
+        except Exception:
+            mem_rows = []
+
+        inserts: list[tuple[Any, ...]] = []
+        deletes: list[tuple[Any, ...]] = []
+        for r in mem_rows or []:
+            d = dict(r)
+            uid = str(d.get("user_id") or "").strip()
+            ex_raw = str(d.get("exchange_id") or "").strip()
+            cat_id = int(d.get("category_id") or 0)
+            sym_raw = str(d.get("symbol") or "").strip()
+            created_at = str(d.get("created_at") or "").strip() or now_utc_iso()
+            if not uid or cat_id <= 0 or not sym_raw:
+                continue
+            new_cat_id = int(category_id_map.get(cat_id, cat_id) or cat_id)
+            new_ex = canonical
+            new_sym = canonical_symbol(new_ex, sym_raw)
+            if not new_sym:
+                continue
+
+            inserts.append((uid, new_ex, new_cat_id, new_sym, created_at))
+            # Delete old row if it isn't already canonicalized.
+            if str(ex_raw).strip().lower() != new_ex or sym_raw != new_sym or new_cat_id != cat_id:
+                deletes.append((uid, ex_raw, cat_id, sym_raw))
+
+        if inserts:
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO asset_category_membership(user_id, exchange_id, category_id, symbol, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, exchange_id, category_id, symbol) DO NOTHING
+                    """,
+                    inserts,
+                )
+            except Exception:
+                pass
+        if deletes:
+            try:
+                conn.executemany(
+                    "DELETE FROM asset_category_membership WHERE user_id = %s AND exchange_id = %s AND category_id = %s AND symbol = %s",
+                    deletes,
+                )
+            except Exception:
+                pass
+
+    if dup_category_ids and _table_exists(conn, "asset_categories"):
+        try:
+            cur = conn.execute(
+                f"DELETE FROM asset_categories WHERE id IN ({sql_placeholders(conn, len(dup_category_ids))})",
+                tuple(dup_category_ids),
+            )
+            stats["asset_categories_deleted"] = int(getattr(cur, "rowcount", 0) or 0)
+        except Exception:
+            stats["asset_categories_deleted"] = stats.get("asset_categories_deleted", 0)
+
+    return stats
+
+
+def _migration_0012_canonicalize_woox_identity(conn: Any) -> None:
+    """Canonicalize Woo/WooX identity (migration wrapper)."""
+    _canonicalize_woox_identity(conn)
+
+
+def normalize_woox_identity(conn: Any) -> Dict[str, int]:
+    """Public maintenance helper to normalize Woo/WooX identity in-place."""
+    return _canonicalize_woox_identity(conn)
+
+
+def _migration_0013_avg_position_time_seconds(conn: Any) -> None:
+    if not _table_exists(conn, "backtest_runs"):
+        return
+
+    execute_optional(
+        conn,
+        "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS avg_position_time_seconds DOUBLE PRECISION",
+    )
+    execute_optional(
+        conn,
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_avg_pos_time_seconds ON backtest_runs(avg_position_time_seconds)",
+    )
+
+    # Best-effort backfill from legacy column and metrics JSONB.
+    try:
+        conn.execute(
+            """
+            UPDATE backtest_runs
+            SET avg_position_time_seconds = avg_position_time_s
+            WHERE avg_position_time_seconds IS NULL AND avg_position_time_s IS NOT NULL
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        conn.execute(
+            """
+            UPDATE backtest_runs
+            SET avg_position_time_seconds = (metrics_jsonb->>'avg_position_time_seconds')::double precision
+            WHERE avg_position_time_seconds IS NULL
+              AND metrics_jsonb ? 'avg_position_time_seconds'
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        conn.execute(
+            """
+            UPDATE backtest_runs
+            SET avg_position_time_seconds = (metrics_jsonb->>'avg_position_time_s')::double precision
+            WHERE avg_position_time_seconds IS NULL
+              AND metrics_jsonb ? 'avg_position_time_s'
+            """
+        )
+    except Exception:
+        pass
+
+
+def _migration_0014_backtest_runs_shortlist_fields(conn: Any) -> None:
+    if not _table_exists(conn, "backtest_runs"):
+        return
+
+    execute_optional(
+        conn,
+        "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS shortlist BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+    execute_optional(
+        conn,
+        "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS shortlist_note TEXT NOT NULL DEFAULT ''",
+    )
+
+
+def _migration_0015_backtest_runs_shortlist_note_nullable(conn: Any) -> None:
+    if not _table_exists(conn, "backtest_runs"):
+        return
+
+    execute_optional(
+        conn,
+        "ALTER TABLE backtest_runs ALTER COLUMN shortlist_note DROP NOT NULL",
+    )
+    execute_optional(
+        conn,
+        "ALTER TABLE backtest_runs ALTER COLUMN shortlist_note DROP DEFAULT",
+    )
+
+
 _MIGRATIONS: list[tuple[int, str, Any]] = [
     (1, "core_schema", _migration_0001_core_schema),
     (2, "backtest_run_details", _migration_0002_backtest_run_details),
@@ -1190,6 +1649,10 @@ _MIGRATIONS: list[tuple[int, str, Any]] = [
     (9, "sweeps_indexes", _migration_0009_sweeps_indexes),
     (10, "assets_indexes", _migration_0010_assets_indexes),
     (11, "saved_periods", _migration_0011_saved_periods),
+    (12, "canonicalize_woox_identity", _migration_0012_canonicalize_woox_identity),
+    (13, "avg_position_time_seconds", _migration_0013_avg_position_time_seconds),
+    (14, "backtest_runs_shortlist_fields", _migration_0014_backtest_runs_shortlist_fields),
+    (15, "backtest_runs_shortlist_note_nullable", _migration_0015_backtest_runs_shortlist_note_nullable),
 ]
 
 
@@ -1425,6 +1888,28 @@ def ensure_symbols_for_exchange_symbols(conn: Any, exchange_symbols: Iterable[st
             n += 1
         except Exception:
             continue
+    if n > 0:
+        try:
+            from project_dragon.ui.crypto_icons import default_spothq_root
+
+            root = default_spothq_root()
+            if root and root.is_dir():
+                base_assets: list[str] = []
+                for sym in missing:
+                    base, _quote = _parse_exchange_symbol_assets(sym)
+                    if base:
+                        s = str(base).strip().upper()
+                        if s and s not in base_assets:
+                            base_assets.append(s)
+                if base_assets:
+                    sync_symbol_icons_from_spothq_pack(
+                        conn,
+                        icons_root=str(root),
+                        base_assets=base_assets,
+                        max_updates=len(base_assets),
+                    )
+        except Exception:
+            pass
     return n
 
 
@@ -1667,63 +2152,25 @@ def init_db(*_args: Any, **_kwargs: Any) -> str:
         raise RuntimeError(
             "DRAGON_DATABASE_URL must be set to a postgres:// or postgresql:// URL."
         )
-    return _init_postgres_db(str(dsn))
-
-
-def _init_postgres_db(dsn: str) -> str:
-    global _DB_INITIALIZED_FOR
-    global _DB_INITIALIZED_VERSION
-    key = f"postgres:{dsn}"
-    latest_version = 0
+    # Validate schema without running DDL.
+    raw_conn = open_postgres_connection(str(dsn))
     try:
-        latest_version = max(int(v) for (v, _name, _fn) in _MIGRATIONS)
-    except Exception:
-        latest_version = 0
-
-    if not _auto_migrate_enabled():
-        return dsn
-    if (
-        _DB_INITIALIZED_FOR is not None
-        and _DB_INITIALIZED_FOR == key
-        and _DB_INITIALIZED_VERSION is not None
-        and int(_DB_INITIALIZED_VERSION) >= int(latest_version)
-    ):
-        return dsn
-
-    with _DB_INIT_LOCK:
-        if not _auto_migrate_enabled():
-            return dsn
-        if (
-            _DB_INITIALIZED_FOR is not None
-            and _DB_INITIALIZED_FOR == key
-            and _DB_INITIALIZED_VERSION is not None
-            and int(_DB_INITIALIZED_VERSION) >= int(latest_version)
-        ):
-            return dsn
-
-        raw_conn = open_postgres_connection(str(dsn))
         if psycopg is not None and isinstance(raw_conn, getattr(psycopg, "Connection", object)):
             conn = PostgresConnectionAdapterV3(raw_conn)
         else:
             conn = PostgresConnectionAdapter(raw_conn)
+        _ensure_schema(conn)
+    finally:
         try:
-            if not _try_acquire_migration_lock(conn):
-                logger.debug("Auto-migrate skipped: lock unavailable")
-                return dsn
-            apply_migrations(conn, use_lock=False)
-            _release_migration_lock(conn)
-            try:
-                row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-                _DB_INITIALIZED_VERSION = int(row[0] or 0) if row else 0
-            except Exception:
-                _DB_INITIALIZED_VERSION = latest_version
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        _DB_INITIALIZED_FOR = key
-        return dsn
+            raw_conn.close()
+        except Exception:
+            pass
+    return str(dsn)
+
+
+def _init_postgres_db(dsn: str) -> str:
+    # Postgres-only: migrations must be executed via db_migrate (no auto-DDL in runtime).
+    return dsn
 
 
 def _ensure_metadata_column(conn: Any) -> None:
@@ -1750,6 +2197,10 @@ def _db_add_column_if_missing(
     ddl_base: str,
     ddl_postgres: str,
 ) -> None:
+    if not _SCHEMA_DDL_ALLOWED:
+        raise RuntimeError(
+            "Schema DDL is disabled at runtime. Run db_migrate to apply schema changes."
+        )
     try:
         conn.execute(ddl_postgres)
     except Exception as exc:
@@ -1786,7 +2237,24 @@ def _is_tx_read_only(conn: Any) -> bool:
 
 
 def _ensure_schema(conn: Any) -> None:
-    if not _auto_migrate_enabled() and not _SCHEMA_DDL_ALLOWED:
+    global _SCHEMA_VALIDATED
+    if not _SCHEMA_DDL_ALLOWED:
+        if _SCHEMA_VALIDATED:
+            return
+        # Validate schema is present and up to date (no DDL in runtime).
+        try:
+            row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+            max_v = int(row[0] or 0) if row else 0
+            expected_max = max(int(v) for (v, _name, _fn) in _MIGRATIONS)
+        except Exception as exc:
+            raise RuntimeError(
+                "Database schema is missing or not migrated. Run db_migrate before starting the app."
+            ) from exc
+        if max_v < expected_max:
+            raise RuntimeError(
+                f"Database schema is out of date (version {max_v} < {expected_max}). Run db_migrate."
+            )
+        _SCHEMA_VALIDATED = True
         return
     if _is_tx_read_only(conn):
         logger.debug("Skipping schema ensure for read-only transaction")
@@ -2887,8 +3355,8 @@ def _infer_exchange_id_for_symbol_seed(exchange_symbol: str) -> str:
     s = (exchange_symbol or "").strip().upper()
     if s.startswith("PERP_") or s.startswith("SPOT_"):
         return "woox"
-    # CCXT default used in the app is "woo".
-    return "woo"
+    # CCXT default used in the app is "woo" (canonicalized to woox).
+    return "woox"
 
 
 def _seed_assets_from_existing_tables(conn: Any) -> int:
@@ -2915,7 +3383,8 @@ def _seed_assets_from_existing_tables(conn: Any) -> int:
         ex_sym = str(r.get("exchange_symbol") or "").strip()
         if not ex_sym:
             continue
-        ex_id = _infer_exchange_id_for_symbol_seed(ex_sym)
+        ex_id = canonical_exchange_id(_infer_exchange_id_for_symbol_seed(ex_sym))
+        ex_sym = canonical_symbol(ex_id, ex_sym)
         base = (str(r.get("base_asset")).strip().upper() if r.get("base_asset") is not None else None)
         quote = (str(r.get("quote_asset")).strip().upper() if r.get("quote_asset") is not None else None)
         rows.append((ex_id, ex_sym, base, quote, now, now))
@@ -2933,6 +3402,8 @@ def _seed_assets_from_existing_tables(conn: Any) -> int:
             sym = str(r[1] or "").strip()
             if not ex_id or not sym:
                 continue
+            ex_id = canonical_exchange_id(ex_id)
+            sym = canonical_symbol(ex_id, sym)
             base, quote = _parse_exchange_symbol_assets(sym)
             rows.append((ex_id, sym, base, quote, now, now))
 
@@ -2947,6 +3418,8 @@ def _seed_assets_from_existing_tables(conn: Any) -> int:
             sym = str(r[1] or "").strip()
             if not ex_id or not sym:
                 continue
+            ex_id = canonical_exchange_id(ex_id)
+            sym = canonical_symbol(ex_id, sym)
             base, quote = _parse_exchange_symbol_assets(sym)
             rows.append((ex_id, sym, base, quote, now, now))
 
@@ -2972,6 +3445,8 @@ def _seed_assets_from_existing_tables(conn: Any) -> int:
                 ex_id = ""
             if not ex_id:
                 ex_id = _infer_exchange_id_for_symbol_seed(sym)
+            ex_id = canonical_exchange_id(ex_id)
+            sym = canonical_symbol(ex_id, sym)
             base, quote = _parse_exchange_symbol_assets(sym)
             rows.append((ex_id, sym, base, quote, now, now))
 
@@ -3008,8 +3483,8 @@ def _upsert_asset(
     quote_asset: Optional[str] = None,
     status: Optional[str] = None,
 ) -> None:
-    ex_id = (exchange_id or "").strip()
-    sym = (symbol or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
+    sym = canonical_symbol(ex_id, symbol)
     if not ex_id or not sym:
         return
     if base_asset is None or quote_asset is None:
@@ -3064,25 +3539,35 @@ def upsert_asset(
             )
 
 
-def upsert_assets_bulk(exchange_id: str, rows: Iterable[tuple[str, Optional[str], Optional[str]]]) -> int:
+def upsert_assets_bulk(
+    exchange_id: str,
+    rows: Iterable[tuple[str, Optional[str], Optional[str]]],
+    *,
+    conn: Optional[Any] = None,
+) -> int:
     """Bulk upsert assets for an exchange.
 
     `rows` is an iterable of (symbol, base_asset, quote_asset).
     Returns the number of non-empty symbols processed.
     """
 
-    ex_id = str(exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     if not ex_id:
         raise ValueError("exchange_id is required")
 
     now = now_utc_iso()
     payload: list[tuple[str, str, Optional[str], Optional[str], str, str]] = []
     for sym_raw, base_raw, quote_raw in (rows or []):
-        sym = str(sym_raw or "").strip()
+        sym = canonical_symbol(ex_id, str(sym_raw or "").strip())
         if not sym:
             continue
+        # Prefer caller-provided base/quote, but fill from normalized symbol.
         b = str(base_raw or "").strip().upper() or None
         q = str(quote_raw or "").strip().upper() or None
+        if b is None or q is None:
+            b2, q2 = _parse_exchange_symbol_assets(sym)
+            b = b or b2
+            q = q or q2
         payload.append((ex_id, sym, b, q, now, now))
 
     if not payload:
@@ -3095,10 +3580,12 @@ def upsert_assets_bulk(exchange_id: str, rows: Iterable[tuple[str, Optional[str]
         if key not in dedup:
             dedup[key] = (ex, sym, b, q, ca, ua)
 
-    with _get_conn() as conn:
-        _ensure_schema(conn)
-        with conn:
-            conn.executemany(
+    owns_conn = conn is None
+    connection = conn or _get_conn()
+    _ensure_schema(connection)
+    if owns_conn:
+        with connection:
+            connection.executemany(
                 """
                 INSERT INTO assets(exchange_id, symbol, base_asset, quote_asset, status, created_at, updated_at)
                 VALUES (%s, %s, %s, %s, 'active', %s, %s)
@@ -3109,6 +3596,22 @@ def upsert_assets_bulk(exchange_id: str, rows: Iterable[tuple[str, Optional[str]
                 """,
                 list(dedup.values()),
             )
+    else:
+        connection.executemany(
+            """
+            INSERT INTO assets(exchange_id, symbol, base_asset, quote_asset, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 'active', %s, %s)
+            ON CONFLICT(exchange_id, symbol) DO UPDATE SET
+                base_asset = COALESCE(excluded.base_asset, assets.base_asset),
+                quote_asset = COALESCE(excluded.quote_asset, assets.quote_asset),
+                updated_at = excluded.updated_at
+            """,
+            list(dedup.values()),
+        )
+        try:
+            connection.commit()
+        except Exception:
+            pass
 
     return int(len(dedup))
 
@@ -3119,12 +3622,15 @@ def list_assets(
     status: str = "active",
 ) -> List[Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     st_norm = (status or "").strip().lower() or "active"
     if st_norm not in {"active", "disabled", "all"}:
         st_norm = "active"
 
     with open_db_connection(read_only=True) as conn:
+
+        ex_ids = exchange_ids_for_query(ex_id)
+        ex_placeholders = sql_placeholders(conn, len(ex_ids))
 
         # One query: assets + a comma-separated list of category names for this user.
         rows = execute_fetchall(
@@ -3149,12 +3655,12 @@ def list_assets(
                 ON c.id = m.category_id
                 AND c.user_id = m.user_id
                 AND c.exchange_id = m.exchange_id
-            WHERE a.exchange_id = %s
+            WHERE a.exchange_id IN ({ex_placeholders})
             {('AND a.status = %s' if st_norm != 'all' else '')}
             GROUP BY a.id
             ORDER BY a.base_asset ASC, a.symbol ASC
             """,
-            tuple([uid, ex_id] + ([st_norm] if st_norm != "all" else [])),
+            tuple([uid] + list(ex_ids) + ([st_norm] if st_norm != "all" else [])),
         )
 
     out: list[Dict[str, Any]] = []
@@ -3172,7 +3678,7 @@ def list_asset_symbols(
     status: str = "all",
     conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     if not ex_id:
         return []
     st_norm = (status or "").strip().lower() or "all"
@@ -3182,8 +3688,9 @@ def list_asset_symbols(
     owns_conn = conn is None
     connection = conn or open_db_connection(read_only=True)
     try:
-        params: list[Any] = [ex_id]
-        where = "WHERE exchange_id = %s"
+        ex_ids = exchange_ids_for_query(ex_id)
+        params: list[Any] = list(ex_ids)
+        where = f"WHERE exchange_id IN ({sql_placeholders(connection, len(ex_ids))})"
         if st_norm != "all":
             where += " AND status = %s"
             params.append(st_norm)
@@ -3192,7 +3699,23 @@ def list_asset_symbols(
             f"SELECT symbol, status FROM assets {where} ORDER BY symbol ASC",
             tuple(params),
         )
-        return [dict(r) for r in rows or []]
+        dedup: dict[str, dict[str, Any]] = {}
+        for r in rows or []:
+            d = dict(r) if isinstance(r, dict) else {}
+            raw_sym = str(d.get("symbol") or "").strip()
+            if not raw_sym:
+                continue
+            sym = canonical_symbol(ex_id, raw_sym)
+            status_val = str(d.get("status") or "").strip().lower()
+            prev = dedup.get(sym)
+            if prev is None:
+                dedup[sym] = {"symbol": sym, "status": status_val}
+                continue
+            prev_status = str(prev.get("status") or "").strip().lower()
+            # Prefer active over disabled when collapsing duplicates.
+            if prev_status != "active" and status_val == "active":
+                dedup[sym] = {"symbol": sym, "status": status_val}
+        return list(dedup.values())
     finally:
         if owns_conn:
             try:
@@ -3216,7 +3739,7 @@ def list_assets_server_side(
     conn: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     st_norm = (status or "").strip().lower() or "all"
     if st_norm not in {"active", "disabled", "all"}:
         st_norm = "all"
@@ -3276,8 +3799,9 @@ def list_assets_server_side(
         *,
         allowed_filters: Dict[str, Dict[str, str]],
     ) -> Tuple[str, List[Any]]:
-        where_parts: list[str] = ["a.exchange_id = %s"]
-        params: list[Any] = [ex_id]
+        ex_ids = exchange_ids_for_query(ex_id)
+        where_parts: list[str] = [f"a.exchange_id IN ({sql_placeholders(connection, len(ex_ids))})"]
+        params: list[Any] = list(ex_ids)
 
         if st_norm != "all":
             where_parts.append("a.status = %s")
@@ -3508,11 +4032,15 @@ def debug_assets_server_side_query(
 
 def list_categories(user_id: str, exchange_id: str) -> List[Dict[str, Any]]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     with open_db_connection(read_only=True) as conn:
+        ex_ids = exchange_ids_for_query(ex_id)
+        if not ex_ids:
+            return []
+        placeholders = sql_placeholders(conn, len(ex_ids))
         rows = execute_fetchall(
             conn,
-            """
+            f"""
             SELECT
                 c.*, 
                 COALESCE(mc.member_count, 0) AS member_count
@@ -3525,10 +4053,10 @@ def list_categories(user_id: str, exchange_id: str) -> List[Dict[str, Any]]:
                 ON mc.user_id = c.user_id
                 AND mc.exchange_id = c.exchange_id
                 AND mc.category_id = c.id
-            WHERE c.user_id = %s AND c.exchange_id = %s
+            WHERE c.user_id = %s AND c.exchange_id IN ({placeholders})
             ORDER BY c.name ASC
             """,
-            (uid, ex_id),
+            tuple([uid] + list(ex_ids)),
         )
     return [dict(r) for r in rows or []]
 
@@ -3566,9 +4094,16 @@ def set_assets_status(exchange_id: str, symbols: Iterable[str], status: str) -> 
             return int(updated)
 
 
-def create_category(user_id: str, exchange_id: str, name: str, source: str = "user") -> int:
+def create_category(
+    user_id: str,
+    exchange_id: str,
+    name: str,
+    source: str = "user",
+    *,
+    conn: Optional[Any] = None,
+) -> int:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     nm = (name or "").strip()
     if not ex_id or not nm:
         raise ValueError("exchange_id and name are required")
@@ -3577,10 +4112,12 @@ def create_category(user_id: str, exchange_id: str, name: str, source: str = "us
         src = "user"
     now = now_utc_iso()
 
-    with _get_conn() as conn:
-        _ensure_schema(conn)
-        with conn:
-            conn.execute(
+    owns_conn = conn is None
+    connection = conn or _get_conn()
+    _ensure_schema(connection)
+    if owns_conn:
+        with connection:
+            connection.execute(
                 """
                 INSERT INTO asset_categories(user_id, exchange_id, name, source, created_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s)
@@ -3590,27 +4127,50 @@ def create_category(user_id: str, exchange_id: str, name: str, source: str = "us
                 (uid, ex_id, nm, src, now, now),
             )
             row = execute_fetchone(
-                conn,
+                connection,
                 "SELECT id FROM asset_categories WHERE user_id = %s AND exchange_id = %s AND name = %s",
                 (uid, ex_id, nm),
             )
-            return int(row.get("id")) if row else 0
+    else:
+        connection.execute(
+            """
+            INSERT INTO asset_categories(user_id, exchange_id, name, source, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT(user_id, exchange_id, name) DO UPDATE SET
+                updated_at = excluded.updated_at
+            """,
+            (uid, ex_id, nm, src, now, now),
+        )
+        try:
+            connection.commit()
+        except Exception:
+            pass
+        row = execute_fetchone(
+            connection,
+            "SELECT id FROM asset_categories WHERE user_id = %s AND exchange_id = %s AND name = %s",
+            (uid, ex_id, nm),
+        )
+    return int(row.get("id")) if row else 0
 
 
 def get_category_symbols(user_id: str, exchange_id: str, category_id: int) -> List[str]:
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     cid = int(category_id)
     with open_db_connection(read_only=True) as conn:
+        ex_ids = exchange_ids_for_query(ex_id)
+        if not ex_ids:
+            return []
+        placeholders = sql_placeholders(conn, len(ex_ids))
         rows = execute_fetchall(
             conn,
             """
             SELECT symbol
             FROM asset_category_membership
-            WHERE user_id = %s AND exchange_id = %s AND category_id = %s
+            WHERE user_id = %s AND exchange_id IN ({placeholders}) AND category_id = %s
             ORDER BY symbol ASC
             """,
-            (uid, ex_id, cid),
+            tuple([uid] + list(ex_ids) + [cid]),
         )
         return [str(r.get("symbol")) for r in rows or [] if r and str(r.get("symbol") or "").strip()]
 
@@ -3700,16 +4260,17 @@ def seed_asset_categories_if_empty(user_id: str, exchange_id: str, *, force: boo
     """
 
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
-    ex_id = (exchange_id or "").strip()
+    ex_id = canonical_exchange_id(exchange_id)
     if not ex_id:
         raise ValueError("exchange_id is required")
 
     with _get_conn() as conn:
         _ensure_schema(conn)
+        ex_ids = exchange_ids_for_query(ex_id)
         row = execute_fetchone(
             conn,
-            "SELECT COUNT(*) AS c FROM asset_categories WHERE user_id = %s AND exchange_id = %s",
-            (uid, ex_id),
+            f"SELECT COUNT(*) AS c FROM asset_categories WHERE user_id = %s AND exchange_id IN ({sql_placeholders(conn, len(ex_ids))})",
+            tuple([uid] + list(ex_ids)),
         )
         existing = int(row.get("c") if row is not None else 0)
         if existing > 0 and not bool(force):
@@ -4672,7 +5233,7 @@ def get_saved_period(conn: Any, user_id: str, period_id: int) -> Optional[Dict[s
     uid = (user_id or "").strip() or DEFAULT_USER_EMAIL
     row = execute_fetchone(
         conn,
-        """
+        f"""
         SELECT id, name, start_ts, end_ts, created_at, updated_at
         FROM saved_periods
         WHERE user_id = %s AND id = %s
@@ -4845,18 +5406,41 @@ def get_backtest_run_chart_artifacts(
         cols = get_table_columns(connection, "backtest_run_details")
     except Exception:
         cols = set()
-    required = {"equity_curve_json", "equity_timestamps_json", "extra_series_json"}
-    if not required.issubset(cols):
+
+    def _has_any(text_col: str, jsonb_col: str) -> bool:
+        return text_col in cols or jsonb_col in cols
+
+    if not (
+        _has_any("equity_curve_json", "equity_curve_jsonb")
+        and _has_any("equity_timestamps_json", "equity_timestamps_jsonb")
+        and _has_any("extra_series_json", "extra_series_jsonb")
+    ):
         if conn is None:
             connection.close()
         return None
 
     row = None
     try:
-        select_cols = ["equity_curve_json", "equity_timestamps_json", "extra_series_json"]
-        for opt in ("candles_json", "params_json", "run_context_json", "computed_metrics_json"):
-            if opt in cols:
-                select_cols.append(opt)
+        select_cols = []
+        for text_col, jsonb_col in (
+            ("equity_curve_json", "equity_curve_jsonb"),
+            ("equity_timestamps_json", "equity_timestamps_jsonb"),
+            ("extra_series_json", "extra_series_jsonb"),
+        ):
+            if text_col in cols:
+                select_cols.append(text_col)
+            if jsonb_col in cols:
+                select_cols.append(jsonb_col)
+        for text_col, jsonb_col in (
+            ("candles_json", "candles_jsonb"),
+            ("params_json", "params_jsonb"),
+            ("run_context_json", "run_context_jsonb"),
+            ("computed_metrics_json", "computed_metrics_jsonb"),
+        ):
+            if text_col in cols:
+                select_cols.append(text_col)
+            if jsonb_col in cols:
+                select_cols.append(jsonb_col)
         row = execute_fetchone(
             connection,
             f"SELECT {', '.join(select_cols)} FROM backtest_run_details WHERE run_id = %s",
@@ -4871,47 +5455,39 @@ def get_backtest_run_chart_artifacts(
     if row is None:
         return None
 
-    eq = None
-    ts = None
-    extra = None
-    candles = None
-    params = None
-    run_context = None
-    computed_metrics = None
-    try:
-        eq = json.loads(row["equity_curve_json"]) if row["equity_curve_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        eq = None
-    try:
-        ts = json.loads(row["equity_timestamps_json"]) if row["equity_timestamps_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        ts = None
-    try:
-        extra = json.loads(row["extra_series_json"]) if row["extra_series_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        extra = None
+    def _load_json_field(text_key: str, jsonb_key: str) -> Any:
+        if jsonb_key in row.keys():
+            raw = row.get(jsonb_key)
+            if raw is not None:
+                if isinstance(raw, (dict, list)):
+                    return raw
+                if isinstance(raw, str):
+                    try:
+                        return json.loads(raw)
+                    except (TypeError, json.JSONDecodeError):
+                        return None
+                try:
+                    return json.loads(str(raw))
+                except (TypeError, json.JSONDecodeError):
+                    return raw
+        if text_key in row.keys():
+            raw = row.get(text_key)
+            if raw:
+                try:
+                    return json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    return None
+        return None
+
+    eq = _load_json_field("equity_curve_json", "equity_curve_jsonb")
+    ts = _load_json_field("equity_timestamps_json", "equity_timestamps_jsonb")
+    extra = _load_json_field("extra_series_json", "extra_series_jsonb")
 
     # Optional artifacts
-    try:
-        if "candles_json" in row.keys():
-            candles = json.loads(row["candles_json"]) if row["candles_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        candles = None
-    try:
-        if "params_json" in row.keys():
-            params = json.loads(row["params_json"]) if row["params_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        params = None
-    try:
-        if "run_context_json" in row.keys():
-            run_context = json.loads(row["run_context_json"]) if row["run_context_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        run_context = None
-    try:
-        if "computed_metrics_json" in row.keys():
-            computed_metrics = json.loads(row["computed_metrics_json"]) if row["computed_metrics_json"] else None
-    except (TypeError, json.JSONDecodeError):
-        computed_metrics = None
+    candles = _load_json_field("candles_json", "candles_jsonb")
+    params = _load_json_field("params_json", "params_jsonb")
+    run_context = _load_json_field("run_context_json", "run_context_jsonb")
+    computed_metrics = _load_json_field("computed_metrics_json", "computed_metrics_jsonb")
 
     if not isinstance(eq, list) or not eq:
         return None
@@ -6565,7 +7141,7 @@ def upsert_backtest_run_by_run_key(
                 start_time = {ph}, end_time = {ph},
                 net_profit = {ph}, net_return_pct = {ph}, roi_pct_on_margin = {ph}, max_drawdown_pct = {ph},
                 sharpe = {ph}, sortino = {ph}, win_rate = {ph}, profit_factor = {ph},
-                cpc_index = {ph}, common_sense_ratio = {ph}, avg_position_time_s = {ph}, trades_json = {ph}, trades_jsonb = {ph},
+                cpc_index = {ph}, common_sense_ratio = {ph}, avg_position_time_seconds = {ph}, trades_json = {ph}, trades_jsonb = {ph},
                 sweep_id = {ph}, market_type = {ph}
             WHERE id = {ph}
             """,
@@ -6592,7 +7168,7 @@ def upsert_backtest_run_by_run_key(
                 run_row_fields.get("profit_factor"),
                 run_row_fields.get("cpc_index"),
                 run_row_fields.get("common_sense_ratio"),
-                run_row_fields.get("avg_position_time_s"),
+                run_row_fields.get("avg_position_time_seconds"),
                 run_row_fields.get("trades_json"),
                 to_jsonb(run_row_fields.get("trades_jsonb")),
                 run_row_fields.get("sweep_id"),
@@ -6754,7 +7330,7 @@ def upsert_backtest_run_by_run_key(
             start_time, end_time,
             net_profit, net_return_pct, roi_pct_on_margin, max_drawdown_pct,
             sharpe, sortino, win_rate, profit_factor,
-            cpc_index, common_sense_ratio, avg_position_time_s, trades_json, trades_jsonb,
+            cpc_index, common_sense_ratio, avg_position_time_seconds, trades_json, trades_jsonb,
             sweep_id
         )
         VALUES (
@@ -6787,7 +7363,7 @@ def upsert_backtest_run_by_run_key(
             run_row_fields.get("profit_factor"),
             run_row_fields.get("cpc_index"),
             run_row_fields.get("common_sense_ratio"),
-            run_row_fields.get("avg_position_time_s"),
+            run_row_fields.get("avg_position_time_seconds"),
             run_row_fields.get("trades_json"),
             to_jsonb(run_row_fields.get("trades_jsonb")),
             run_row_fields.get("sweep_id"),
@@ -7475,7 +8051,7 @@ def get_bot_snapshot(conn: Any, bot_id: int) -> Optional[Dict[str, Any]]:
     """Get a bot row joined with its latest durable snapshot (if present)."""
     row = execute_fetchone(
         conn,
-        """
+        f"""
         SELECT
             b.*,
             a.label AS account_label,
@@ -8303,6 +8879,10 @@ def upsert_candles(
 ) -> None:
     if not candles:
         return
+    ex_id = canonical_exchange_id(exchange_id)
+    sym = canonical_symbol(ex_id, symbol)
+    if not ex_id or not sym:
+        return
     market_type = (market_type or "unknown").lower()
     rows = []
     for c in candles:
@@ -8311,9 +8891,9 @@ def upsert_candles(
             continue
         rows.append(
             (
-                exchange_id,
+                ex_id,
                 market_type,
-                symbol,
+                sym,
                 timeframe,
                 ts_ms,
                 float(getattr(c, "open", 0.0)),
@@ -8354,12 +8934,17 @@ def load_cached_range(
     end_ms: Optional[int],
 ) -> List[Dict[str, Any]]:
     market_type = (market_type or "unknown").lower()
+    ex_id = canonical_exchange_id(exchange_id)
+    sym = canonical_symbol(ex_id, symbol)
+    if not ex_id or not sym:
+        return []
     start_ms = _ts_to_ms(start_ms)
     end_ms = _ts_to_ms(end_ms)
     ph = sql_placeholder(conn)
-    params: list[Any] = [exchange_id, market_type, symbol, timeframe]
+    ex_ids = exchange_ids_for_query(ex_id)
+    params: list[Any] = list(ex_ids) + [market_type, sym, timeframe]
     conditions = [
-        f"exchange_id = {ph}",
+        f"exchange_id IN ({sql_placeholders(conn, len(ex_ids))})",
         f"market_type = {ph}",
         f"symbol = {ph}",
         f"timeframe = {ph}",
@@ -8371,13 +8956,35 @@ def load_cached_range(
         conditions.append(f"timestamp_ms <= {ph}")
         params.append(int(end_ms))
     query = (
-        "SELECT timestamp_ms, open, high, low, close, volume FROM candles_cache "
+        "SELECT exchange_id, timestamp_ms, open, high, low, close, volume FROM candles_cache "
         + " WHERE "
         + " AND ".join(conditions)
         + " ORDER BY timestamp_ms ASC"
     )
     rows = fetchall_dicts(conn.execute(query, tuple(params)))
-    return rows
+
+    # Dedupe by timestamp if historical aliases exist; prefer canonical exchange_id.
+    by_ts: dict[int, Dict[str, Any]] = {}
+    for r in rows or []:
+        try:
+            ts = int(r.get("timestamp_ms") or 0)
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        existing = by_ts.get(ts)
+        if existing is None:
+            by_ts[ts] = r
+            continue
+        ex_existing = str(existing.get("exchange_id") or "").strip().lower()
+        ex_new = str(r.get("exchange_id") or "").strip().lower()
+        if ex_existing != ex_id and ex_new == ex_id:
+            by_ts[ts] = r
+
+    out = [by_ts[k] for k in sorted(by_ts.keys())]
+    for r in out:
+        r.pop("exchange_id", None)
+    return out
 
 
 def get_cached_coverage(
@@ -8388,15 +8995,22 @@ def get_cached_coverage(
     timeframe: str,
 ) -> tuple[Optional[int], Optional[int]]:
     market_type = (market_type or "unknown").lower()
+    ex_id = canonical_exchange_id(exchange_id)
+    sym = canonical_symbol(ex_id, symbol)
+    if not ex_id or not sym:
+        return None, None
+    ex_ids = exchange_ids_for_query(ex_id)
     row = fetchone_dict(
         conn.execute(
             f"""
             SELECT MIN(timestamp_ms) AS min_ts, MAX(timestamp_ms) AS max_ts
             FROM candles_cache
-            WHERE exchange_id = {sql_placeholder(conn)} AND market_type = {sql_placeholder(conn)}
-              AND symbol = {sql_placeholder(conn)} AND timeframe = {sql_placeholder(conn)}
+            WHERE exchange_id IN ({sql_placeholders(conn, len(ex_ids))})
+              AND market_type = {sql_placeholder(conn)}
+              AND symbol = {sql_placeholder(conn)}
+              AND timeframe = {sql_placeholder(conn)}
             """,
-            (exchange_id, market_type, symbol, timeframe),
+            tuple(list(ex_ids) + [market_type, sym, timeframe]),
         )
     )
     if not row:
@@ -8658,6 +9272,10 @@ def build_backtest_run_rows(
             computed_metrics_json = None
             computed_metrics_obj = None
 
+    avg_pos_seconds = _safe_float(metrics_source.get("avg_position_time_seconds"))
+    if avg_pos_seconds is None:
+        avg_pos_seconds = _safe_float(metrics_source.get("avg_position_time_s"))
+
     run_row_fields: Dict[str, Any] = {
         "created_at": created_at,
         "symbol": symbol,
@@ -8684,7 +9302,7 @@ def build_backtest_run_rows(
         "profit_factor": _safe_float(metrics_source.get("profit_factor")),
         "cpc_index": _safe_float(metrics_source.get("cpc_index")),
         "common_sense_ratio": _safe_float(metrics_source.get("common_sense_ratio")),
-        "avg_position_time_s": _safe_float(metrics_source.get("avg_position_time_s")),
+        "avg_position_time_seconds": avg_pos_seconds,
         "trades_json": trades_json,
         "trades_jsonb": trades_obj,
     }
@@ -8771,7 +9389,7 @@ def save_backtest_run(
             "profit_factor",
             "cpc_index",
             "common_sense_ratio",
-            "avg_position_time_s",
+            "avg_position_time_seconds",
             "trades_json",
             "trades_jsonb",
             "sweep_id",
@@ -9416,6 +10034,43 @@ def set_user_run_shortlists(
             return
 
 
+def update_run_shortlist_fields(
+    run_id: str,
+    *,
+    shortlist: Optional[bool] = None,
+    shortlist_note: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> None:
+    rid = str(run_id or "").strip()
+    if not rid:
+        return
+    with _get_conn() as conn:
+        _ensure_schema(conn)
+        try:
+            run_cols = get_table_columns(conn, "backtest_runs")
+        except Exception:
+            run_cols = set()
+        if "shortlist" not in run_cols or "shortlist_note" not in run_cols:
+            return
+
+        sets: list[str] = []
+        params: list[Any] = []
+        ph = sql_placeholder(conn)
+        if shortlist is not None:
+            sets.append(f"shortlist = {ph}")
+            params.append(bool(shortlist))
+        if shortlist_note is not None:
+            sets.append(f"shortlist_note = {ph}")
+            params.append(str(shortlist_note))
+        if not sets:
+            return
+        params.append(rid)
+        conn.execute(
+            f"UPDATE backtest_runs SET {', '.join(sets)} WHERE id = {ph}",
+            tuple(params),
+        )
+
+
 def load_backtest_runs_explorer_rows(
     *,
     user_id: Optional[str] = None,
@@ -9426,7 +10081,7 @@ def load_backtest_runs_explorer_rows(
 
     - Uses stored `backtest_runs.market_type` (never derived from symbol).
     - Joins `symbols.icon_uri` by exact symbol match.
-    - Joins per-user shortlist (optional).
+    - Uses canonical shortlist fields on backtest_runs.
     """
 
     lim = max(1, int(limit or 2000))
@@ -9435,14 +10090,14 @@ def load_backtest_runs_explorer_rows(
 
     with _get_conn() as conn:
         _ensure_schema(conn)
+        run_cols = get_table_columns(conn, "backtest_runs")
         shortlist_join = ""
-        shortlist_cols = "0 AS shortlisted, '' AS shortlist_note"
+        shortlist_cols = "FALSE AS shortlist, '' AS shortlist_note"
         filter_params: List[Any] = []
         params: List[Any] = []
-        if uid:
-            shortlist_join = "LEFT JOIN run_shortlists rs ON rs.run_id = r.id AND rs.user_id = %s"
-            shortlist_cols = "COALESCE(rs.shortlisted, 0) AS shortlisted, COALESCE(rs.note, '') AS shortlist_note"
-            params.append(uid)
+
+        if "shortlist" in run_cols and "shortlist_note" in run_cols:
+            shortlist_cols = "COALESCE(r.shortlist, FALSE) AS shortlist, COALESCE(r.shortlist_note, '') AS shortlist_note"
 
         where_clauses: list[str] = []
         if filters.get("sweep_id") is not None:
@@ -9480,6 +10135,7 @@ def load_backtest_runs_explorer_rows(
 
         params.extend(filter_params)
 
+        avg_pos_expr = _avg_position_time_seconds_expr(run_cols, details_alias=None)
         sql = f"""
             SELECT
                 r.id AS run_id,
@@ -9502,7 +10158,7 @@ def load_backtest_runs_explorer_rows(
                 r.profit_factor,
                 r.cpc_index,
                 r.common_sense_ratio,
-                r.avg_position_time_s,
+                {avg_pos_expr} AS avg_position_time_seconds,
                 r.sweep_id,
                 sw.name AS sweep_name,
                 sw.exchange_id AS sweep_exchange_id,
@@ -9524,7 +10180,29 @@ def load_backtest_runs_explorer_rows(
         params.append(lim)
 
         rows = execute_fetchall(conn, sql, tuple(params))
-        return [dict(r) for r in rows]
+        out: List[Dict[str, Any]] = []
+        for r in rows or []:
+            row = dict(r)
+            sym = str(row.get("symbol") or "").strip()
+            ex_id = str(row.get("sweep_exchange_id") or "").strip()
+            display_symbol = sym
+            try:
+                ex_norm = canonical_exchange_id(ex_id)
+                if ex_norm == "woox" or sym.upper().startswith(("PERP_", "SPOT_")):
+                    from project_dragon.data_online import woox_symbol_to_ccxt_symbol
+
+                    display_symbol, _ = woox_symbol_to_ccxt_symbol(sym)
+            except Exception:
+                display_symbol = sym
+            row["asset_display"] = display_symbol
+            secs = row.get("avg_position_time_seconds")
+            if secs is None:
+                secs = row.get("avg_position_time_s")
+            row["avg_position_time"] = format_duration_dhm(secs)
+            row.pop("avg_position_time_seconds", None)
+            row.pop("avg_position_time_s", None)
+            out.append(row)
+        return out
 
 
 def _runs_allowed_filter_map(run_cols: set[str]) -> Dict[str, Dict[str, str]]:
@@ -9552,6 +10230,13 @@ def _runs_allowed_filter_map(run_cols: set[str]) -> Dict[str, Dict[str, str]]:
         "sweep_name": {"type": "text", "sql": "sw.name"},
         "user_id": {"type": "text", "sql": "r.user_id"},
     }
+    if "shortlist" in run_cols:
+        allow["shortlist"] = {"type": "number", "sql": "r.shortlist"}
+    if "shortlist_note" in run_cols:
+        allow["shortlist_note"] = {"type": "text", "sql": "r.shortlist_note"}
+    avg_pos_expr = _avg_position_time_seconds_expr(run_cols)
+    allow["avg_position_time_seconds"] = {"type": "number", "sql": avg_pos_expr}
+    allow["avg_position_time"] = {"type": "number", "sql": avg_pos_expr}
     if "metadata_jsonb" in run_cols:
         allow["run_key"] = {"type": "text", "sql": "(r.metadata_jsonb->>'run_key')"}
     return allow
@@ -9609,7 +10294,7 @@ def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
         "profit_factor": "r.profit_factor",
         "cpc_index": "r.cpc_index",
         "common_sense_ratio": "r.common_sense_ratio",
-        "avg_position_time_s": "r.avg_position_time_s",
+        "avg_position_time_seconds": f"{_avg_position_time_seconds_expr(run_cols)} AS avg_position_time_seconds",
         "sweep_id": "r.sweep_id",
         "sweep_name": "sw.name AS sweep_name",
         "sweep_exchange_id": "sw.exchange_id AS sweep_exchange_id",
@@ -9619,14 +10304,16 @@ def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
         "base_asset": "s.base_asset",
         "quote_asset": "s.quote_asset",
         "icon_uri": "s.icon_uri",
-        "shortlisted": "COALESCE(rs.shortlisted, 0) AS shortlisted",
-        "shortlist_note": "COALESCE(rs.note, '') AS shortlist_note",
     }
+    if "shortlist" in run_cols:
+        select["shortlist"] = "COALESCE(r.shortlist, FALSE) AS shortlist"
+    if "shortlist_note" in run_cols:
+        select["shortlist_note"] = "COALESCE(r.shortlist_note, '') AS shortlist_note"
     if "metadata_jsonb" in run_cols:
         select["run_key"] = "(r.metadata_jsonb->>'run_key') AS run_key"
     # Drop selections for missing columns.
     for key in list(select.keys()):
-        if key in {"run_id", "id", "sweep_name", "sweep_exchange_id", "sweep_scope", "sweep_assets_json", "sweep_category_id", "base_asset", "quote_asset", "icon_uri", "shortlisted", "shortlist_note", "run_key"}:
+        if key in {"run_id", "id", "sweep_name", "sweep_exchange_id", "sweep_scope", "sweep_assets_json", "sweep_category_id", "base_asset", "quote_asset", "icon_uri", "shortlist_note", "run_key"}:
             continue
         col = select[key].split(" AS ")[0].strip()
         if col.startswith("r.") and col[2:] not in run_cols:
@@ -9636,6 +10323,30 @@ def _runs_allowed_select_map(run_cols: set[str]) -> Dict[str, str]:
 
 def _runs_duration_seconds_sql() -> str:
     return "EXTRACT(EPOCH FROM (r.end_time::timestamptz - r.start_time::timestamptz))"
+
+
+def _avg_position_time_seconds_expr(
+    run_cols: set[str],
+    *,
+    table_alias: str = "r",
+    details_alias: Optional[str] = "d",
+) -> str:
+    parts: list[str] = []
+    if "avg_position_time_seconds" in run_cols:
+        parts.append(f"{table_alias}.avg_position_time_seconds")
+    if "avg_position_time_s" in run_cols:
+        parts.append(f"{table_alias}.avg_position_time_s")
+    if "metrics_jsonb" in run_cols:
+        parts.append(f"({table_alias}.metrics_jsonb->>'avg_position_time_seconds')::double precision")
+        parts.append(f"({table_alias}.metrics_jsonb->>'avg_position_time_s')::double precision")
+    if details_alias:
+        parts.append(f"({details_alias}.computed_metrics_jsonb->>'avg_position_time_seconds')::double precision")
+        parts.append(f"({details_alias}.computed_metrics_jsonb->>'avg_position_time_s')::double precision")
+        parts.append(f"({details_alias}.metrics_jsonb->>'avg_position_time_seconds')::double precision")
+        parts.append(f"({details_alias}.metrics_jsonb->>'avg_position_time_s')::double precision")
+    if not parts:
+        return "NULL::double precision"
+    return f"COALESCE({', '.join(parts)})"
 
 
 _SAFE_JSON_PATH_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -9959,9 +10670,19 @@ def list_runs_server_side(
         allowed_filters = _runs_allowed_filter_map(run_cols)
         allowed_select = _runs_allowed_select_map(run_cols)
 
+        if "shortlist" not in run_cols:
+            allowed_filters["shortlist"] = {"type": "number", "sql": "0"}
+            allowed_select["shortlist"] = "FALSE AS shortlist"
+        if "shortlist_note" not in run_cols:
+            allowed_filters["shortlist_note"] = {"type": "text", "sql": "''"}
+            allowed_select["shortlist_note"] = "'' AS shortlist_note"
+
         req_cols = {"run_id", "created_at", "symbol", "timeframe", "strategy_name"}
         if visible_columns:
             selected = [c for c in visible_columns if c in allowed_select]
+            if "avg_position_time" in visible_columns and "avg_position_time_seconds" in allowed_select:
+                if "avg_position_time_seconds" not in selected:
+                    selected.append("avg_position_time_seconds")
         else:
             selected = []
         for col in req_cols:
@@ -10005,9 +10726,6 @@ def list_runs_server_side(
 
         shortlist_join = ""
         select_params: List[Any] = list(where_params)
-        if user_id:
-            shortlist_join = "LEFT JOIN run_shortlists rs ON rs.run_id = r.id AND rs.user_id = %s"
-            select_params = [str(user_id)] + select_params
 
         sql = f"""
             SELECT {select_sql}
@@ -10046,7 +10764,30 @@ def list_runs_server_side(
         except Exception:
             pass
 
-        return [dict(r) for r in rows], int(total_count)
+        out: List[Dict[str, Any]] = []
+        for r in rows or []:
+            row = dict(r)
+            sym = str(row.get("symbol") or "").strip()
+            ex_id = str(row.get("sweep_exchange_id") or "").strip()
+            display_symbol = sym
+            try:
+                ex_norm = canonical_exchange_id(ex_id)
+                if ex_norm == "woox" or sym.upper().startswith(("PERP_", "SPOT_")):
+                    from project_dragon.data_online import woox_symbol_to_ccxt_symbol
+
+                    display_symbol, _ = woox_symbol_to_ccxt_symbol(sym)
+            except Exception:
+                display_symbol = sym
+            row["asset_display"] = display_symbol
+            secs = row.get("avg_position_time_seconds")
+            if secs is None:
+                secs = row.get("avg_position_time_s")
+            if "avg_position_time" in (visible_columns or []) or "avg_position_time" in row:
+                row["avg_position_time"] = format_duration_dhm(secs)
+            row.pop("avg_position_time_seconds", None)
+            row.pop("avg_position_time_s", None)
+            out.append(row)
+        return out, int(total_count)
     except Exception:
         _rollback_quietly(conn)
         logger.exception("list_runs_server_side failed")
@@ -10073,7 +10814,7 @@ def list_backtest_run_symbols(
     )
     lim = max(1, min(int(limit or 500), 5000))
     sql = f"""
-        SELECT DISTINCT COALESCE(s.base_asset, r.symbol) AS symbol
+        SELECT DISTINCT r.symbol AS symbol, s.base_asset AS base_asset
         FROM backtest_runs r
         LEFT JOIN symbols s ON s.exchange_symbol = r.symbol
         LEFT JOIN sweeps sw ON sw.id = r.sweep_id
@@ -10082,12 +10823,27 @@ def list_backtest_run_symbols(
         LIMIT %s
     """
     rows = execute_fetchall(conn, sql, tuple(list(params) + [lim]))
+    seen: set[str] = set()
     out: List[str] = []
     for r in rows or []:
-        v = r.get("symbol") if isinstance(r, dict) else None
-        s = ("" if v is None else str(v)).strip()
-        if s:
-            out.append(s)
+        if not isinstance(r, dict):
+            continue
+        raw_symbol = ("" if r.get("symbol") is None else str(r.get("symbol"))).strip()
+        base_asset = ("" if r.get("base_asset") is None else str(r.get("base_asset"))).strip()
+        candidate = base_asset
+        if not candidate:
+            try:
+                base_guess, _quote = _parse_exchange_symbol_assets(raw_symbol)
+                candidate = (base_guess or "").strip()
+            except Exception:
+                candidate = raw_symbol
+        if not candidate:
+            continue
+        canon = candidate.strip().upper()
+        if canon in seen:
+            continue
+        seen.add(canon)
+        out.append(canon)
     return out
 
 
