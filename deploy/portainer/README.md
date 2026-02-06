@@ -30,9 +30,9 @@ Containers should always use @postgres:5432. Host shell uses @127.0.0.1:5432 onl
 - Manual run (if needed):
   - docker compose -f docker-compose.yml run --rm db_migrate
 
-## Dev auto-migrate (optional)
-- Set DRAGON_ENV=dev and DRAGON_AUTO_MIGRATE=1 to allow runtime auto-migration in dev.
-- In prod (DRAGON_ENV=prod), auto-migrate is hard-disabled.
+## Migrations
+- Use the one-shot db_migrate service before UI/workers start.
+- Runtime auto-migrate is disabled; db_migrate is the only DDL path.
 
 ## Persistent data (QNAP bind mounts)
 This compose uses:

@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple, List, Callable
 
 from project_dragon.domain import Candle
 from project_dragon.data_online import get_candles_with_cache
+from project_dragon.exchange_normalization import canonical_exchange_id, canonical_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +139,14 @@ def _cache_key(
     analysis_limit: Optional[int],
     chunk_sec: int,
 ) -> tuple:
+    ex_id = canonical_exchange_id(exchange_id)
+    sym = canonical_symbol(ex_id, symbol)
     if analysis_start_ms is not None and analysis_end_ms is not None:
         c_start, c_end = _chunk_range(analysis_start_ms, analysis_end_ms, chunk_sec=chunk_sec)
         return (
-            str(exchange_id).lower(),
+            str(ex_id).lower(),
             str(market_type).lower(),
-            str(symbol),
+            str(sym),
             str(timeframe),
             str(range_mode).lower(),
             "range",
@@ -151,9 +154,9 @@ def _cache_key(
             int(c_end or 0),
         )
     return (
-        str(exchange_id).lower(),
+        str(ex_id).lower(),
         str(market_type).lower(),
-        str(symbol),
+        str(sym),
         str(timeframe),
         str(range_mode).lower(),
         "bars",

@@ -20,8 +20,10 @@ from project_dragon.domain import Candle
 from project_dragon.storage import (
     build_backtest_run_rows,
     bulk_enqueue_backtest_run_jobs,
+    bulk_mark_jobs_cancelled,
     claim_job_with_lease,
     compute_run_key,
+    ensure_sweep_parent_jobs,
     finalize_sweep_if_complete,
     get_backtest_run_job_counts_by_sweep,
     get_job,
@@ -29,7 +31,8 @@ from project_dragon.storage import (
     get_sweep_row,
     init_db,
     open_db_connection,
-    reclaim_stale_job,
+    requeue_orphaned_running_jobs,
+    requeue_expired_lease_jobs,
     renew_job_lease,
     upsert_backtest_run_by_run_key,
     update_job,
@@ -382,6 +385,10 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
     try:
         flags0 = get_parent_job_flags(conn, int(job_id))
         if int(flags0.get("cancel_requested") or 0) == 1:
+            try:
+                bulk_mark_jobs_cancelled(conn, group_key)
+            except Exception:
+                pass
             update_job(conn, job_id, status="cancelled", message="Sweep cancelled", finished_at=_now_iso())
             try:
                 update_sweep_status(str(sweep_id), "cancelled", error_message="cancel_requested")
@@ -492,6 +499,10 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
                     flags = get_parent_job_flags(conn, int(job_id))
                     if int(flags.get("cancel_requested") or 0) == 1:
                         _flush()
+                        try:
+                            bulk_mark_jobs_cancelled(conn, group_key)
+                        except Exception:
+                            pass
                         update_job(conn, job_id, status="cancelled", message="Sweep cancelled", finished_at=_now_iso())
                         try:
                             update_sweep_status(str(sweep_id), "cancelled", error_message="cancel_requested")
@@ -860,31 +871,28 @@ def _poll_once(worker_id: str) -> int:
         init_db()  # ensure schema
         now_iso = _now_iso()
 
-                # Reclaim one stale running job (planner or run).
+        # Ensure running/paused sweeps have a planner job after restarts.
         try:
-            stale = conn.execute(
-                """
-                SELECT *
-                FROM jobs
-                                WHERE job_type IN ('sweep_parent','backtest_run')
-                  AND status = 'running'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < %s
-                ORDER BY lease_expires_at ASC
-                LIMIT 1
-                """,
-                (now_iso,),
-            ).fetchone()
-            if stale:
-                stale_job = dict(stale)
-                stale_job_id = int(stale_job.get("id"))
-                ok = reclaim_stale_job(conn, job_id=stale_job_id, new_worker_id=str(worker_id), lease_s=float(JOB_LEASE_S))
-                if ok:
-                    reclaimed = get_job(conn, stale_job_id)
-                    if reclaimed and reclaimed.get("id") is not None:
-                        jid = int(reclaimed.get("id"))
-                        _JOB_EXPECTED_LEASE_VERSION[jid] = int(reclaimed.get("lease_version") or 0)
-                        _JOB_LAST_LEASE_RENEW_S[jid] = 0.0
+            ensure_sweep_parent_jobs(conn)
+        except Exception:
+            pass
+
+        # Requeue legacy running jobs without leases (resume after restart).
+        try:
+            requeue_orphaned_running_jobs(
+                conn,
+                job_types=("sweep_parent", "backtest_run"),
+                older_than_s=float(JOB_LEASE_S or 30.0),
+            )
+        except Exception:
+            pass
+
+        # Requeue jobs with expired leases so they can be claimed again.
+        try:
+            requeue_expired_lease_jobs(
+                conn,
+                job_types=("sweep_parent", "backtest_run"),
+            )
         except Exception:
             pass
 

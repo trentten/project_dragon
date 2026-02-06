@@ -8,14 +8,10 @@ Setup:
 Postgres (required):
 - Set DRAGON_DATABASE_URL (example): postgresql://dragon:dragon@localhost:5432/dragon
 
-Migrations (two modes):
-A) Recommended (default): migrate-once using db_migrate service
+Migrations:
+- Run once using the db_migrate service
 - docker compose -f deploy/portainer/docker-compose.yml up -d
 - UI/workers never run DDL at runtime.
-
-B) Dev convenience (optional): auto-migrate in app runtime
-- Set DRAGON_ENV=dev and DRAGON_AUTO_MIGRATE=1
-- Intended for local dev only; ignored in prod.
 
 UI performance:
 - Runs grids use server-side paging; grid filter/sort re-queries Postgres and only returns the current page.
@@ -41,6 +37,10 @@ Tests:
 
 Manual migrations (if needed):
 - docker compose -f deploy/portainer/docker-compose.yml run --rm db_migrate
+
+Maintenance (WooX normalization):
+- Best-effort cleanup for legacy "woo"/"woox" exchange ids and symbol formats:
+	PYTHONPATH=src python examples/normalize_woox_identity.py
 
 Live dry-run checklist (WooX):
 - Set WOOX_API_KEY/SECRET in your env (or accept stub mode for offline checks).
@@ -78,3 +78,12 @@ PYTHONPATH=src python -m project_dragon.ui.icons add <name> --variant filled
 ```
 
 Then reference it from Python via `project_dragon.ui.icons`.
+
+## Favicon override
+
+Project Dragon will use an override favicon if present:
+
+- /app/config/favicon.png or /app/config/favicon.ico (preferred)
+- fallback: app/assets/project_dragon_favicon.png
+
+In Docker/Portainer, mount your custom favicon into /app/config.

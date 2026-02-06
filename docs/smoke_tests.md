@@ -109,6 +109,20 @@ Expected:
   - Expected: worker can still decrypt and connect
   - Expected: no secrets are printed/logged
 
+## 10) UI grid shortlist propagation (Runs → Results)
+- Runs Explorer: toggle `Shortlist` for a run and add/edit `Shortlist Note` (Enter or ✓)
+- Expected: change persists immediately on the row
+- Results: locate the same run and confirm `Shortlist` + `Shortlist Note` match
+
+## 11) UI asset block formatting (no PERP_ leakage)
+- Runs Explorer: confirm Asset shows `ETH/USDT:USDT - PERPS` (icon if available), not `PERP_ETH_USDT`
+- Results: confirm the same run shows the identical Asset block (icon + CCXT symbol + market)
+- Sweeps (overview + runs): single-asset sweeps show the same CCXT symbol format; multi-asset/category sweeps show the category/preview without `PERP_` prefixes
+
+## 12) Cancel job / sweep
+- Jobs: cancel a queued or running backtest job; expect status transitions to `cancel_requested`
+- Sweeps: cancel a sweep parent job; expect the sweep state to move to `Cancelling` and no NameError in logs
+
 ## Notes
 - Always start with tiny sizing and `--dry-run` until you trust the behavior.
 - If anything is blocked, inspect bot events first (Live → Bot detail → Events).

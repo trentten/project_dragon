@@ -39,11 +39,54 @@ ICONS: dict[str, str] = {
 
 
 def _repo_root() -> Path:
+    env_root = os.environ.get("PROJECT_DRAGON_ROOT") or os.environ.get("DRAGON_ASSETS_ROOT")
+    if env_root:
+        try:
+            p = Path(env_root).expanduser().resolve()
+            if p.exists():
+                return p
+        except Exception:
+            pass
+
+    candidates = [Path.cwd(), Path(__file__).resolve()]
+    for base in candidates:
+        for parent in [base] + list(base.parents):
+            if (parent / "app" / "assets" / "ui_icons" / "tabler").exists():
+                return parent
+
+    for fallback in (Path("/app"), Path("/workspaces/project_dragon")):
+        try:
+            if (fallback / "app" / "assets" / "ui_icons" / "tabler").exists():
+                return fallback
+        except Exception:
+            pass
+
     return Path(__file__).resolve().parents[3]
 
 
 def _tabler_root() -> Path:
     return _repo_root() / "app" / "assets" / "ui_icons" / "tabler"
+
+
+def tabler_assets_available() -> bool:
+    try:
+        root = _tabler_root()
+        return root.exists()
+    except Exception:
+        return False
+
+
+def tabler_icon_inventory() -> dict[str, int]:
+    counts: dict[str, int] = {"filled": 0, "outline": 0}
+    try:
+        root = _tabler_root()
+        for variant in ("filled", "outline"):
+            p = root / variant
+            if p.exists():
+                counts[variant] = len(list(p.glob("*.svg")))
+    except Exception:
+        pass
+    return counts
 
 
 def _read_text(path: Path) -> str:

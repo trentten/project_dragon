@@ -58,6 +58,7 @@ def compute_metrics(equity_curve: Iterable[float], trades: List[Trade], initial_
             "gross_profit": gross_profit,
             "gross_loss": gross_loss,
             "reward_risk": reward_risk,
+            "avg_position_time_seconds": avg_pos_time_s,
             "avg_position_time_s": avg_pos_time_s,
         }
     )
