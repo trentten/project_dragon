@@ -131,6 +131,11 @@ Expected:
 - Children start only after preflight succeeds (no hang)
 - If preflight fails, sweep ends in `failed` with the symbol/timeframe in the error
 
+## 14) Backtest Detail MA overlay
+- Open a completed run in Run Detail
+- Expected: MA line is visible on the candle chart and aligned to candle timestamps
+- If MA is missing due to insufficient bars, a warning log reports `ma_unavailable`
+
 ## Notes
 - Always start with tiny sizing and `--dry-run` until you trust the behavior.
 - If anything is blocked, inspect bot events first (Live → Bot detail → Events).

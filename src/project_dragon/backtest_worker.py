@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional, Iterable, Tuple
 
 from project_dragon.backtest_core import DataSettings, compute_analysis_window_from_snapshot, run_single_backtest
 from project_dragon.candle_cache import get_candles_analysis_window, enqueue_prefetch_analysis_window
-from project_dragon.data_online import get_candles_with_cache, load_ccxt_candles
+from project_dragon.data_online import get_candles_with_cache, load_ccxt_candles, timeframe_to_milliseconds
 from project_dragon.domain import Candle
 from project_dragon.storage import (
     build_backtest_run_rows,
@@ -58,6 +58,13 @@ _CANDLE_CACHE_PREFETCH_QUERY_LIMIT = 50
 _CANDLE_CACHE_PREFETCH_BUDGET_S = 2.0
 _LAST_PREFETCH_GROUP_KEY: Optional[str] = None
 _CACHE_PREFLIGHT_LOCKS: Dict[tuple[str, str, str, str], threading.Lock] = {}
+_CANDLE_CACHE_END_TOLERANCE_BARS = int(os.environ.get("DRAGON_CANDLE_CACHE_END_TOLERANCE_BARS", "2") or 2)
+_CANDLE_CACHE_END_TOLERANCE_RECENT_BARS = int(
+    os.environ.get("DRAGON_CANDLE_CACHE_END_TOLERANCE_RECENT_BARS", "12") or 12
+)
+_CANDLE_CACHE_END_TOLERANCE_RECENT_WINDOW_H = int(
+    os.environ.get("DRAGON_CANDLE_CACHE_END_TOLERANCE_RECENT_WINDOW_H", "24") or 24
+)
 
 
 def _to_ms(value: Any) -> Optional[int]:
@@ -233,6 +240,51 @@ def _exc_text() -> str:
     return "".join(traceback.format_exception(*traceback.sys.exc_info()))
 
 
+def _commit_quietly(conn: Any) -> None:
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _start_lease_heartbeat(
+    *,
+    job_id: int,
+    worker_id: str,
+    lease_s: float,
+    interval_s: float,
+) -> tuple[threading.Event, Dict[str, Any]]:
+    stop_event = threading.Event()
+    status: Dict[str, Any] = {"lost": False}
+    expected = _JOB_EXPECTED_LEASE_VERSION.get(job_id)
+    if expected is None:
+        expected = 0
+    expected = int(expected or 0)
+
+    def _runner() -> None:
+        try:
+            with open_db_connection() as hb_conn:
+                while not stop_event.wait(float(interval_s)):
+                    ok = renew_job_lease(
+                        hb_conn,
+                        job_id=int(job_id),
+                        worker_id=str(worker_id),
+                        lease_s=float(lease_s),
+                        expected_lease_version=int(expected),
+                    )
+                    _JOB_LAST_LEASE_RENEW_S[int(job_id)] = float(time.time())
+                    if not ok:
+                        status["lost"] = True
+                        break
+        except Exception:
+            status["lost"] = True
+
+    thread = threading.Thread(target=_runner, name=f"lease_hb_{job_id}", daemon=True)
+    thread.start()
+    status["thread"] = thread
+    return stop_event, status
+
+
 def _parse_time_ms(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -261,6 +313,31 @@ def _parse_time_ms(value: Any) -> Optional[int]:
             except Exception:
                 return None
     return None
+
+
+def _align_range_to_timeframe(
+    *,
+    start_ms: Optional[int],
+    end_ms: Optional[int],
+    timeframe: str,
+) -> Tuple[Optional[int], Optional[int], int]:
+    if end_ms is None:
+        return start_ms, end_ms, 0
+    try:
+        ms_per_bar = int(timeframe_to_milliseconds(str(timeframe or "1h")))
+    except Exception:
+        ms_per_bar = 0
+    if ms_per_bar <= 0:
+        return start_ms, end_ms, 0
+    # Align to the previous closed candle (use candle open timestamps).
+    aligned_end = int(end_ms) - (int(end_ms) % int(ms_per_bar)) - int(ms_per_bar)
+    if aligned_end < 0:
+        aligned_end = 0
+    if aligned_end == int(end_ms):
+        return start_ms, end_ms, 0
+    delta = int(end_ms) - int(aligned_end)
+    aligned_start = int(start_ms) - delta if start_ms is not None else None
+    return aligned_start, aligned_end, int(delta)
 
 
 def _cache_lock_key(exchange_id: str, market_type: str, symbol: str, timeframe: str) -> tuple[str, str, str, str]:
@@ -300,6 +377,7 @@ def _ensure_candle_cache(
             min_ts, max_ts = get_cached_coverage(conn, exchange_id, market_type, symbol, timeframe)
         except Exception:
             min_ts, max_ts = None, None
+        _commit_quietly(conn)
 
         coverage_ok = False
         if start_ms is not None and end_ms is not None:
@@ -321,7 +399,14 @@ def _ensure_candle_cache(
             int(start_ms or 0) if start_ms is not None else None,
             int(end_ms or 0) if end_ms is not None else None,
         )
+        _commit_quietly(conn)
         try:
+            if limit is None and start_ms is not None and end_ms is not None:
+                ms_per_bar = int(timeframe_to_milliseconds(str(timeframe or "1h")) or 0)
+                if ms_per_bar > 0:
+                    span_ms = max(0, int(end_ms) - int(start_ms))
+                    est = int(span_ms // ms_per_bar) + 2
+                    limit = min(max(est, 1), 250_000)
             candles = get_candles_with_cache(
                 exchange_id=exchange_id,
                 symbol=symbol,
@@ -348,11 +433,35 @@ def _ensure_candle_cache(
             min_ts, max_ts = get_cached_coverage(conn, exchange_id, market_type, symbol, timeframe)
         except Exception:
             min_ts, max_ts = None, None
+        _commit_quietly(conn)
         if min_ts is None or max_ts is None:
             return False, "coverage_missing"
         if start_ms is not None and min_ts > start_ms:
             return False, "coverage_start_missing"
         if end_ms is not None and max_ts < end_ms:
+            try:
+                ms_per_bar = timeframe_to_milliseconds(str(timeframe or "1h"))
+                tolerance_ms = max(0, int(_CANDLE_CACHE_END_TOLERANCE_BARS)) * int(ms_per_bar)
+            except Exception:
+                tolerance_ms = 0
+            if tolerance_ms and max_ts + tolerance_ms >= end_ms:
+                return True, "coverage_end_tolerated"
+            try:
+                recent_window_ms = max(0, int(_CANDLE_CACHE_END_TOLERANCE_RECENT_WINDOW_H)) * 3600 * 1000
+            except Exception:
+                recent_window_ms = 0
+            if recent_window_ms:
+                now_ms = int(time.time() * 1000)
+                if int(end_ms) >= (now_ms - int(recent_window_ms)):
+                    try:
+                        recent_tolerance_ms = max(
+                            int(tolerance_ms),
+                            int(_CANDLE_CACHE_END_TOLERANCE_RECENT_BARS) * int(ms_per_bar),
+                        )
+                    except Exception:
+                        recent_tolerance_ms = int(tolerance_ms or 0)
+                    if recent_tolerance_ms and max_ts + recent_tolerance_ms >= end_ms:
+                        return True, "coverage_end_recent_tolerated"
             return False, "coverage_end_missing"
         return True, "coverage_ok"
 
@@ -607,6 +716,21 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
             "range_params": range_params,
         }
 
+    # Sweep assets (needed for preflight symbol union)
+    sweep_assets: list[str] = []
+    try:
+        assets_raw = sweep_row.get("sweep_assets_json")
+        if isinstance(assets_raw, str) and assets_raw.strip():
+            parsed = json.loads(assets_raw)
+            if isinstance(parsed, list):
+                sweep_assets = [str(s).strip() for s in parsed if str(s).strip()]
+    except Exception:
+        sweep_assets = []
+    if not sweep_assets:
+        sym0 = str(sweep_row.get("symbol") or "").strip()
+        if sym0:
+            sweep_assets = [sym0]
+
     # --- Sweep candle cache preflight (union of symbol/timeframe pairs) ---
     try:
         data_source_key = str(base_data_settings.get("data_source") or "ccxt").strip().lower()
@@ -717,6 +841,12 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
                 end_ms = end_ms if end_ms is not None else union_end
                 limit_val = int(limit_ms) if limit_ms is not None else union_limit
 
+                start_ms, end_ms, _delta = _align_range_to_timeframe(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    timeframe=tf,
+                )
+
                 ok, reason = _ensure_candle_cache(
                     conn=conn,
                     exchange_id=base_exchange,
@@ -746,21 +876,6 @@ def execute_sweep_parent_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
                     return
 
         logger.info("sweep_preflight_done job_id=%s sweep_id=%s", int(job_id), str(sweep_id))
-
-    # Sweep assets
-    sweep_assets: list[str] = []
-    try:
-        assets_raw = sweep_row.get("sweep_assets_json")
-        if isinstance(assets_raw, str) and assets_raw.strip():
-            parsed = json.loads(assets_raw)
-            if isinstance(parsed, list):
-                sweep_assets = [str(s).strip() for s in parsed if str(s).strip()]
-    except Exception:
-        sweep_assets = []
-    if not sweep_assets:
-        sym0 = str(sweep_row.get("symbol") or "").strip()
-        if sym0:
-            sweep_assets = [sym0]
 
     if not value_lists:
         value_lists = [[None]]
@@ -988,6 +1103,31 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
     except Exception:
         analysis_info = {}
 
+    # Align range to last completed bar if end_ms is not on a candle boundary.
+    try:
+        display_start_ms = analysis_info.get("display_start_ms")
+        display_end_ms = analysis_info.get("display_end_ms")
+        aligned_display_start, aligned_display_end, delta = _align_range_to_timeframe(
+            start_ms=display_start_ms,
+            end_ms=display_end_ms,
+            timeframe=str(getattr(data_settings, "timeframe", "1h") or "1h"),
+        )
+        if delta:
+            analysis_info["display_start_ms"] = aligned_display_start
+            analysis_info["display_end_ms"] = aligned_display_end
+            if analysis_info.get("analysis_start_ms") is not None:
+                analysis_info["analysis_start_ms"] = int(analysis_info.get("analysis_start_ms") or 0) - int(delta)
+            if analysis_info.get("analysis_end_ms") is not None:
+                analysis_info["analysis_end_ms"] = int(analysis_info.get("analysis_end_ms") or 0) - int(delta)
+            rp = dict(getattr(data_settings, "range_params", None) or {})
+            if aligned_display_end is not None:
+                rp["until"] = int(aligned_display_end)
+            if aligned_display_start is not None:
+                rp["since"] = int(aligned_display_start)
+            data_settings.range_params = rp
+    except Exception:
+        pass
+
     if str(getattr(data_settings, "data_source", "") or "").lower() != "synthetic":
         try:
             ok, reason = _ensure_candle_cache(
@@ -1010,6 +1150,7 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
             update_job(conn, job_id, status="failed", error_text=f"preflight_error:{exc}", finished_at=_now_iso())
             logger.exception("preflight_error job_id=%s", int(job_id))
             return
+        _commit_quietly(conn)
 
     # Best-effort prefetch for new sweep groups.
     try:
@@ -1018,6 +1159,7 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
             _prefetch_group_candles(conn=conn, group_key=str(group_key), worker_id=str(worker_id))
     except Exception:
         pass
+    _commit_quietly(conn)
 
     # Worker-local candle cache (in-memory) to reduce DB contention under concurrency.
     candles_override: Optional[list[Candle]] = None
@@ -1049,6 +1191,15 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
                 label_override = None
     except Exception:
         candles_override = None
+    _commit_quietly(conn)
+
+    # Keep the lease alive during long compute.
+    lease_stop, lease_status = _start_lease_heartbeat(
+        job_id=int(job_id),
+        worker_id=str(worker_id),
+        lease_s=float(JOB_LEASE_S),
+        interval_s=max(5.0, float(JOB_LEASE_RENEW_EVERY_S or 10.0)),
+    )
 
     # Run compute without holding a transaction.
     cfg_for_storage, result, _label, storage_symbol, storage_timeframe = run_single_backtest(
@@ -1059,6 +1210,20 @@ def execute_backtest_run_job(*, conn, job: Dict[str, Any], worker_id: str) -> No
         storage_symbol_override=storage_symbol_override,
         storage_timeframe_override=storage_timeframe_override,
     )
+
+    lease_stop.set()
+    try:
+        thread = lease_status.get("thread")
+        if thread is not None:
+            thread.join(timeout=2.0)
+    except Exception:
+        pass
+    if lease_status.get("lost"):
+        try:
+            update_job(conn, job_id, status="error", error_text="job_lease_lost", finished_at=_now_iso())
+        except Exception:
+            pass
+        return
 
     # Honor cancel before persisting results.
     if _cancel_if_requested(conn=conn, job_id=job_id, reason="Cancelled after run", sweep_id=payload.get("sweep_id")):

@@ -197,6 +197,8 @@ from project_dragon.config_dragon import (
 )
 from project_dragon.domain import BacktestResult, Candle, Trade
 from project_dragon.data_online import get_candles_with_cache, get_woox_market_catalog
+from project_dragon.candle_cache import get_run_details_candles_analysis_window
+from project_dragon.indicators import htf_ma_mapping
 from project_dragon.crypto import CryptoConfigError, decrypt_str, mask_api_key
 from project_dragon.brokers.woox_client import WooXAPIError, WooXClient
 from project_dragon.live.trade_config import (
@@ -1113,36 +1115,33 @@ def _extract_ma_periods_from_config_dict(
     trend = (
         config_dict.get("trend") if isinstance(config_dict.get("trend"), dict) else {}
     )
-    raw = None
-    for key in ("ma_len", "ma_lens", "ma_period", "ma_periods"):
-        if key in trend:
-            raw = trend.get(key)
-            break
-    if raw is None:
+    periods: List[int] = []
+
+    def _extend_periods(raw: Any) -> None:
+        if raw is None:
+            return
+        values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        for v in values:
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                periods.append(n)
+
+    if "ma_len" in trend:
+        _extend_periods(trend.get("ma_len"))
+    if "ma_length" in trend:
+        _extend_periods(trend.get("ma_length"))
+    general = config_dict.get("general") if isinstance(config_dict.get("general"), dict) else {}
+    if "ma_length" in general:
+        _extend_periods(general.get("ma_length"))
+
+    if not periods:
         return []
 
-    periods: List[int] = []
-    if isinstance(raw, (list, tuple)):
-        values = list(raw)
-    else:
-        values = [raw]
-
-    for v in values:
-        try:
-            n = int(v)
-        except (TypeError, ValueError):
-            continue
-        if n > 0:
-            periods.append(n)
-
-            # Deduplicate while preserving order.
-    out: List[int] = []
-    seen: set[int] = set()
-    for n in periods:
-        if n not in seen:
-            out.append(n)
-            seen.add(n)
-    return out
+    # Deduplicate and sort deterministically.
+    return sorted(set(periods))
 
 
 def _extract_trend_ma_settings_from_config_dict(
@@ -1163,7 +1162,10 @@ def _extract_trend_ma_settings_from_config_dict(
         interval_min = int(trend.get("ma_interval_min") or 1)
     except (TypeError, ValueError):
         interval_min = 1
-    ma_type = str(trend.get("ma_type") or "sma")
+    ma_type = str(trend.get("ma_type") or "").strip()
+    if not ma_type:
+        general = config_dict.get("general") if isinstance(config_dict.get("general"), dict) else {}
+        ma_type = str(general.get("ma_type") or "sma")
     ma_lens = _extract_ma_periods_from_config_dict(config_dict)
     return max(1, interval_min), ma_type, ma_lens
 
@@ -1232,6 +1234,69 @@ def _cached_strategy_trend_ma_overlays(
     return out
 
 
+def _log_ma_unavailable(*, scope: str, timeframe: str, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+    payload = {
+        "scope": str(scope or ""),
+        "timeframe": str(timeframe or ""),
+        "reason": str(reason or "unknown"),
+    }
+    if isinstance(extra, dict) and extra:
+        payload.update(extra)
+    try:
+        logging.warning(
+            "ma_unavailable scope=%s timeframe=%s reason=%s extra=%s",
+            payload.get("scope"),
+            payload.get("timeframe"),
+            payload.get("reason"),
+            {k: v for k, v in payload.items() if k not in {"scope", "timeframe", "reason"}},
+        )
+    except Exception:
+        pass
+    try:
+        print(
+            "ma_unavailable scope=%s timeframe=%s reason=%s extra=%s"
+            % (
+                payload.get("scope"),
+                payload.get("timeframe"),
+                payload.get("reason"),
+                {k: v for k, v in payload.items() if k not in {"scope", "timeframe", "reason"}},
+            )
+        )
+    except Exception:
+        pass
+
+
+def _prepare_ma_series(
+    *,
+    ts: pd.Series,
+    closes: pd.Series,
+    warmup_ts: Optional[pd.Series] = None,
+    warmup_closes: Optional[pd.Series] = None,
+    ma_calc_ts: Optional[pd.Series] = None,
+    ma_calc_closes: Optional[pd.Series] = None,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    base_ts = pd.to_datetime(ma_calc_ts if ma_calc_ts is not None else ts, utc=True)
+    base_closes = pd.to_numeric(
+        ma_calc_closes if ma_calc_closes is not None else closes, errors="coerce"
+    ).astype("float64")
+    display_ts = pd.to_datetime(ts, utc=True)
+    if (
+        warmup_ts is not None
+        and warmup_closes is not None
+        and len(warmup_ts)
+        and len(warmup_closes)
+    ):
+        ts_all = pd.concat([pd.to_datetime(warmup_ts, utc=True), base_ts], ignore_index=True)
+        closes_all = pd.concat(
+            [pd.to_numeric(warmup_closes, errors="coerce").astype("float64"), base_closes],
+            ignore_index=True,
+        )
+    else:
+        ts_all = base_ts
+        closes_all = base_closes
+    return display_ts, ts_all, closes_all, base_closes
+
+
 def _add_ma_overlays_to_candles_fig(
     fig: go.Figure,
     *,
@@ -1247,49 +1312,44 @@ def _add_ma_overlays_to_candles_fig(
     warmup_closes: Optional[pd.Series] = None,
     ma_calc_ts: Optional[pd.Series] = None,
     ma_calc_closes: Optional[pd.Series] = None,
-) -> None:
+) -> int:
     if not ma_periods:
-        return
+        _log_ma_unavailable(scope=str(scope_key or ""), timeframe=str(timeframe or ""), reason="periods_empty")
+        return 0
 
-        # Combine warmup + calculation series for MA computation.
-    base_ts = pd.to_datetime(ma_calc_ts if ma_calc_ts is not None else ts, utc=True)
-    base_closes = pd.to_numeric(
-        ma_calc_closes if ma_calc_closes is not None else closes, errors="coerce"
+    # Combine warmup + calculation series for MA computation.
+    display_ts, ts_all, closes_all, base_closes = _prepare_ma_series(
+        ts=ts,
+        closes=closes,
+        warmup_ts=warmup_ts,
+        warmup_closes=warmup_closes,
+        ma_calc_ts=ma_calc_ts,
+        ma_calc_closes=ma_calc_closes,
     )
-    if (
-        warmup_ts is not None
-        and warmup_closes is not None
-        and len(warmup_ts)
-        and len(warmup_closes)
-    ):
-        ts_all = pd.concat(
-            [pd.to_datetime(warmup_ts, utc=True), base_ts], ignore_index=True
-        )
-        closes_all = pd.concat(
-            [pd.to_numeric(warmup_closes, errors="coerce"), base_closes],
-            ignore_index=True,
-        )
-    else:
-        ts_all = base_ts
-        closes_all = base_closes
 
     try:
-        close_tuple = tuple(float(v) for v in closes_all.tolist())
-    except Exception:
-        return
+        close_list = pd.to_numeric(closes_all, errors="coerce").tolist()
+        close_tuple = tuple(float(v) if pd.notna(v) else math.nan for v in close_list)
+    except Exception as exc:
+        _log_ma_unavailable(
+            scope=str(scope_key or ""),
+            timeframe=str(timeframe or ""),
+            reason="data_tuple_failed",
+            extra={"error": str(exc)},
+        )
+        return 0
     try:
         # Use int64 nanoseconds for stable hashing in cache.
         ts_ns_tuple = tuple(
             int(v) for v in pd.to_datetime(ts_all, utc=True).astype("int64").tolist()
         )
-        display_ns_tuple = tuple(
-            int(v) for v in pd.to_datetime(ts, utc=True).astype("int64").tolist()
-        )
+        display_ns_tuple = tuple(int(v) for v in display_ts.astype("int64").tolist())
     except Exception:
-        return
+        return 0
     ma_periods_tuple = tuple(int(p) for p in ma_periods if int(p) > 0)
     if not ma_periods_tuple:
-        return
+        _log_ma_unavailable(scope=str(scope_key or ""), timeframe=str(timeframe or ""), reason="periods_invalid")
+        return 0
     series_map = _cached_strategy_trend_ma_overlays(
         str(scope_key or ""),
         str(timeframe or ""),
@@ -1300,11 +1360,39 @@ def _add_ma_overlays_to_candles_fig(
         int(ma_interval_min),
         str(ma_type or "sma"),
     )
+    if not series_map:
+        _log_ma_unavailable(scope=str(scope_key or ""), timeframe=str(timeframe or ""), reason="series_missing")
+        return 0
+    added = 0
+    base_min = max(1, int(timeframe_to_minutes(str(timeframe or "1h")) or 1))
+    step = max(1, int(round(max(int(ma_interval_min or 1), 1) / float(base_min))))
     for period in ma_periods:
         y_full = series_map.get(int(period))
         if not y_full:
+            _log_ma_unavailable(
+                scope=str(scope_key or ""),
+                timeframe=str(timeframe or ""),
+                reason="series_empty",
+                extra={"period": int(period)},
+            )
             continue
         y = y_full
+        try:
+            if not pd.Series(y).notna().any():
+                needed = int(step * int(period))
+                _log_ma_unavailable(
+                    scope=str(scope_key or ""),
+                    timeframe=str(timeframe or ""),
+                    reason="insufficient_bars",
+                    extra={
+                        "period": int(period),
+                        "need": int(needed),
+                        "have": int(len(base_closes)),
+                    },
+                )
+                continue
+        except Exception:
+            pass
         fig.add_trace(
             go.Scatter(
                 x=x,
@@ -1314,6 +1402,14 @@ def _add_ma_overlays_to_candles_fig(
                 connectgaps=False,
             )
         )
+        added += 1
+    if added == 0:
+        _log_ma_unavailable(
+            scope=str(scope_key or ""),
+            timeframe=str(timeframe or ""),
+            reason="ma_mapping_no_traces",
+        )
+    return int(added)
 
 
 def test_woox_credential(
@@ -5921,10 +6017,12 @@ def build_price_orders_chart(
     )
 
     # Strategy MA overlays (from run config snapshot).
-    try:
-        periods = list(ma_periods or [])
-        if periods:
-            _add_ma_overlays_to_candles_fig(
+    periods = list(ma_periods or [])
+    added = 0
+    ma_error: Optional[str] = None
+    if periods:
+        try:
+            added = _add_ma_overlays_to_candles_fig(
                 fig,
                 x=candles_df["timestamp"],
                 closes=candles_df["close"],
@@ -5939,8 +6037,104 @@ def build_price_orders_chart(
                 ma_calc_ts=ma_calc_ts,
                 ma_calc_closes=ma_calc_closes,
             )
-    except Exception:
-        pass
+        except Exception as exc:
+            ma_error = str(exc)
+            _log_ma_unavailable(
+                scope=str(scope_key or "run"),
+                timeframe=str(timeframe or ""),
+                reason="ma_mapping_failed",
+                extra={"error": ma_error},
+            )
+
+    if periods and int(added or 0) <= 0:
+        # Fallback: rolling MA on closes (vectorized). Do not bypass warmup logic.
+        fallback_added = 0
+        if "close" not in candles_df.columns:
+            _log_ma_unavailable(
+                scope=str(scope_key or "run"),
+                timeframe=str(timeframe or ""),
+                reason="close_missing",
+            )
+        else:
+            try:
+                display_ts, ts_all, closes_all, base_closes = _prepare_ma_series(
+                    ts=candles_df["timestamp"],
+                    closes=candles_df["close"],
+                    warmup_ts=warmup_ts,
+                    warmup_closes=warmup_closes,
+                    ma_calc_ts=ma_calc_ts,
+                    ma_calc_closes=ma_calc_closes,
+                )
+            except Exception as exc:
+                _log_ma_unavailable(
+                    scope=str(scope_key or "run"),
+                    timeframe=str(timeframe or ""),
+                    reason="ma_data_invalid",
+                    extra={"error": str(exc)},
+                )
+                display_ts = None
+                ts_all = None
+                closes_all = None
+                base_closes = None
+
+            if display_ts is not None and ts_all is not None and closes_all is not None:
+                ma_type_norm = str(ma_type or "sma").strip().lower()
+                if ma_type_norm not in {"sma", "ema"}:
+                    _log_ma_unavailable(
+                        scope=str(scope_key or "run"),
+                        timeframe=str(timeframe or ""),
+                        reason="ma_type_unsupported",
+                        extra={"ma_type": str(ma_type or "")},
+                    )
+                else:
+                    calc_series = pd.Series(closes_all.values, index=ts_all).sort_index()
+                    warmup_count = int(len(warmup_ts) if warmup_ts is not None else 0)
+                    have = int(len(ts_all))
+                    for period in periods:
+                        try:
+                            p = int(period)
+                        except (TypeError, ValueError):
+                            continue
+                        if p <= 0:
+                            continue
+                        if have < p:
+                            _log_ma_unavailable(
+                                scope=str(scope_key or "run"),
+                                timeframe=str(timeframe or ""),
+                                reason="insufficient_bars",
+                                extra={
+                                    "period": int(p),
+                                    "need": int(p + warmup_count),
+                                    "have": int(have),
+                                },
+                            )
+                            continue
+                        if ma_type_norm == "ema":
+                            ma_series = calc_series.ewm(
+                                span=int(p), min_periods=int(p), adjust=False
+                            ).mean()
+                        else:
+                            ma_series = calc_series.rolling(
+                                window=int(p), min_periods=int(p)
+                            ).mean()
+                        display_ma = ma_series.reindex(display_ts)
+                        if display_ma.notna().any():
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=display_ts,
+                                    y=display_ma,
+                                    mode="lines",
+                                    name=f"MA {int(p)}",
+                                    connectgaps=False,
+                                )
+                            )
+                            fallback_added += 1
+        if fallback_added == 0:
+            _log_ma_unavailable(
+                scope=str(scope_key or "run"),
+                timeframe=str(timeframe or ""),
+                reason="ma_fallback_no_traces",
+            )
 
     overlay_specs = [
         ("avg_entry", "Avg Entry", "#ff7f0e", "dash"),
@@ -6227,6 +6421,14 @@ def get_metric_color(metric_name: str, value: Any) -> str:
     if v is None:
         return "muted"
 
+        if "run:" in str(scope_key or ""):
+            try:
+                names = [getattr(t, "name", None) for t in fig.data]
+                print(
+                    f"ma_trace_debug scope={scope_key} periods={periods} trace_names={names}"
+                )
+            except Exception:
+                pass
     def _as_ratio(x: float) -> float:
         # Accept both ratio (0..1) and already-percent (0..100).
         return (x * 100.0) if -1.0 <= x <= 1.0 else x
@@ -7443,6 +7645,17 @@ def render_run_detail_from_db(
         ma_interval_min, ma_type, ma_periods = (
             _extract_trend_ma_settings_from_config_dict(config_dict_for_ma)
         )
+        if not ma_periods:
+            _log_ma_unavailable(
+                scope=str(scope_key or ""),
+                timeframe=str(tf_for_ma or ""),
+                reason="periods_empty",
+                extra={
+                    "config_keys": sorted((config_dict_for_ma or {}).keys())
+                    if isinstance(config_dict_for_ma, dict)
+                    else [],
+                },
+            )
 
         # Hard cap for Run detail charts: prevents huge runs from freezing the UI.
         # (Still preserves endpoints via the downsampling index selection.)
@@ -8120,6 +8333,13 @@ def render_run_detail_from_db(
 
                 warmup_ts = None
                 warmup_closes = None
+                display_start_ms = None
+                display_end_ms = None
+                display_limit = None
+                warmup_bars = None
+                warmup_count = None
+                analysis_count = None
+                display_count = None
                 try:
                     rc = (
                         result_for_charts.run_context
@@ -8149,6 +8369,15 @@ def render_run_detail_from_db(
                                 display_start_ms = int(first_dt.timestamp() * 1000)
                         except Exception:
                             display_start_ms = None
+                    if warmup_bars is None:
+                        try:
+                            warmup_bars = _estimate_warmup_bars_for_trend_ma(
+                                str(tf_for_ma or ""),
+                                int(ma_interval_min or 1),
+                                list(ma_periods or []),
+                            )
+                        except Exception:
+                            warmup_bars = None
                     if (
                         analysis_start_ms is None
                         and display_start_ms is not None
@@ -8162,18 +8391,74 @@ def render_run_detail_from_db(
                             )
                         except Exception:
                             analysis_start_ms = None
+                    if (
+                        analysis_start_ms is None
+                        and display_start_ms is not None
+                        and warmup_bars
+                    ):
+                        try:
+                            base_min = max(1, int(timeframe_to_minutes(str(tf_for_ma or "1h")) or 1))
+                            analysis_start_ms = max(
+                                0,
+                                int(display_start_ms)
+                                - int(warmup_bars) * int(base_min) * 60 * 1000,
+                            )
+                        except Exception:
+                            analysis_start_ms = None
                     if analysis_start_ms is not None and display_start_ms is not None:
                         data_settings = None
                         try:
                             data_settings = _build_data_settings(hydrated)
                         except Exception:
                             data_settings = None
+                        if data_settings is None:
+                            try:
+                                ds_snapshot = rc.get("data_settings") if isinstance(rc, dict) else None
+                                if isinstance(ds_snapshot, dict):
+                                    ds_payload = dict(ds_snapshot)
+                                    ds_payload.setdefault("data_source", "ccxt")
+                                    ds_payload.setdefault("range_mode", "bars")
+                                    ds_payload.setdefault("range_params", {})
+                                    data_settings = DataSettings(**ds_payload)
+                            except Exception:
+                                data_settings = None
+                        if data_settings is None:
+                            try:
+                                md = _extract_metadata(hydrated) or {}
+                                ds_payload = {
+                                    "data_source": "ccxt",
+                                    "exchange_id": md.get("exchange_id") or hydrated.get("exchange_id"),
+                                    "market_type": md.get("market_type") or md.get("market_type_hint"),
+                                    "symbol": hydrated.get("symbol") or md.get("symbol"),
+                                    "timeframe": hydrated.get("timeframe") or md.get("timeframe"),
+                                    "range_mode": md.get("range_mode") or "bars",
+                                    "range_params": dict(md.get("range_params") or {}),
+                                }
+                                data_settings = DataSettings(**ds_payload)
+                            except Exception:
+                                data_settings = None
+                        if data_settings is None:
+                            pass
+                        else:
+                            try:
+                                if not getattr(data_settings, "exchange_id", None):
+                                    data_settings.exchange_id = hydrated.get("exchange_id") or md.get("exchange_id")
+                                if not getattr(data_settings, "symbol", None):
+                                    data_settings.symbol = hydrated.get("symbol") or md.get("symbol")
+                                if not getattr(data_settings, "timeframe", None):
+                                    data_settings.timeframe = hydrated.get("timeframe") or md.get("timeframe")
+                                if not getattr(data_settings, "market_type", None):
+                                    data_settings.market_type = md.get("market_type") or md.get("market_type_hint")
+                            except Exception:
+                                pass
                         if (
                             data_settings is not None
                             and str(data_settings.data_source or "").lower()
                             != "synthetic"
                         ):
                             analysis_info = dict(rc) if isinstance(rc, dict) else {}
+                            if analysis_start_ms is not None:
+                                analysis_info["analysis_start_ms"] = int(analysis_start_ms)
                             try:
                                 (
                                     _analysis_start,
@@ -8201,28 +8486,59 @@ def render_run_detail_from_db(
                                         fetch_fn=load_ccxt_candles,
                                     )
                                 else:
-                                    raise
+                                    candles_analysis = []
+                                    _candles_display = []
 
                             warmup_ts_list: list[datetime] = []
                             warmup_close_list: list[float] = []
-                            for c in candles_analysis or []:
-                                ts = _normalize_timestamp(getattr(c, "timestamp", None))
-                                if ts is None:
-                                    continue
-                                ts_ms = int(ts.timestamp() * 1000)
-                                if ts_ms >= int(display_start_ms):
-                                    continue
-                                warmup_ts_list.append(ts)
-                                warmup_close_list.append(
-                                    float(getattr(c, "close", 0.0) or 0.0)
+                            try:
+                                display_limit = (
+                                    rc.get("display_limit") if isinstance(rc, dict) else None
                                 )
+                            except Exception:
+                                display_limit = None
+                            try:
+                                warmup_bars = (
+                                    rc.get("warmup_bars") if isinstance(rc, dict) else None
+                                )
+                            except Exception:
+                                warmup_bars = None
+                            if display_limit is not None:
+                                warmup_count = max(0, int(len(candles_analysis or [])) - int(display_limit))
+                            elif warmup_bars is not None:
+                                warmup_count = max(0, int(warmup_bars))
 
+                            if warmup_count is not None and warmup_count > 0:
+                                for c in (candles_analysis or [])[: int(warmup_count)]:
+                                    ts = _normalize_timestamp(getattr(c, "timestamp", None))
+                                    if ts is None:
+                                        continue
+                                    warmup_ts_list.append(ts)
+                                    warmup_close_list.append(
+                                        float(getattr(c, "close", 0.0) or 0.0)
+                                    )
+                            elif display_start_ms is not None:
+                                for c in candles_analysis or []:
+                                    ts = _normalize_timestamp(getattr(c, "timestamp", None))
+                                    if ts is None:
+                                        continue
+                                    ts_ms = int(ts.timestamp() * 1000)
+                                    if ts_ms >= int(display_start_ms):
+                                        continue
+                                    warmup_ts_list.append(ts)
+                                    warmup_close_list.append(
+                                        float(getattr(c, "close", 0.0) or 0.0)
+                                    )
+
+                            analysis_count = int(len(candles_analysis or []))
                             if warmup_ts_list:
                                 warmup_ts = pd.Series(warmup_ts_list)
                                 warmup_closes = pd.Series(warmup_close_list)
                 except Exception:
                     warmup_ts = None
                     warmup_closes = None
+                if "_candles_display" in locals() and _candles_display is not None:
+                    display_count = int(len(_candles_display))
                 eq_fig = build_equity_chart(result_for_charts)
                 ma_calc_ts = None
                 ma_calc_closes = None

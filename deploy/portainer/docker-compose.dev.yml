@@ -12,6 +12,8 @@ services:
       - ../..:/app
       - ../../config:/app/config
       - ../../logs:/app/logs
+    environment:
+      PYTHONPATH: /app/src
 
   live_worker:
     build:
@@ -22,6 +24,8 @@ services:
       - ../..:/app
       - ../../config:/app/config
       - ../../logs:/app/logs
+    environment:
+      PYTHONPATH: /app/src
 
   backtest_worker:
     build:
@@ -32,6 +36,8 @@ services:
       - ../..:/app
       - ../../config:/app/config
       - ../../logs:/app/logs
+    environment:
+      PYTHONPATH: /app/src
 
   backtest_worker_2:
     build:
@@ -42,6 +48,8 @@ services:
       - ../..:/app
       - ../../config:/app/config
       - ../../logs:/app/logs
+    environment:
+      PYTHONPATH: /app/src
 
   db_migrate:
     build:
@@ -52,4 +60,6 @@ services:
       - ../..:/app
       - ../../config:/app/config
       - ../../logs:/app/logs
+    environment:
+      PYTHONPATH: /app/src
 
